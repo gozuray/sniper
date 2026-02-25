@@ -25,6 +25,11 @@ use crate::strategy::{Action, LiveBuyOrder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Fijar proveedor crypto de rustls una sola vez por proceso (evita panic al abrir nuevas conexiones TLS/WS).
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("instalar CryptoProvider por defecto de rustls");
+
     // Load .env if present (optional; in production set env vars directly)
     let _ = dotenvy::dotenv();
 
@@ -149,6 +154,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     // Last printed best bid/ask to avoid flooding; show WS prices vs entry range while waiting
     let mut last_printed_bid: Option<Decimal> = None;
     let mut last_printed_ask: Option<Decimal> = None;
+    let mut ws_first_update_logged = false;
     const PRICE_LOG_EVERY_N_TICKS: u64 = 50;
 
     match executor.get_book().await {
@@ -173,6 +179,10 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             Some(result) = book_stream.next() => {
                 match result {
                     Ok(snapshot) => {
+                        if !ws_first_update_logged {
+                            tracing::info!("WS orderbook: primer update en tiempo real recibido");
+                            ws_first_update_logged = true;
+                        }
                         let bids: Vec<(Decimal, Decimal)> = snapshot
                             .bids
                             .iter()
@@ -194,6 +204,10 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             Some(result) = price_stream.next() => {
                 match result {
                     Ok(price_event) => {
+                        if !ws_first_update_logged {
+                            tracing::info!("WS prices: primer update en tiempo real recibido");
+                            ws_first_update_logged = true;
+                        }
                         for change in &price_event.price_changes {
                             book.update_best(change.best_bid, change.best_ask);
                         }

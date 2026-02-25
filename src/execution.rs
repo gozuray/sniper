@@ -118,15 +118,34 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
     // ── GET /book (REST fallback for stale book) ───────────────────
 
     pub async fn get_book(&self) -> Result<BookSnapshot> {
-        tracing::debug!("REST fallback: fetching book");
+        tracing::debug!("REST: fetching order book");
 
         let request = OrderBookSummaryRequest::builder()
             .token_id(self.token_id)
             .build();
         let book = self.client.order_book(&request).await?;
 
-        let best_bid = book.bids.first().map(|l| l.price);
-        let best_ask = book.asks.first().map(|l| l.price);
+        // No asumir orden del API: best bid = mayor precio en bids, best ask = menor precio en asks
+        let best_bid = book.bids.iter().map(|l| l.price).max();
+        let best_ask = book.asks.iter().map(|l| l.price).min();
+
+        if book.bids.is_empty() || book.asks.is_empty() {
+            tracing::debug!(
+                bids_len = book.bids.len(),
+                asks_len = book.asks.len(),
+                "REST book tiene bids o asks vacíos"
+            );
+        } else {
+            let top_bids: Vec<_> = book.bids.iter().take(3).map(|l| (l.price, l.size)).collect();
+            let top_asks: Vec<_> = book.asks.iter().take(3).map(|l| (l.price, l.size)).collect();
+            tracing::debug!(
+                best_bid = ?best_bid,
+                best_ask = ?best_ask,
+                top_bids = ?top_bids,
+                top_asks = ?top_asks,
+                "REST book snapshot"
+            );
+        }
 
         Ok(BookSnapshot { best_bid, best_ask })
     }
