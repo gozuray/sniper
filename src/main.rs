@@ -44,9 +44,9 @@ async fn main() -> Result<()> {
         .with_chain_id(Some(polymarket_client_sdk::POLYGON));
 
     if config.auto_btc5m {
-        // Dynamic 5-min: operate on previous interval slug; switch when interval closes or out of sync.
+        // Dynamic 5-min: operate on the *active* interval (current 5-min window); switch when interval closes or out of sync.
         loop {
-            let slug = gamma::get_previous_5min_slug();
+            let slug = gamma::get_active_5min_slug();
             let market = gamma::fetch_market_info(&slug, config.outcome_up)
                 .await
                 .with_context(|| format!("fetch market for slug {slug}"))?;
@@ -217,9 +217,9 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             tracing::error!(?e, "tick error");
         }
 
-        // Dynamic 5-min: detect interval close or out-of-sync and signal switch
+        // Dynamic 5-min: detect interval close or out-of-sync and signal switch to next active market
         if let Some((market_info, _)) = interval_info {
-            let expected_slug = gamma::get_previous_5min_slug();
+            let expected_slug = gamma::get_active_5min_slug();
             let is_out_of_sync = market_info.slug != expected_slug;
             let market_just_closed = market_info
                 .close_time_unix

@@ -1,6 +1,6 @@
 //! Resolve BTC 5-min market token_id from Polymarket Gamma API.
-//! Slug pattern: btc-updown-5m-{close_time_unix}. Interval = 300s.
-//! Bot operates on the *previous* interval slug to avoid future market without liquidity.
+//! Slug pattern: btc-updown-5m-{window_start_unix}. Interval = 300s.
+//! Bot operates on the *active* interval (current 5-min window) so we trade the live market.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -37,7 +37,22 @@ pub fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Slug for the market we trade: the *previous* interval (avoids future market without liquidity).
+/// Start of the current 5-min window (floor(now/300)*300). This is the number used in Polymarket slugs.
+#[inline]
+pub fn current_window_start_unix() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before Unix epoch");
+    (now.as_secs() / BTC_5MIN_INTERVAL_SEC) * BTC_5MIN_INTERVAL_SEC
+}
+
+/// Slug for the *active* 5-min market (the window we're currently in). Uses window start so we subscribe to the correct live market.
+/// E.g. between 12:05 and 12:10 ET we use btc-updown-5m-1771995900; from 12:10 we use btc-updown-5m-1771996200.
+pub fn get_active_5min_slug() -> String {
+    format!("btc-updown-5m-{}", current_window_start_unix())
+}
+
+/// Slug for the market we trade: the *previous* interval (legacy; prefer get_active_5min_slug for active interval).
 pub fn get_previous_5min_slug() -> String {
     format!("btc-updown-5m-{}", get_previous_btc_5min_close_time_unix())
 }
@@ -45,15 +60,6 @@ pub fn get_previous_5min_slug() -> String {
 /// Slug for the *current* interval (for reference / next-slug when interval just closed).
 pub fn get_current_5min_slug() -> String {
     format!("btc-updown-5m-{}", get_current_btc_5min_close_time_unix())
-}
-
-/// Legacy: current 5-minute window *start* (Unix seconds). Prefer get_current_btc_5min_close_time_unix for dynamic slug.
-#[inline]
-pub fn current_window_start_unix() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before Unix epoch");
-    (now.as_secs() / BTC_5MIN_INTERVAL_SEC) * BTC_5MIN_INTERVAL_SEC
 }
 
 /// Seconds from now until the current 5-min window ends.
@@ -65,7 +71,7 @@ pub fn secs_until_window_end() -> u64 {
     close.saturating_sub(now.as_secs())
 }
 
-/// Legacy: slug for a given window start. Prefer get_previous_5min_slug() for dynamic operation.
+/// Legacy: slug for a given window start. Prefer get_active_5min_slug() for dynamic operation.
 pub fn btc5m_slug(window_start: u64) -> String {
     format!("btc-updown-5m-{window_start}")
 }
