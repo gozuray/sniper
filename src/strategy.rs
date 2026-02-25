@@ -41,6 +41,7 @@ pub enum Action {
 /// Evaluate the current tick. Returns a single Action following the
 /// priority chain: SL > TP > Buy (early return).
 /// When traded_this_interval is true, no new buy is allowed until the next interval.
+/// When interval_data is Some, blocks buy for min_delay_after_interval_start_sec after interval start or after interval switch.
 pub fn evaluate(
     config: &Config,
     book: &OrderBook,
@@ -49,6 +50,8 @@ pub fn evaluate(
     live_buy: Option<&LiveBuyOrder>,
     book_is_stale: bool,
     traded_this_interval: bool,
+    interval_data: Option<(Option<u64>, tokio::time::Instant)>,
+    now_unix: u64,
 ) -> Action {
     let best_bid = match book.best_bid {
         Some(b) => b,
@@ -81,6 +84,23 @@ pub fn evaluate(
 
     // ── Buy (only if no SL/TP this tick, book not stale) ──────────
     // One trade per interval: if we already traded this 5-min window, do not place/replace buys.
+    // No buy within min_delay_after_interval_start_sec of interval start or after interval switch.
+    let min_delay = config.min_delay_after_interval_start_sec;
+    let within_delay_after_switch = interval_data
+        .as_ref()
+        .map(|(_, switch_instant)| switch_instant.elapsed().as_secs() < min_delay)
+        .unwrap_or(false);
+    let within_delay_after_interval_start = interval_data
+        .and_then(|(close_opt, _)| close_opt)
+        .map(|close_time_unix| {
+            let interval_start = close_time_unix.saturating_sub(300);
+            now_unix.saturating_sub(interval_start) < min_delay
+        })
+        .unwrap_or(false);
+    if within_delay_after_switch || within_delay_after_interval_start {
+        return Action::Nothing;
+    }
+
     if traded_this_interval {
         if let Some(existing) = live_buy {
             let target_price = best_bid.max(config.buy_min).min(config.buy_max);

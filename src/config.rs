@@ -20,6 +20,8 @@ pub struct Config {
     pub dedupe_ttl: Duration,
     pub stale_threshold: Duration,
     pub clob_url: String,
+    /// Seconds to wait after interval start (or after interval switch) before allowing buy. Default 3.
+    pub min_delay_after_interval_start_sec: u64,
 }
 
 impl Config {
@@ -64,6 +66,11 @@ impl Config {
         let clob_url = std::env::var("POLYMARKET_CLOB_URL")
             .unwrap_or_else(|_| "https://clob.polymarket.com".into());
 
+        let min_delay_after_interval_start_sec: u64 = std::env::var("MIN_DELAY_AFTER_INTERVAL_START_SEC")
+            .unwrap_or_else(|_| "3".into())
+            .parse()
+            .unwrap_or(3);
+
         Ok(Self {
             token_id,
             auto_btc5m,
@@ -77,6 +84,7 @@ impl Config {
             dedupe_ttl: Duration::from_millis(dedupe_ttl_ms),
             stale_threshold: Duration::from_millis(stale_ms),
             clob_url,
+            min_delay_after_interval_start_sec,
         })
     }
 }

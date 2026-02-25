@@ -18,6 +18,7 @@ use polymarket_client_sdk::auth::Signer as SignerTrait;
 use crate::config::Config;
 use crate::dedupe::{Dedupe, IntentKind};
 use crate::execution::{Executor, FillStatus};
+use crate::gamma::MarketInfo;
 use crate::orderbook::OrderBook;
 use crate::position::Position;
 use crate::strategy::{Action, LiveBuyOrder};
@@ -44,25 +45,22 @@ async fn main() -> Result<()> {
         .with_chain_id(Some(polymarket_client_sdk::POLYGON));
 
     if config.auto_btc5m {
-        // Rotate to the next BTC 5-min market every 5 minutes
+        // Dynamic 5-min: operate on previous interval slug; switch when interval closes or out of sync.
         loop {
-            let window_start = gamma::current_window_start_unix();
-            let slug = gamma::btc5m_slug(window_start);
-            let token_id = gamma::fetch_token_id(&slug, config.outcome_up)
+            let slug = gamma::get_previous_5min_slug();
+            let market = gamma::fetch_market_info(&slug, config.outcome_up)
                 .await
-                .with_context(|| format!("fetch token_id for slug {slug}"))?;
-            let asset_id: ruint::Uint<256, 4> = token_id
+                .with_context(|| format!("fetch market for slug {slug}"))?;
+            let asset_id: ruint::Uint<256, 4> = market
+                .token_id
                 .parse()
                 .context("TOKEN_ID from Gamma must be valid U256")?;
 
-            let secs_until_end = gamma::secs_until_window_end();
-            let switch_deadline = tokio::time::Instant::now() + Duration::from_secs(secs_until_end);
-
             tracing::info!(
-                slug = %slug,
-                token_id = %token_id,
-                secs_until_switch = secs_until_end,
-                "starting 5-min window"
+                slug = %market.slug,
+                token_id = %market.token_id,
+                close_time_unix = ?market.close_time_unix,
+                "starting 5-min window (dynamic)"
             );
 
             let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
@@ -74,16 +72,21 @@ async fn main() -> Result<()> {
                 .await?;
 
             let executor = Executor::new(client, signer, asset_id);
+            let interval_switch_wall_time = tokio::time::Instant::now();
 
-            run_loop(
+            let should_switch = run_loop(
                 config.clone(),
                 executor,
                 asset_id,
-                Some(switch_deadline),
+                Some((&market, interval_switch_wall_time)),
             )
             .await?;
 
-            tracing::info!("window ended, switching to next market");
+            if should_switch {
+                tracing::info!("interval closed or out of sync, switching to next market");
+                continue;
+            }
+            break;
         }
     } else {
         // Single TOKEN_ID from env
@@ -110,17 +113,15 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     config: Config,
     executor: Executor<S>,
     asset_id: ruint::Uint<256, 4>,
-    switch_deadline: Option<tokio::time::Instant>,
-) -> Result<()> {
+    interval_info: Option<(&MarketInfo, tokio::time::Instant)>,
+) -> Result<bool> {
     let mut book = OrderBook::new();
     let mut position = Position::new();
     let mut dedupe = Dedupe::new(config.dedupe_ttl);
     let mut live_buy: Option<LiveBuyOrder> = None;
     let mut tick_count: u64 = 0;
-    // One trade (buy) per 5-min interval; reset when window switches.
     let mut traded_this_interval = false;
 
-    // Subscribe to WS streams
     let ws_client = polymarket_client_sdk::clob::ws::Client::default();
     let asset_ids = vec![asset_id];
 
@@ -136,14 +137,6 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     let mut book_stream = Box::pin(book_stream);
     let mut price_stream = Box::pin(price_stream);
 
-    // Optional: sleep until next window (for AUTO_BTC5M rotation)
-    let switch_fut = match switch_deadline {
-        Some(d) => futures::future::Either::Left(tokio::time::sleep_until(d)),
-        None => futures::future::Either::Right(futures::future::pending()),
-    };
-    futures::pin_mut!(switch_fut);
-
-    // Fetch initial book snapshot via REST
     match executor.get_book().await {
         Ok(snap) => {
             book.update_best(snap.best_bid, snap.best_ask);
@@ -158,10 +151,6 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
 
     loop {
         tokio::select! {
-            _ = &mut switch_fut => {
-                tracing::info!("switch deadline reached");
-                return Ok(());
-            }
             Some(result) = book_stream.next() => {
                 match result {
                     Ok(snapshot) => {
@@ -198,17 +187,17 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             }
             else => {
                 tracing::warn!("all WS streams closed, reconnecting...");
-                break;
+                return Ok(false);
             }
         }
 
-        // ── Tick processing ────────────────────────────────────────
         tick_count += 1;
         if tick_count % 1000 == 0 {
             dedupe.cleanup();
         }
 
         let stale = book.is_stale(config.stale_threshold);
+        let now_unix = gamma::now_unix();
 
         let result = handle_tick(
             &config,
@@ -219,15 +208,34 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             &mut live_buy,
             &mut traded_this_interval,
             stale,
+            interval_info.map(|(m, t)| (m, t)),
+            now_unix,
         )
         .await;
 
         if let Err(e) = result {
             tracing::error!(?e, "tick error");
         }
-    }
 
-    Ok(())
+        // Dynamic 5-min: detect interval close or out-of-sync and signal switch
+        if let Some((market_info, _)) = interval_info {
+            let expected_slug = gamma::get_previous_5min_slug();
+            let is_out_of_sync = market_info.slug != expected_slug;
+            let market_just_closed = market_info
+                .close_time_unix
+                .map(|t| now_unix >= t)
+                .unwrap_or(false);
+            if is_out_of_sync || market_just_closed {
+                tracing::info!(
+                    current_slug = %market_info.slug,
+                    expected_slug = %expected_slug,
+                    market_just_closed = market_just_closed,
+                    "interval switch: resubscribing to new market"
+                );
+                return Ok(true);
+            }
+        }
+    }
 }
 
 /// Process a single tick. Implements:
@@ -235,6 +243,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
 ///   - SL > TP > Buy priority with early return
 ///   - One buy per interval; never buy outside [buy_min, buy_max]
 ///   - SL FAK retry loop for partial fills
+///   - When interval_info is set: no buy within MIN_DELAY_AFTER_INTERVAL_START_SEC of interval start or switch
 async fn handle_tick<S: SignerTrait + Send + Sync>(
     config: &Config,
     executor: &Executor<S>,
@@ -244,6 +253,8 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
     live_buy: &mut Option<LiveBuyOrder>,
     traded_this_interval: &mut bool,
     book_is_stale: bool,
+    interval_info: Option<(&MarketInfo, tokio::time::Instant)>,
+    now_unix: u64,
 ) -> Result<()> {
     let action = strategy::evaluate(
         config,
@@ -253,6 +264,8 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
         live_buy.as_ref(),
         book_is_stale,
         *traded_this_interval,
+        interval_info.map(|(m, t)| (m.close_time_unix, t)),
+        now_unix,
     );
 
     match action {
