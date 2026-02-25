@@ -179,6 +179,10 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             Some(result) = book_stream.next() => {
                 match result {
                     Ok(snapshot) => {
+                        // Solo aplicar si es para nuestro token (el WS puede enviar varios assets).
+                        if snapshot.asset_id != asset_id {
+                            continue;
+                        }
                         if !ws_first_update_logged {
                             tracing::info!("WS orderbook: primer update en tiempo real recibido");
                             ws_first_update_logged = true;
@@ -208,7 +212,11 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
                             tracing::info!("WS prices: primer update en tiempo real recibido");
                             ws_first_update_logged = true;
                         }
+                        // Solo aplicar cambios de nuestro token; el batch puede incluir ambos outcomes (0.01/0.99 del otro).
                         for change in &price_event.price_changes {
+                            if change.asset_id != asset_id {
+                                continue;
+                            }
                             book.update_best(change.best_bid, change.best_ask);
                         }
                     }
