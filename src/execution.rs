@@ -57,7 +57,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         size: Decimal,
         limit_price: Decimal,
     ) -> Result<OrderResult> {
-        tracing::info!(size = %size, limit = %limit_price, "sending SL sell FAK");
+        tracing::debug!(size = %size, limit = %limit_price, "sending SL sell FAK");
         let resp = self
             .place_limit_sell(token_id, size, limit_price, OrderType::FAK)
             .await?;
@@ -71,7 +71,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         size: Decimal,
         limit_price: Decimal,
     ) -> Result<OrderResult> {
-        tracing::info!(size = %size, limit = %limit_price, "sending TP sell FAK (HFT)");
+        tracing::debug!(size = %size, limit = %limit_price, "sending TP sell FAK (HFT)");
         let resp = self
             .place_limit_sell(token_id, size, limit_price, OrderType::FAK)
             .await?;
@@ -209,7 +209,7 @@ fn classify_sell_response(resp: PostOrderResponse, requested_size: Decimal) -> O
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         order_id = %resp.order_id,
         sdk_status = ?resp.status,
         making = %resp.making_amount,
@@ -245,7 +245,7 @@ fn classify_buy_response(resp: PostOrderResponse, requested_size: Decimal) -> Or
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         order_id = %resp.order_id,
         sdk_status = ?resp.status,
         making = %resp.making_amount,

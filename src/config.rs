@@ -26,6 +26,8 @@ pub struct Config {
     pub min_delay_after_interval_start_sec: u64,
     /// Minimum time (ms) the buy order must stay on the book before we allow cancel/replace. Gives the order time to fill before we cancel it. Default 2000.
     pub buy_order_min_age_ms: u64,
+    /// Max frequency (ms) for syncing position from resting buy order via get_order. Lower = faster fill detection, more REST calls. Default 200. Set lower (e.g. 100) for HFT.
+    pub order_sync_interval_ms: u64,
 }
 
 impl Config {
@@ -90,6 +92,11 @@ impl Config {
             .parse()
             .unwrap_or(2000);
 
+        let order_sync_interval_ms: u64 = std::env::var("ORDER_SYNC_INTERVAL_MS")
+            .unwrap_or_else(|_| "200".into())
+            .parse()
+            .unwrap_or(200);
+
         Ok(Self {
             token_id,
             auto_btc5m,
@@ -106,6 +113,7 @@ impl Config {
             clob_url,
             min_delay_after_interval_start_sec,
             buy_order_min_age_ms,
+            order_sync_interval_ms,
         })
     }
 }

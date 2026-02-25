@@ -203,6 +203,8 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
     let mut dedupe_down = Dedupe::new(config.dedupe_ttl);
     let mut live_buy_up: Option<LiveBuyOrder> = None;
     let mut live_buy_down: Option<LiveBuyOrder> = None;
+    let mut last_order_sync_up: Option<std::time::Instant> = None;
+    let mut last_order_sync_down: Option<std::time::Instant> = None;
     let mut traded_up_this_interval = false;
     let mut traded_down_this_interval = false;
     let mut tick_count: u64 = 0;
@@ -339,6 +341,7 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
             stale_up,
             interval_info_opt,
             now_unix,
+            &mut last_order_sync_up,
         )
         .await;
         if let Err(e) = result_up {
@@ -349,6 +352,12 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
             };
             if should_log {
                 tracing::error!(side = "Up", ?e, "tick error");
+                if err_msg.contains("not enough balance") || err_msg.contains("allowance") {
+                    tracing::error!(
+                        "Para VENDER (SL/TP) hace falta saldo de outcome tokens y allowance de Conditional Tokens. \
+                        Revisa README: cargo run --bin check_balance y approvals (USDC + CTF)."
+                    );
+                }
                 last_tick_error = Some((err_msg, std::time::Instant::now()));
             }
         } else {
@@ -367,6 +376,7 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
             stale_down,
             interval_info_opt,
             now_unix,
+            &mut last_order_sync_down,
         )
         .await;
         if let Err(e) = result_down {
@@ -377,6 +387,12 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
             };
             if should_log {
                 tracing::error!(side = "Down", ?e, "tick error");
+                if err_msg.contains("not enough balance") || err_msg.contains("allowance") {
+                    tracing::error!(
+                        "Para VENDER (SL/TP) hace falta saldo de outcome tokens y allowance de Conditional Tokens. \
+                        Revisa README: cargo run --bin check_balance y approvals (USDC + CTF)."
+                    );
+                }
                 last_tick_error = Some((err_msg, std::time::Instant::now()));
             }
         } else {
@@ -411,6 +427,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     let mut position = Position::new();
     let mut dedupe = Dedupe::new(config.dedupe_ttl);
     let mut live_buy: Option<LiveBuyOrder> = None;
+    let mut last_order_sync: Option<std::time::Instant> = None;
     let mut tick_count: u64 = 0;
     let mut traded_this_interval = false;
 
@@ -565,6 +582,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             stale,
             interval_info.map(|(m, t)| (m, t)),
             now_unix,
+            &mut last_order_sync,
         )
         .await;
 
@@ -578,6 +596,12 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             };
             if should_log {
                 tracing::error!(?e, "tick error");
+                if err_msg.contains("not enough balance") || err_msg.contains("allowance") {
+                    tracing::error!(
+                        "Para VENDER (SL/TP) hace falta saldo de outcome tokens y allowance de Conditional Tokens. \
+                        Revisa README: cargo run --bin check_balance y approvals (USDC + CTF)."
+                    );
+                }
                 last_tick_error = Some((err_msg, std::time::Instant::now()));
             }
         } else {
@@ -611,6 +635,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
 ///   - One buy per interval; never buy outside [buy_min, buy_max]
 ///   - SL FAK retry loop for partial fills
 ///   - When interval_info is set: no buy within MIN_DELAY_AFTER_INTERVAL_START_SEC of interval start or switch
+///   - Position sync from resting buy is throttled (ORDER_SYNC_INTERVAL_MS) so we don't block every tick on REST.
 async fn handle_tick<S: SignerTrait + Send + Sync>(
     config: &Config,
     executor: &Executor<S>,
@@ -623,24 +648,33 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
     book_is_stale: bool,
     interval_info: Option<(&MarketInfo, tokio::time::Instant)>,
     now_unix: u64,
+    last_order_sync: &mut Option<std::time::Instant>,
 ) -> Result<()> {
-    // Sync position from resting buy order: when a limit buy is on the book and gets filled,
-    // we only see it via get_order (size_matched). Update position so TP/SL can trigger.
+    // Sync position from resting buy order at most every order_sync_interval_ms (HFT: avoid REST on every WS message).
+    let sync_interval = std::time::Duration::from_millis(config.order_sync_interval_ms);
     if let Some(buy) = live_buy.as_mut() {
-        if let Ok(Some((size_matched, is_live))) = executor.get_order_matched(&buy.order_id).await {
-            let delta = size_matched - buy.filled_so_far;
-            if delta > dec!(0) {
-                position.add_fill(delta);
-                buy.filled_so_far = size_matched;
-                tracing::info!(order_id = %buy.order_id, size_matched = %size_matched, delta = %delta, "buy order fill synced to position");
+        let should_sync = last_order_sync
+            .map(|t| t.elapsed() >= sync_interval)
+            .unwrap_or(true);
+        if should_sync {
+            if let Ok(Some((size_matched, is_live))) = executor.get_order_matched(&buy.order_id).await {
+                let delta = size_matched - buy.filled_so_far;
+                if delta > dec!(0) {
+                    position.add_fill(delta);
+                    buy.filled_so_far = size_matched;
+                    tracing::info!(order_id = %buy.order_id, size_matched = %size_matched, delta = %delta, "buy order fill synced to position");
+                }
+                if !is_live {
+                    let order_id = buy.order_id.clone();
+                    let _ = executor.cancel_order(&order_id).await;
+                    *live_buy = None;
+                    tracing::debug!(order_id = %order_id, "live buy order no longer on book, cleared");
+                }
             }
-            if !is_live {
-                let order_id = buy.order_id.clone();
-                let _ = executor.cancel_order(&order_id).await;
-                *live_buy = None;
-                tracing::debug!(order_id = %order_id, "live buy order no longer on book, cleared");
-            }
+            *last_order_sync = Some(std::time::Instant::now());
         }
+    } else {
+        *last_order_sync = None;
     }
 
     let action = strategy::evaluate(
@@ -658,9 +692,14 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
 
     match action {
         Action::SendSL {
-            size,
+            size: _,
             mut limit_price,
         } => {
+            // Vender el máximo que tenemos: usar posición actual al ejecutar (puede haber cambiado desde evaluate)
+            let size = position.shares;
+            if size <= dec!(0) {
+                // Sin posición, no hacer nada
+            } else {
             // Refresh book if stale before SL
             if book_is_stale {
                 if let Ok(snap) = executor.get_book(asset_id).await {
@@ -671,7 +710,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                 }
             }
 
-            // SL FAK retry loop for partial fills
+            // SL FAK retry loop: intentar vender todo (partial fill → retry con el resto)
             let mut remaining = size;
             loop {
                 if remaining <= dec!(0) {
@@ -680,9 +719,14 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                 if !dedupe.can_send(IntentKind::SellSL, Some(remaining)) {
                     break;
                 }
+                // Nunca enviar más de lo que tenemos
+                let to_sell = remaining.min(position.shares);
+                if to_sell <= dec!(0) {
+                    break;
+                }
 
-                let result = executor.sell_fak(asset_id, remaining, limit_price).await?;
-                dedupe.record(IntentKind::SellSL, Some(remaining));
+                let result = executor.sell_fak(asset_id, to_sell, limit_price).await?;
+                dedupe.record(IntentKind::SellSL, Some(to_sell));
 
                 if result.filled_size > dec!(0) {
                     position.subtract_fill(result.filled_size);
@@ -717,13 +761,19 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                     }
                 }
             }
+            }
             // Early return: no TP or buy this tick
         }
 
         Action::SendTP {
-            size,
+            size: _,
             mut limit_price,
         } => {
+            // Vender el máximo que tenemos: usar posición actual al ejecutar
+            let size = position.shares;
+            if size <= dec!(0) {
+                // Sin posición, no hacer nada
+            } else {
             if book_is_stale {
                 if let Ok(snap) = executor.get_book(asset_id).await {
                     book.update_best(snap.best_bid, snap.best_ask);
@@ -733,7 +783,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                 }
             }
 
-            // TP FAK retry loop (same HFT as SL): sell as fast as possible, retry remainder on partial fill
+            // TP FAK retry loop: intentar vender todo (partial fill → retry con el resto)
             let mut remaining = size;
             loop {
                 if remaining <= dec!(0) {
@@ -742,9 +792,13 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                 if !dedupe.can_send(IntentKind::SellTP, Some(remaining)) {
                     break;
                 }
+                let to_sell = remaining.min(position.shares);
+                if to_sell <= dec!(0) {
+                    break;
+                }
 
-                let result = executor.sell_fak_tp(asset_id, remaining, limit_price).await?;
-                dedupe.record(IntentKind::SellTP, Some(remaining));
+                let result = executor.sell_fak_tp(asset_id, to_sell, limit_price).await?;
+                dedupe.record(IntentKind::SellTP, Some(to_sell));
 
                 if result.filled_size > dec!(0) {
                     position.subtract_fill(result.filled_size);
@@ -777,6 +831,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                         break;
                     }
                 }
+            }
             }
             // Early return: no buy this tick
         }
