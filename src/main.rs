@@ -11,7 +11,6 @@ use futures::StreamExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
-use std::time::Duration;
 
 use polymarket_client_sdk::auth::Signer as SignerTrait;
 
@@ -88,6 +87,7 @@ async fn main() -> Result<()> {
             }
             break;
         }
+        Ok(())
     } else {
         // Single TOKEN_ID from env
         let asset_id: ruint::Uint<256, 4> = config
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
 
         let executor = Executor::new(client, signer, asset_id);
 
-        run_loop(config, executor, asset_id, None).await
+        run_loop(config, executor, asset_id, None).await.map(|_| ())
     }
 }
 
