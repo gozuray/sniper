@@ -137,6 +137,11 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     let mut book_stream = Box::pin(book_stream);
     let mut price_stream = Box::pin(price_stream);
 
+    // Last printed best bid/ask to avoid flooding; show WS prices vs entry range while waiting
+    let mut last_printed_bid: Option<Decimal> = None;
+    let mut last_printed_ask: Option<Decimal> = None;
+    const PRICE_LOG_EVERY_N_TICKS: u64 = 50;
+
     match executor.get_book().await {
         Ok(snap) => {
             book.update_best(snap.best_bid, snap.best_ask);
@@ -194,6 +199,28 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
         tick_count += 1;
         if tick_count % 1000 == 0 {
             dedupe.cleanup();
+        }
+
+        // Mostrar en terminal precios del libro (WS) y rango de entrada configurado
+        let bid_changed = book.best_bid != last_printed_bid;
+        let ask_changed = book.best_ask != last_printed_ask;
+        if (tick_count % PRICE_LOG_EVERY_N_TICKS == 0 || bid_changed || ask_changed)
+            && (book.best_bid.is_some() || book.best_ask.is_some())
+        {
+            let in_range = book
+                .best_bid
+                .map(|b| b >= config.buy_min && b <= config.buy_max)
+                .unwrap_or(false);
+            tracing::info!(
+                best_bid = ?book.best_bid,
+                best_ask = ?book.best_ask,
+                buy_min = %config.buy_min,
+                buy_max = %config.buy_max,
+                in_entry_zone = in_range,
+                "WS book | esperando entrada en [buy_min, buy_max]"
+            );
+            last_printed_bid = book.best_bid;
+            last_printed_ask = book.best_ask;
         }
 
         let stale = book.is_stale(config.stale_threshold);
