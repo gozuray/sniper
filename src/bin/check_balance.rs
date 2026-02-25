@@ -37,7 +37,7 @@ struct RpcError {
 }
 
 fn address_to_hex_64(addr: &impl std::fmt::Display) -> String {
-    let s = format!("{:?}", addr);
+    let s = format!("{}", addr);
     let s = s.trim_start_matches("0x");
     let s = if s.len() >= 40 { &s[s.len() - 40..] } else { s };
     format!("{:0>64}", s.to_lowercase())
@@ -80,7 +80,10 @@ async fn main_impl() -> Result<()> {
     println!("  EOA  — USDC balance: {} USDC, allowance (CTF): {} USDC", balance_eoa, allowance_eoa);
 
     // --- Saldo y allowance de la Safe (Polymarket) ---
-    let safe_hex = address_to_hex_64(&safe_address);
+    let safe_addr = safe_address
+        .as_ref()
+        .context("derived Safe wallet address (Polymarket) no disponible")?;
+    let safe_hex = address_to_hex_64(safe_addr);
     let data_balance_safe = format!("0x{}{}", SELECTOR_BALANCE, safe_hex);
     let balance_raw_safe = eth_call(&client, &rpc_url, USDC_POLYGON, &data_balance_safe).await?;
     let balance_safe = parse_hex_u256(&balance_raw_safe)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
