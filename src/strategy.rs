@@ -15,6 +15,8 @@ pub struct LiveBuyOrder {
     pub size: Decimal,
     /// When the order was placed; used to avoid cancelling before it has time to fill.
     pub placed_at: Instant,
+    /// Filled amount we have already added to position (from post_order response or previous sync).
+    pub filled_so_far: Decimal,
 }
 
 #[derive(Debug)]

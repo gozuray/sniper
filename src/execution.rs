@@ -114,6 +114,23 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         Ok(())
     }
 
+    /// Get order by id (for syncing position when a resting buy gets filled).
+    /// Returns (size_matched, is_still_open). None if order not found (e.g. already filled and removed).
+    pub async fn get_order_matched(&self, order_id: &str) -> Result<Option<(Decimal, bool)>> {
+        use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
+        let order: OpenOrderResponse = match self.client.order(order_id).await {
+            Ok(o) => o,
+            Err(e) => {
+                // 404 or similar: order not found (filled and gone, or cancelled)
+                tracing::debug!(order_id, ?e, "get_order failed (order may be filled/cancelled)");
+                return Ok(None);
+            }
+        };
+        let size_matched = order.size_matched;
+        let is_live = order.status == OrderStatusType::Live;
+        Ok(Some((size_matched, is_live)))
+    }
+
     // ── GET /book (REST fallback for stale book) ───────────────────
 
     pub async fn get_book(&self) -> Result<BookSnapshot> {

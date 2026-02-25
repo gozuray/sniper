@@ -13,7 +13,7 @@ use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::time::Duration;
 
-use polymarket_client_sdk::auth::{Credentials, Signer as SignerTrait};
+use polymarket_client_sdk::auth::Signer as SignerTrait;
 use polymarket_client_sdk::clob::types::SignatureType;
 
 use crate::config::Config;
@@ -277,13 +277,15 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
                 .best_ask
                 .map(|a| a >= config.buy_min && a <= config.buy_max)
                 .unwrap_or(false);
+            let bid = book.best_bid.map(|b| b.to_string()).unwrap_or_else(|| "-".into());
+            let ask = book.best_ask.map(|a| a.to_string()).unwrap_or_else(|| "-".into());
             tracing::info!(
-                best_bid = ?book.best_bid,
-                best_ask = ?book.best_ask,
-                buy_min = %config.buy_min,
-                buy_max = %config.buy_max,
-                in_entry_zone = in_range,
-                "WS book | entrada cuando best_ask en [buy_min, buy_max]"
+                "bid={} ask={} buy_min={} buy_max={} zone={}",
+                bid,
+                ask,
+                config.buy_min,
+                config.buy_max,
+                in_range
             );
             last_printed_bid = book.best_bid;
             last_printed_ask = book.best_ask;
@@ -361,6 +363,25 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
     interval_info: Option<(&MarketInfo, tokio::time::Instant)>,
     now_unix: u64,
 ) -> Result<()> {
+    // Sync position from resting buy order: when a limit buy is on the book and gets filled,
+    // we only see it via get_order (size_matched). Update position so TP/SL can trigger.
+    if let Some(buy) = live_buy.as_mut() {
+        if let Ok(Some((size_matched, is_live))) = executor.get_order_matched(&buy.order_id).await {
+            let delta = size_matched - buy.filled_so_far;
+            if delta > dec!(0) {
+                position.add_fill(delta);
+                buy.filled_so_far = size_matched;
+                tracing::info!(order_id = %buy.order_id, size_matched = %size_matched, delta = %delta, "buy order fill synced to position");
+            }
+            if !is_live {
+                let order_id = buy.order_id.clone();
+                let _ = executor.cancel_order(&order_id).await;
+                *live_buy = None;
+                tracing::debug!(order_id = %order_id, "live buy order no longer on book, cleared");
+            }
+        }
+    }
+
     let action = strategy::evaluate(
         config,
         book,
@@ -517,6 +538,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                             price,
                             size,
                             placed_at: std::time::Instant::now(),
+                            filled_so_far: result.filled_size,
                         });
                     }
                 }
@@ -556,6 +578,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                             price: new_price,
                             size: new_size,
                             placed_at: std::time::Instant::now(),
+                            filled_so_far: result.filled_size,
                         });
                     }
                 }
