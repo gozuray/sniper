@@ -274,8 +274,8 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             && (book.best_bid.is_some() || book.best_ask.is_some())
         {
             let in_range = book
-                .best_bid
-                .map(|b| b >= config.buy_min && b <= config.buy_max)
+                .best_ask
+                .map(|a| a >= config.buy_min && a <= config.buy_max)
                 .unwrap_or(false);
             tracing::info!(
                 best_bid = ?book.best_bid,
@@ -283,7 +283,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
                 buy_min = %config.buy_min,
                 buy_max = %config.buy_max,
                 in_entry_zone = in_range,
-                "WS book | esperando entrada en [buy_min, buy_max]"
+                "WS book | entrada cuando best_ask en [buy_min, buy_max]"
             );
             last_printed_bid = book.best_bid;
             last_printed_ask = book.best_ask;
@@ -462,9 +462,9 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
         }
 
         Action::PlaceBuy { size, price } => {
-            // Never send buy outside configured range
+            // Never send buy outside configured range (defensive clamp)
             let price = price.max(config.buy_min).min(config.buy_max);
-            dedupe.record(IntentKind::Buy, None); // antes de la llamada: 1 intento por TTL aunque falle
+            dedupe.record(IntentKind::Buy, None);
             match executor.buy_limit(size, price).await {
                 Ok(result) => {
                     *traded_this_interval = true;
@@ -482,7 +482,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                     }
                 }
                 Err(e) => {
-                    *traded_this_interval = true; // no reintentar compra este intervalo aunque falle (ej. balance)
+                    *traded_this_interval = true;
                     return Err(e);
                 }
             }
@@ -501,7 +501,6 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
             let _ = executor.cancel_order(&cancel_order_id).await;
             *live_buy = None;
 
-            // Never send buy outside configured range
             let new_price = new_price.max(config.buy_min).min(config.buy_max);
             dedupe.record(IntentKind::Buy, None);
             match executor.buy_limit(new_size, new_price).await {

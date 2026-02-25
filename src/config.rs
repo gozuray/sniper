@@ -48,10 +48,10 @@ impl Config {
 
         let order_size = parse_env_decimal("ORDER_SIZE", dec!(100))?;
         let max_position = parse_env_decimal("MAX_POSITION", dec!(500))?;
-        let buy_min = parse_env_decimal("BUY_MIN", dec!(0.93))?;
-        let buy_max = parse_env_decimal("BUY_MAX", dec!(0.95))?;
-        let take_profit_trigger = parse_env_decimal("TAKE_PROFIT", dec!(0.97))?;
-        let stop_loss_trigger = parse_env_decimal("STOP_LOSS", dec!(0.90))?;
+        let buy_min = normalize_price_to_zero_one(parse_env_decimal("BUY_MIN", dec!(0.93))?);
+        let buy_max = normalize_price_to_zero_one(parse_env_decimal("BUY_MAX", dec!(0.95))?);
+        let take_profit_trigger = normalize_price_to_zero_one(parse_env_decimal("TAKE_PROFIT", dec!(0.97))?);
+        let stop_loss_trigger = normalize_price_to_zero_one(parse_env_decimal("STOP_LOSS", dec!(0.90))?);
 
         let dedupe_ttl_ms: u64 = std::env::var("DEDUPE_TTL_MS")
             .unwrap_or_else(|_| "50".into())
@@ -93,5 +93,14 @@ fn parse_env_decimal(key: &str, default: Decimal) -> Result<Decimal> {
     match std::env::var(key) {
         Ok(val) => val.parse().with_context(|| format!("Invalid {key}")),
         Err(_) => Ok(default),
+    }
+}
+
+/// Normalize price to [0, 1]. If value > 1, treat as cents (e.g. 95 -> 0.95). Matches polybot normalizePriceToZeroOne.
+fn normalize_price_to_zero_one(v: Decimal) -> Decimal {
+    if v > dec!(1) {
+        (v / dec!(100)).min(dec!(1)).max(Decimal::ZERO)
+    } else {
+        v.min(dec!(1)).max(Decimal::ZERO)
     }
 }

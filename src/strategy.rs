@@ -83,10 +83,12 @@ pub fn evaluate(
     }
 
     // ── Buy (only if no SL/TP this tick, book not stale) ──────────
-    // Only buy when the order book has actually reached the entry zone: best_bid in [buy_min, buy_max].
-    let in_entry_zone = best_bid >= config.buy_min && best_bid <= config.buy_max;
+    // Only buy when the price we pay (best_ask) is in [buy_min, buy_max]. No best_ask = no buy.
+    let in_entry_zone = match book.best_ask {
+        Some(a) => a >= config.buy_min && a <= config.buy_max,
+        None => false,
+    };
 
-    // If we're outside the entry zone: cancel any live buy (we don't want orders sitting outside range), else do nothing.
     if !in_entry_zone {
         return match live_buy {
             Some(existing) => Action::CancelBuy {
@@ -96,8 +98,8 @@ pub fn evaluate(
         };
     }
 
-    // From here, best_bid is in [buy_min, buy_max]. Use it as the limit price (no clamping needed).
-    let target_price = best_bid;
+    // best_ask is Some and in range; use it as limit price (clamped to be safe).
+    let target_price = book.best_ask.unwrap().max(config.buy_min).min(config.buy_max);
 
     // One trade per interval; no buy within min_delay after interval start or switch.
     let min_delay = config.min_delay_after_interval_start_sec;
