@@ -83,8 +83,23 @@ pub fn evaluate(
     }
 
     // ── Buy (only if no SL/TP this tick, book not stale) ──────────
-    // One trade per interval: if we already traded this 5-min window, do not place/replace buys.
-    // No buy within min_delay_after_interval_start_sec of interval start or after interval switch.
+    // Only buy when the order book has actually reached the entry zone: best_bid in [buy_min, buy_max].
+    let in_entry_zone = best_bid >= config.buy_min && best_bid <= config.buy_max;
+
+    // If we're outside the entry zone: cancel any live buy (we don't want orders sitting outside range), else do nothing.
+    if !in_entry_zone {
+        return match live_buy {
+            Some(existing) => Action::CancelBuy {
+                order_id: existing.order_id.clone(),
+            },
+            None => Action::Nothing,
+        };
+    }
+
+    // From here, best_bid is in [buy_min, buy_max]. Use it as the limit price (no clamping needed).
+    let target_price = best_bid;
+
+    // One trade per interval; no buy within min_delay after interval start or switch.
     let min_delay = config.min_delay_after_interval_start_sec;
     let within_delay_after_switch = interval_data
         .as_ref()
@@ -102,14 +117,6 @@ pub fn evaluate(
     }
 
     if traded_this_interval {
-        if let Some(existing) = live_buy {
-            let target_price = best_bid.max(config.buy_min).min(config.buy_max);
-            if target_price < config.buy_min || target_price > config.buy_max {
-                return Action::CancelBuy {
-                    order_id: existing.order_id.clone(),
-                };
-            }
-        }
         return Action::Nothing;
     }
 
@@ -125,20 +132,6 @@ pub fn evaluate(
     let size = config.order_size.min(remaining_capacity);
     if size <= Decimal::ZERO {
         return Action::Nothing;
-    }
-
-    // Target buy price: join best_bid, clamped to [buy_min, buy_max].
-    // Bot never buys outside this range.
-    let target_price = best_bid.max(config.buy_min).min(config.buy_max);
-
-    // Only place if the target is actually within our range
-    if target_price < config.buy_min || target_price > config.buy_max {
-        return match live_buy {
-            Some(existing) => Action::CancelBuy {
-                order_id: existing.order_id.clone(),
-            },
-            None => Action::Nothing,
-        };
     }
 
     if !dedupe.can_send(IntentKind::Buy, None) {
