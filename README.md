@@ -41,6 +41,9 @@ When `AUTO_BTC5M=1`, the bot switches to the next 5-minute market automatically 
 |---|---|---|---|
 | `POLYMARKET_PRIVATE_KEY` | yes | -- | Hex private key for signing orders |
 | `TOKEN_ID` | yes* | -- | U256 token/asset ID of the outcome to trade (*omit when AUTO_BTC5M=1) |
+| `POLYMARKET_API_KEY` | no | -- | CLOB API key (UUID). If set, also set `_SECRET` and `_PASSPHRASE` to use that account’s balance |
+| `POLYMARKET_API_SECRET` | no | -- | CLOB API secret (required if `POLYMARKET_API_KEY` is set) |
+| `POLYMARKET_API_PASSPHRASE` | no | -- | CLOB API passphrase (required if `POLYMARKET_API_KEY` is set) |
 | `AUTO_BTC5M` | no | 0 | Set to `1` or `true` to auto-rotate to the current BTC 5-min market every 5 minutes |
 | `OUTCOME` | no | up | When AUTO_BTC5M=1: `up` or `down` (which outcome to trade) |
 | `ORDER_SIZE` | no | 100 | Size per order (shares for sells, USDC for buys) |
@@ -88,6 +91,35 @@ trading. See the
 
 Proxy/Safe wallets (email login, browser extension) do **not** need manual
 approvals.
+
+### "Not enough balance / allowance" but I have balance
+
+The CLOB rejects orders when **either** your USDC **balance** on Polygon is too low
+**or** your **allowance** (permission for the exchange contract to spend USDC) is
+missing or too low. With an EOA wallet you often have balance but **allowance = 0**
+until you run the approvals once.
+
+**Check what the chain sees (read-only, no gas, no orders):**
+
+```bash
+cargo run --bin check_balance
+```
+
+This prints your **EOA** address (from your private key), the **Polymarket trading wallet**
+(Gnosis Safe derived from it), and USDC balance/allowance for each. If you use
+Phantom or MetaMask with Polymarket, the site uses the Safe; the bot now does too
+(see below).
+
+If you have balance but allowance is 0 (EOA only), run the
+[approvals example](https://github.com/Polymarket/rs-clob-client/blob/main/examples/approvals.rs)
+once (same `POLYMARKET_PRIVATE_KEY`, same network).
+
+### Bot uses your Polymarket (Safe) balance
+
+If you connected Polymarket with a **browser wallet** (Phantom, MetaMask, etc.),
+the site uses a **derived wallet** (Gnosis Safe), not your EOA. The bot is
+configured to use **SignatureType::GnosisSafe**, so it trades with the same
+account and balance you see on Polymarket. No need to move funds to the EOA.
 
 ## Architecture
 

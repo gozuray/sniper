@@ -13,7 +13,8 @@ use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::time::Duration;
 
-use polymarket_client_sdk::auth::Signer as SignerTrait;
+use polymarket_client_sdk::auth::{Credentials, Signer as SignerTrait};
+use polymarket_client_sdk::clob::types::SignatureType;
 
 use crate::config::Config;
 use crate::dedupe::{Dedupe, IntentKind};
@@ -22,6 +23,18 @@ use crate::gamma::MarketInfo;
 use crate::orderbook::OrderBook;
 use crate::position::Position;
 use crate::strategy::{Action, LiveBuyOrder};
+
+/// Build L2 API credentials from env if POLYMARKET_API_KEY, _SECRET, _PASSPHRASE are all set.
+fn api_credentials_from_env() -> Result<Option<polymarket_client_sdk::auth::Credentials>> {
+    let key = match std::env::var("POLYMARKET_API_KEY") {
+        Ok(k) => k,
+        Err(_) => return Ok(None),
+    };
+    let secret = std::env::var("POLYMARKET_API_SECRET").context("POLYMARKET_API_SECRET required when POLYMARKET_API_KEY is set")?;
+    let passphrase = std::env::var("POLYMARKET_API_PASSPHRASE").context("POLYMARKET_API_PASSPHRASE required when POLYMARKET_API_KEY is set")?;
+    let api_key: polymarket_client_sdk::auth::ApiKey = key.parse().context("POLYMARKET_API_KEY must be a valid UUID")?;
+    Ok(Some(polymarket_client_sdk::auth::Credentials::new(api_key, secret, passphrase)))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -79,10 +92,13 @@ async fn main() -> Result<()> {
             let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
                 .with_chain_id(Some(polymarket_client_sdk::POLYGON));
             let sdk_config = polymarket_client_sdk::clob::Config::default();
-            let client = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
+            let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
                 .authentication_builder(&signer)
-                .authenticate()
-                .await?;
+                .signature_type(SignatureType::GnosisSafe);
+            if let Some(creds) = api_credentials_from_env()? {
+                builder = builder.credentials(creds);
+            }
+            let client = builder.authenticate().await?;
 
             let executor = Executor::new(client, signer, asset_id);
             let interval_switch_wall_time = tokio::time::Instant::now();
@@ -110,10 +126,13 @@ async fn main() -> Result<()> {
             .context("TOKEN_ID must be a valid U256 number")?;
 
         let sdk_config = polymarket_client_sdk::clob::Config::default();
-        let client = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
+        let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
             .authentication_builder(&signer)
-            .authenticate()
-            .await?;
+            .signature_type(SignatureType::GnosisSafe);
+        if let Some(creds) = api_credentials_from_env()? {
+            builder = builder.credentials(creds);
+        }
+        let client = builder.authenticate().await?;
 
         tracing::info!("CLOB client authenticated");
 
@@ -445,22 +464,27 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
         Action::PlaceBuy { size, price } => {
             // Never send buy outside configured range
             let price = price.max(config.buy_min).min(config.buy_max);
-            let result = executor.buy_limit(size, price).await?;
-            dedupe.record(IntentKind::Buy, None);
-            *traded_this_interval = true;
-
-            if result.filled_size > dec!(0) {
-                position.add_fill(result.filled_size);
-            }
-
-            if result.status == FillStatus::Placed
-                || result.status == FillStatus::PartiallyFilled
-            {
-                *live_buy = Some(LiveBuyOrder {
-                    order_id: result.order_id,
-                    price,
-                    size,
-                });
+            dedupe.record(IntentKind::Buy, None); // antes de la llamada: 1 intento por TTL aunque falle
+            match executor.buy_limit(size, price).await {
+                Ok(result) => {
+                    *traded_this_interval = true;
+                    if result.filled_size > dec!(0) {
+                        position.add_fill(result.filled_size);
+                    }
+                    if result.status == FillStatus::Placed
+                        || result.status == FillStatus::PartiallyFilled
+                    {
+                        *live_buy = Some(LiveBuyOrder {
+                            order_id: result.order_id,
+                            price,
+                            size,
+                        });
+                    }
+                }
+                Err(e) => {
+                    *traded_this_interval = true; // no reintentar compra este intervalo aunque falle (ej. balance)
+                    return Err(e);
+                }
             }
         }
 
@@ -479,22 +503,27 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
 
             // Never send buy outside configured range
             let new_price = new_price.max(config.buy_min).min(config.buy_max);
-            let result = executor.buy_limit(new_size, new_price).await?;
             dedupe.record(IntentKind::Buy, None);
-            *traded_this_interval = true;
-
-            if result.filled_size > dec!(0) {
-                position.add_fill(result.filled_size);
-            }
-
-            if result.status == FillStatus::Placed
-                || result.status == FillStatus::PartiallyFilled
-            {
-                *live_buy = Some(LiveBuyOrder {
-                    order_id: result.order_id,
-                    price: new_price,
-                    size: new_size,
-                });
+            match executor.buy_limit(new_size, new_price).await {
+                Ok(result) => {
+                    *traded_this_interval = true;
+                    if result.filled_size > dec!(0) {
+                        position.add_fill(result.filled_size);
+                    }
+                    if result.status == FillStatus::Placed
+                        || result.status == FillStatus::PartiallyFilled
+                    {
+                        *live_buy = Some(LiveBuyOrder {
+                            order_id: result.order_id,
+                            price: new_price,
+                            size: new_size,
+                        });
+                    }
+                }
+                Err(e) => {
+                    *traded_this_interval = true;
+                    return Err(e);
+                }
             }
         }
 

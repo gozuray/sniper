@@ -3,6 +3,10 @@ name = "sniper"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "check_balance"
+path = "src/bin/check_balance.rs"
+
 [dependencies]
 polymarket-client-sdk = { version = "0.4", features = ["clob", "ws"] }
 tokio = { version = "1", features = ["full"] }
