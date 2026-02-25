@@ -74,42 +74,86 @@ async fn main() -> Result<()> {
                 now_unix,
                 "active 5-min market (Polymarket: btc-updown-5m-<window_start>, ventana 300s)"
             );
-            let market = gamma::fetch_market_info(&slug, config.outcome_up)
-                .await
-                .with_context(|| format!("fetch market for slug {slug}"))?;
-            let asset_id: ruint::Uint<256, 4> = market
-                .token_id
-                .parse()
-                .context("TOKEN_ID from Gamma must be valid U256")?;
 
-            tracing::info!(
-                slug = %market.slug,
-                token_id = %market.token_id,
-                close_time_unix = ?market.close_time_unix,
-                "starting 5-min window (dynamic)"
-            );
+            let (market_up, market_down, asset_id_up, asset_id_down, executor, interval_switch_wall_time) = if config.trade_both_sides {
+                let (market_up, market_down) = gamma::fetch_both_market_infos(&slug)
+                    .await
+                    .with_context(|| format!("fetch both outcomes for slug {slug}"))?;
+                let asset_id_up: ruint::Uint<256, 4> = market_up
+                    .token_id
+                    .parse()
+                    .context("Up TOKEN_ID from Gamma must be valid U256")?;
+                let asset_id_down: ruint::Uint<256, 4> = market_down
+                    .token_id
+                    .parse()
+                    .context("Down TOKEN_ID from Gamma must be valid U256")?;
+                tracing::info!(
+                    slug = %market_up.slug,
+                    token_up = %market_up.token_id,
+                    token_down = %market_down.token_id,
+                    close_time_unix = ?market_up.close_time_unix,
+                    "starting 5-min window (dual: Up + Down)"
+                );
+                let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
+                    .with_chain_id(Some(polymarket_client_sdk::POLYGON));
+                let sdk_config = polymarket_client_sdk::clob::Config::default();
+                let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
+                    .authentication_builder(&signer)
+                    .signature_type(SignatureType::GnosisSafe);
+                if let Some(creds) = api_credentials_from_env()? {
+                    builder = builder.credentials(creds);
+                }
+                let client = builder.authenticate().await?;
+                let interval_switch_wall_time = tokio::time::Instant::now();
+                (market_up, market_down, asset_id_up, asset_id_down, Executor::new(client, signer), interval_switch_wall_time)
+            } else {
+                let market = gamma::fetch_market_info(&slug, config.outcome_up)
+                    .await
+                    .with_context(|| format!("fetch market for slug {slug}"))?;
+                let asset_id: ruint::Uint<256, 4> = market
+                    .token_id
+                    .parse()
+                    .context("TOKEN_ID from Gamma must be valid U256")?;
+                tracing::info!(
+                    slug = %market.slug,
+                    token_id = %market.token_id,
+                    close_time_unix = ?market.close_time_unix,
+                    "starting 5-min window (dynamic)"
+                );
+                let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
+                    .with_chain_id(Some(polymarket_client_sdk::POLYGON));
+                let sdk_config = polymarket_client_sdk::clob::Config::default();
+                let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
+                    .authentication_builder(&signer)
+                    .signature_type(SignatureType::GnosisSafe);
+                if let Some(creds) = api_credentials_from_env()? {
+                    builder = builder.credentials(creds);
+                }
+                let client = builder.authenticate().await?;
+                let interval_switch_wall_time = tokio::time::Instant::now();
+                let market_up = market.clone();
+                let market_down = market;
+                (market_up, market_down, asset_id, asset_id, Executor::new(client, signer), interval_switch_wall_time)
+            };
 
-            let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
-                .with_chain_id(Some(polymarket_client_sdk::POLYGON));
-            let sdk_config = polymarket_client_sdk::clob::Config::default();
-            let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
-                .authentication_builder(&signer)
-                .signature_type(SignatureType::GnosisSafe);
-            if let Some(creds) = api_credentials_from_env()? {
-                builder = builder.credentials(creds);
-            }
-            let client = builder.authenticate().await?;
-
-            let executor = Executor::new(client, signer, asset_id);
-            let interval_switch_wall_time = tokio::time::Instant::now();
-
-            let should_switch = run_loop(
-                config.clone(),
-                executor,
-                asset_id,
-                Some((&market, interval_switch_wall_time)),
-            )
-            .await?;
+            let should_switch = if config.trade_both_sides {
+                run_loop_dual(
+                    config.clone(),
+                    executor,
+                    asset_id_up,
+                    asset_id_down,
+                    (&market_up, &market_down, &interval_switch_wall_time),
+                )
+                .await?
+            } else {
+                run_loop(
+                    config.clone(),
+                    executor,
+                    asset_id_up,
+                    Some((&market_up, interval_switch_wall_time)),
+                )
+                .await?
+            };
 
             if should_switch {
                 tracing::info!("interval closed or out of sync, switching to next market");
@@ -136,9 +180,224 @@ async fn main() -> Result<()> {
 
         tracing::info!("CLOB client authenticated");
 
-        let executor = Executor::new(client, signer, asset_id);
+        let executor = Executor::new(client, signer);
 
         run_loop(config, executor, asset_id, None).await.map(|_| ())
+    }
+}
+
+/// Dual outcome: scan and trade both Up and Down; execute when price is in range on either side.
+async fn run_loop_dual<S: SignerTrait + Send + Sync>(
+    config: Config,
+    executor: Executor<S>,
+    asset_id_up: ruint::Uint<256, 4>,
+    asset_id_down: ruint::Uint<256, 4>,
+    interval_info: (&MarketInfo, &MarketInfo, &tokio::time::Instant),
+) -> Result<bool> {
+    let (market_up, _market_down, interval_switch_wall_time) = interval_info;
+    let mut book_up = OrderBook::new();
+    let mut book_down = OrderBook::new();
+    let mut position_up = Position::new();
+    let mut position_down = Position::new();
+    let mut dedupe_up = Dedupe::new(config.dedupe_ttl);
+    let mut dedupe_down = Dedupe::new(config.dedupe_ttl);
+    let mut live_buy_up: Option<LiveBuyOrder> = None;
+    let mut live_buy_down: Option<LiveBuyOrder> = None;
+    let mut traded_up_this_interval = false;
+    let mut traded_down_this_interval = false;
+    let mut tick_count: u64 = 0;
+
+    let mut last_tick_error: Option<(String, std::time::Instant)> = None;
+    const TICK_ERROR_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let ws_client = polymarket_client_sdk::clob::ws::Client::default();
+    let asset_ids = vec![asset_id_up, asset_id_down];
+
+    tracing::info!("subscribing to WS orderbook + prices (Up + Down)");
+
+    let book_stream = ws_client
+        .subscribe_orderbook(asset_ids.clone())
+        .context("failed to subscribe to orderbook")?;
+    let price_stream = ws_client
+        .subscribe_prices(asset_ids.clone())
+        .context("failed to subscribe to prices")?;
+
+    let mut book_stream = Box::pin(book_stream);
+    let mut price_stream = Box::pin(price_stream);
+
+    let mut ws_first_update_logged = false;
+    const PRICE_LOG_EVERY_N_TICKS: u64 = 300;
+
+    if let Ok(snap) = executor.get_book(asset_id_up).await {
+        book_up.update_best(snap.best_bid, snap.best_ask);
+        tracing::info!(best_bid = ?book_up.best_bid, best_ask = ?book_up.best_ask, "initial book Up");
+    }
+    if let Ok(snap) = executor.get_book(asset_id_down).await {
+        book_down.update_best(snap.best_bid, snap.best_ask);
+        tracing::info!(best_bid = ?book_down.best_bid, best_ask = ?book_down.best_ask, "initial book Down");
+    }
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+
+    loop {
+        tokio::select! {
+            Some(result) = book_stream.next() => {
+                match result {
+                    Ok(snapshot) => {
+                        if snapshot.asset_id == asset_id_up {
+                            if !ws_first_update_logged {
+                                tracing::info!("WS orderbook: primer update en tiempo real recibido (dual)");
+                                ws_first_update_logged = true;
+                            }
+                            let bids: Vec<(Decimal, Decimal)> = snapshot.bids.iter().map(|l| (l.price, l.size)).collect();
+                            let asks: Vec<(Decimal, Decimal)> = snapshot.asks.iter().map(|l| (l.price, l.size)).collect();
+                            book_up.update_from_levels(&bids, &asks);
+                        } else if snapshot.asset_id == asset_id_down {
+                            if !ws_first_update_logged {
+                                tracing::info!("WS orderbook: primer update en tiempo real recibido (dual)");
+                                ws_first_update_logged = true;
+                            }
+                            let bids: Vec<(Decimal, Decimal)> = snapshot.bids.iter().map(|l| (l.price, l.size)).collect();
+                            let asks: Vec<(Decimal, Decimal)> = snapshot.asks.iter().map(|l| (l.price, l.size)).collect();
+                            book_down.update_from_levels(&bids, &asks);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "WS book stream error");
+                        continue;
+                    }
+                }
+            }
+            Some(result) = price_stream.next() => {
+                match result {
+                    Ok(price_event) => {
+                        if !ws_first_update_logged {
+                            tracing::info!("WS prices: primer update en tiempo real recibido (dual)");
+                            ws_first_update_logged = true;
+                        }
+                        for change in &price_event.price_changes {
+                            if change.asset_id == asset_id_up {
+                                book_up.update_best(change.best_bid, change.best_ask);
+                            } else if change.asset_id == asset_id_down {
+                                book_down.update_best(change.best_bid, change.best_ask);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "WS price stream error");
+                        continue;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                tracing::info!(
+                    up_bid = ?book_up.best_bid, up_ask = ?book_up.best_ask,
+                    down_bid = ?book_down.best_bid, down_ask = ?book_down.best_ask,
+                    "heartbeat dual (Up + Down)"
+                );
+            }
+            else => {
+                tracing::warn!("all WS streams closed, reconnecting...");
+                return Ok(false);
+            }
+        }
+
+        tick_count += 1;
+        if tick_count % 1000 == 0 {
+            dedupe_up.cleanup();
+            dedupe_down.cleanup();
+        }
+
+        if tick_count % PRICE_LOG_EVERY_N_TICKS == 0 {
+            let in_range_up = book_up.best_ask.map(|a| a >= config.buy_min && a <= config.buy_max).unwrap_or(false);
+            let in_range_down = book_down.best_ask.map(|a| a >= config.buy_min && a <= config.buy_max).unwrap_or(false);
+            if book_up.best_bid.is_some() || book_up.best_ask.is_some() || book_down.best_bid.is_some() || book_down.best_ask.is_some() {
+                tracing::info!(
+                    "Up: bid={:?} ask={:?} zone={} | Down: bid={:?} ask={:?} zone={}",
+                    book_up.best_bid, book_up.best_ask, in_range_up,
+                    book_down.best_bid, book_down.best_ask, in_range_down
+                );
+            }
+        }
+
+        let stale_up = book_up.is_stale(config.stale_threshold);
+        let stale_down = book_down.is_stale(config.stale_threshold);
+        let now_unix = gamma::now_unix();
+        let interval_info_opt = Some((market_up, *interval_switch_wall_time));
+
+        let result_up = handle_tick(
+            &config,
+            &executor,
+            asset_id_up,
+            &mut book_up,
+            &mut position_up,
+            &mut dedupe_up,
+            &mut live_buy_up,
+            &mut traded_up_this_interval,
+            stale_up,
+            interval_info_opt,
+            now_unix,
+        )
+        .await;
+        if let Err(e) = result_up {
+            let err_msg = format!("{:?}", e);
+            let should_log = match &last_tick_error {
+                None => true,
+                Some((prev, ts)) => prev != &err_msg || ts.elapsed() >= TICK_ERROR_LOG_COOLDOWN,
+            };
+            if should_log {
+                tracing::error!(side = "Up", ?e, "tick error");
+                last_tick_error = Some((err_msg, std::time::Instant::now()));
+            }
+        } else {
+            last_tick_error = None;
+        }
+
+        let result_down = handle_tick(
+            &config,
+            &executor,
+            asset_id_down,
+            &mut book_down,
+            &mut position_down,
+            &mut dedupe_down,
+            &mut live_buy_down,
+            &mut traded_down_this_interval,
+            stale_down,
+            interval_info_opt,
+            now_unix,
+        )
+        .await;
+        if let Err(e) = result_down {
+            let err_msg = format!("{:?}", e);
+            let should_log = match &last_tick_error {
+                None => true,
+                Some((prev, ts)) => prev != &err_msg || ts.elapsed() >= TICK_ERROR_LOG_COOLDOWN,
+            };
+            if should_log {
+                tracing::error!(side = "Down", ?e, "tick error");
+                last_tick_error = Some((err_msg, std::time::Instant::now()));
+            }
+        } else {
+            last_tick_error = None;
+        }
+
+        let expected_slug = gamma::get_active_5min_slug();
+        let is_out_of_sync = market_up.slug != expected_slug;
+        let market_just_closed = market_up
+            .close_time_unix
+            .map(|t| now_unix >= t)
+            .unwrap_or(false);
+        if is_out_of_sync || market_just_closed {
+            tracing::info!(
+                current_slug = %market_up.slug,
+                expected_slug = %expected_slug,
+                market_just_closed,
+                "interval switch: resubscribing to new market (dual)"
+            );
+            return Ok(true);
+        }
     }
 }
 
@@ -180,7 +439,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     let mut ws_first_update_logged = false;
     const PRICE_LOG_EVERY_N_TICKS: u64 = 300;
 
-    match executor.get_book().await {
+    match executor.get_book(asset_id).await {
         Ok(snap) => {
             book.update_best(snap.best_bid, snap.best_ask);
             tracing::info!(
@@ -297,6 +556,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
         let result = handle_tick(
             &config,
             &executor,
+            asset_id,
             &mut book,
             &mut position,
             &mut dedupe,
@@ -354,6 +614,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
 async fn handle_tick<S: SignerTrait + Send + Sync>(
     config: &Config,
     executor: &Executor<S>,
+    asset_id: ruint::Uint<256, 4>,
     book: &mut OrderBook,
     position: &mut Position,
     dedupe: &mut Dedupe,
@@ -402,7 +663,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
         } => {
             // Refresh book if stale before SL
             if book_is_stale {
-                if let Ok(snap) = executor.get_book().await {
+                if let Ok(snap) = executor.get_book(asset_id).await {
                     book.update_best(snap.best_bid, snap.best_ask);
                     if let Some(fresh_bid) = snap.best_bid {
                         limit_price = fresh_bid;
@@ -420,7 +681,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                     break;
                 }
 
-                let result = executor.sell_fak(remaining, limit_price).await?;
+                let result = executor.sell_fak(asset_id, remaining, limit_price).await?;
                 dedupe.record(IntentKind::SellSL, Some(remaining));
 
                 if result.filled_size > dec!(0) {
@@ -443,7 +704,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                             "SL partial fill, retrying immediately"
                         );
                         // Refresh best_bid for retry
-                        if let Ok(snap) = executor.get_book().await {
+                        if let Ok(snap) = executor.get_book(asset_id).await {
                             book.update_best(snap.best_bid, snap.best_ask);
                             if let Some(fresh_bid) = snap.best_bid {
                                 limit_price = fresh_bid;
@@ -464,7 +725,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
             mut limit_price,
         } => {
             if book_is_stale {
-                if let Ok(snap) = executor.get_book().await {
+                if let Ok(snap) = executor.get_book(asset_id).await {
                     book.update_best(snap.best_bid, snap.best_ask);
                     if let Some(fresh_bid) = snap.best_bid {
                         limit_price = fresh_bid;
@@ -482,7 +743,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                     break;
                 }
 
-                let result = executor.sell_fak_tp(remaining, limit_price).await?;
+                let result = executor.sell_fak_tp(asset_id, remaining, limit_price).await?;
                 dedupe.record(IntentKind::SellTP, Some(remaining));
 
                 if result.filled_size > dec!(0) {
@@ -504,7 +765,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                             remainder = %remaining,
                             "TP partial fill, retrying immediately (HFT)"
                         );
-                        if let Ok(snap) = executor.get_book().await {
+                        if let Ok(snap) = executor.get_book(asset_id).await {
                             book.update_best(snap.best_bid, snap.best_ask);
                             if let Some(fresh_bid) = snap.best_bid {
                                 limit_price = fresh_bid;
@@ -524,7 +785,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
             // Never send buy outside configured range (defensive clamp)
             let price = price.max(config.buy_min).min(config.buy_max);
             dedupe.record(IntentKind::Buy, None);
-            match executor.buy_limit(size, price).await {
+            match executor.buy_limit(asset_id, size, price).await {
                 Ok(result) => {
                     *traded_this_interval = true;
                     if result.filled_size > dec!(0) {
@@ -564,7 +825,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
 
             let new_price = new_price.max(config.buy_min).min(config.buy_max);
             dedupe.record(IntentKind::Buy, None);
-            match executor.buy_limit(new_size, new_price).await {
+            match executor.buy_limit(asset_id, new_size, new_price).await {
                 Ok(result) => {
                     *traded_this_interval = true;
                     if result.filled_size > dec!(0) {

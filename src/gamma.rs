@@ -141,3 +141,11 @@ pub async fn fetch_token_id(slug: &str, outcome_up: bool) -> Result<String> {
     let info = fetch_market_info(slug, outcome_up).await?;
     Ok(info.token_id)
 }
+
+/// Fetch market info for both outcomes (Up and Down) in one request.
+/// Returns (up_info, down_info) for the same slug so both sides can be scanned and traded.
+pub async fn fetch_both_market_infos(slug: &str) -> Result<(MarketInfo, MarketInfo)> {
+    let up = fetch_market_info(slug, true).await?;
+    let down = fetch_market_info(slug, false).await?;
+    Ok((up, down))
+}

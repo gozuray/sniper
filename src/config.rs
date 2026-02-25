@@ -11,6 +11,8 @@ pub struct Config {
     pub auto_btc5m: bool,
     /// For auto_btc5m: true = trade "Up" (first token), false = "Down" (second token).
     pub outcome_up: bool,
+    /// When true (OUTCOME=both or TRADE_BOTH_SIDES=1), scan and execute on both Up and Down when price is in range.
+    pub trade_both_sides: bool,
     pub buy_min: Decimal,
     pub buy_max: Decimal,
     pub take_profit_trigger: Decimal,
@@ -48,6 +50,16 @@ impl Config {
             })
             .unwrap_or(true);
 
+        let trade_both_sides = std::env::var("OUTCOME")
+            .map(|v| v.to_lowercase() == "both")
+            .unwrap_or(false)
+            || std::env::var("TRADE_BOTH_SIDES")
+                .map(|v| {
+                    let low = v.to_lowercase();
+                    low == "1" || low == "true" || low == "yes"
+                })
+                .unwrap_or(false);
+
         let order_size = parse_env_decimal("ORDER_SIZE", dec!(100))?;
         let max_position = parse_env_decimal("MAX_POSITION", dec!(500))?;
         let buy_min = normalize_price_to_zero_one(parse_env_decimal("BUY_MIN", dec!(0.93))?);
@@ -82,6 +94,7 @@ impl Config {
             token_id,
             auto_btc5m,
             outcome_up,
+            trade_both_sides,
             buy_min,
             buy_max,
             take_profit_trigger,

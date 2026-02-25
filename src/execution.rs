@@ -39,32 +39,27 @@ pub struct BookSnapshot {
 pub struct Executor<S> {
     client: polymarket_client_sdk::clob::Client<Authenticated<Normal>>,
     signer: S,
-    token_id: U256,
 }
 
 impl<S: SignerTrait + Send + Sync> Executor<S> {
     pub fn new(
         client: polymarket_client_sdk::clob::Client<Authenticated<Normal>>,
         signer: S,
-        token_id: U256,
     ) -> Self {
-        Self {
-            client,
-            signer,
-            token_id,
-        }
+        Self { client, signer }
     }
 
     // ── Sell FAK (for SL) ──────────────────────────────────────────
 
     pub async fn sell_fak(
         &self,
+        token_id: U256,
         size: Decimal,
         limit_price: Decimal,
     ) -> Result<OrderResult> {
         tracing::info!(size = %size, limit = %limit_price, "sending SL sell FAK");
         let resp = self
-            .place_limit_sell(size, limit_price, OrderType::FAK)
+            .place_limit_sell(token_id, size, limit_price, OrderType::FAK)
             .await?;
         Ok(classify_sell_response(resp, size))
     }
@@ -72,12 +67,13 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
     // ── Sell FAK (for TP — same HFT as SL: fill what you can, cancel rest, retry remainder)
     pub async fn sell_fak_tp(
         &self,
+        token_id: U256,
         size: Decimal,
         limit_price: Decimal,
     ) -> Result<OrderResult> {
         tracing::info!(size = %size, limit = %limit_price, "sending TP sell FAK (HFT)");
         let resp = self
-            .place_limit_sell(size, limit_price, OrderType::FAK)
+            .place_limit_sell(token_id, size, limit_price, OrderType::FAK)
             .await?;
         Ok(classify_sell_response(resp, size))
     }
@@ -86,6 +82,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
 
     pub async fn buy_limit(
         &self,
+        token_id: U256,
         size: Decimal,
         price: Decimal,
     ) -> Result<OrderResult> {
@@ -94,7 +91,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         let order = self
             .client
             .limit_order()
-            .token_id(self.token_id)
+            .token_id(token_id)
             .size(size)
             .price(price)
             .side(Side::Buy)
@@ -133,11 +130,11 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
 
     // ── GET /book (REST fallback for stale book) ───────────────────
 
-    pub async fn get_book(&self) -> Result<BookSnapshot> {
+    pub async fn get_book(&self, token_id: U256) -> Result<BookSnapshot> {
         tracing::debug!("REST: fetching order book");
 
         let request = OrderBookSummaryRequest::builder()
-            .token_id(self.token_id)
+            .token_id(token_id)
             .build();
         let book = self.client.order_book(&request).await?;
 
@@ -170,6 +167,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
 
     async fn place_limit_sell(
         &self,
+        token_id: U256,
         size: Decimal,
         limit_price: Decimal,
         order_type: OrderType,
@@ -177,7 +175,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         let order = self
             .client
             .limit_order()
-            .token_id(self.token_id)
+            .token_id(token_id)
             .size(size)
             .price(limit_price)
             .side(Side::Sell)
