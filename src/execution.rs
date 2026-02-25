@@ -69,16 +69,15 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         Ok(classify_sell_response(resp, size))
     }
 
-    // ── Sell FOK (for TP — immediate or cancel) ────────────────────
-
-    pub async fn sell_limit(
+    // ── Sell FAK (for TP — same HFT as SL: fill what you can, cancel rest, retry remainder)
+    pub async fn sell_fak_tp(
         &self,
         size: Decimal,
         limit_price: Decimal,
     ) -> Result<OrderResult> {
-        tracing::info!(size = %size, limit = %limit_price, "sending TP sell FOK");
+        tracing::info!(size = %size, limit = %limit_price, "sending TP sell FAK (HFT)");
         let resp = self
-            .place_limit_sell(size, limit_price, OrderType::FOK)
+            .place_limit_sell(size, limit_price, OrderType::FAK)
             .await?;
         Ok(classify_sell_response(resp, size))
     }

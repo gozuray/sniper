@@ -371,6 +371,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
         *traded_this_interval,
         interval_info.map(|(m, t)| (m.close_time_unix, t)),
         now_unix,
+        std::time::Instant::now(),
     );
 
     match action {
@@ -450,14 +451,51 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                 }
             }
 
-            let result = executor.sell_limit(size, limit_price).await?;
-            dedupe.record(IntentKind::SellTP, Some(size));
+            // TP FAK retry loop (same HFT as SL): sell as fast as possible, retry remainder on partial fill
+            let mut remaining = size;
+            loop {
+                if remaining <= dec!(0) {
+                    break;
+                }
+                if !dedupe.can_send(IntentKind::SellTP, Some(remaining)) {
+                    break;
+                }
 
-            if result.filled_size > dec!(0) {
-                position.subtract_fill(result.filled_size);
+                let result = executor.sell_fak_tp(remaining, limit_price).await?;
+                dedupe.record(IntentKind::SellTP, Some(remaining));
+
+                if result.filled_size > dec!(0) {
+                    position.subtract_fill(result.filled_size);
+
+                    if let Some(buy) = live_buy.take() {
+                        let _ = executor.cancel_order(&buy.order_id).await;
+                    }
+                }
+
+                match result.status {
+                    FillStatus::FullyFilled => {
+                        tracing::info!("TP fully filled");
+                        break;
+                    }
+                    FillStatus::PartiallyFilled => {
+                        remaining -= result.filled_size;
+                        tracing::warn!(
+                            remainder = %remaining,
+                            "TP partial fill, retrying immediately (HFT)"
+                        );
+                        if let Ok(snap) = executor.get_book().await {
+                            book.update_best(snap.best_bid, snap.best_ask);
+                            if let Some(fresh_bid) = snap.best_bid {
+                                limit_price = fresh_bid;
+                            }
+                        }
+                    }
+                    FillStatus::NotFilled | FillStatus::Placed => {
+                        tracing::warn!("TP FAK got no fill");
+                        break;
+                    }
+                }
             }
-
-            tracing::info!(status = ?result.status, "TP result");
             // Early return: no buy this tick
         }
 
@@ -478,6 +516,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                             order_id: result.order_id,
                             price,
                             size,
+                            placed_at: std::time::Instant::now(),
                         });
                     }
                 }
@@ -516,6 +555,7 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
                             order_id: result.order_id,
                             price: new_price,
                             size: new_size,
+                            placed_at: std::time::Instant::now(),
                         });
                     }
                 }

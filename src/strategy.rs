@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -11,6 +13,8 @@ pub struct LiveBuyOrder {
     pub order_id: String,
     pub price: Decimal,
     pub size: Decimal,
+    /// When the order was placed; used to avoid cancelling before it has time to fill.
+    pub placed_at: Instant,
 }
 
 #[derive(Debug)]
@@ -52,6 +56,7 @@ pub fn evaluate(
     traded_this_interval: bool,
     interval_data: Option<(Option<u64>, tokio::time::Instant)>,
     now_unix: u64,
+    now: Instant,
 ) -> Action {
     let best_bid = match book.best_bid {
         Some(b) => b,
@@ -91,9 +96,16 @@ pub fn evaluate(
 
     if !in_entry_zone {
         return match live_buy {
-            Some(existing) => Action::CancelBuy {
-                order_id: existing.order_id.clone(),
-            },
+            Some(existing) => {
+                let min_age = std::time::Duration::from_millis(config.buy_order_min_age_ms);
+                if now.duration_since(existing.placed_at) < min_age {
+                    Action::Nothing
+                } else {
+                    Action::CancelBuy {
+                        order_id: existing.order_id.clone(),
+                    }
+                }
+            }
             None => Action::Nothing,
         };
     }
@@ -142,15 +154,20 @@ pub fn evaluate(
 
     match live_buy {
         Some(existing) => {
-            let tick = dec!(0.01);
-            if (existing.price - target_price).abs() > tick {
-                Action::CancelAndReplaceBuy {
-                    cancel_order_id: existing.order_id.clone(),
-                    new_size: size,
-                    new_price: target_price,
-                }
-            } else {
+            let min_age = std::time::Duration::from_millis(config.buy_order_min_age_ms);
+            if now.duration_since(existing.placed_at) < min_age {
                 Action::Nothing
+            } else {
+                let tick = dec!(0.01);
+                if (existing.price - target_price).abs() > tick {
+                    Action::CancelAndReplaceBuy {
+                        cancel_order_id: existing.order_id.clone(),
+                        new_size: size,
+                        new_price: target_price,
+                    }
+                } else {
+                    Action::Nothing
+                }
             }
         }
         None => Action::PlaceBuy {
