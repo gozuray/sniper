@@ -1,0 +1,17 @@
+[package]
+name = "sniper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+polymarket-client-sdk = { version = "0.4", features = ["clob", "ws"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust_decimal = "1"
+rust_decimal_macros = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+ruint = "1"
