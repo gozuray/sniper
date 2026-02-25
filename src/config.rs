@@ -5,7 +5,12 @@ use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Set by TOKEN_ID, or resolved from Gamma when auto_btc5m is true.
     pub token_id: String,
+    /// When true, ignore TOKEN_ID and resolve token from Gamma each 5-min window.
+    pub auto_btc5m: bool,
+    /// For auto_btc5m: true = trade "Up" (first token), false = "Down" (second token).
+    pub outcome_up: bool,
     pub buy_min: Decimal,
     pub buy_max: Decimal,
     pub take_profit_trigger: Decimal,
@@ -19,7 +24,25 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let token_id = std::env::var("TOKEN_ID").context("TOKEN_ID is required")?;
+        let auto_btc5m = std::env::var("AUTO_BTC5M")
+            .map(|v| {
+                let low = v.to_lowercase();
+                low == "1" || low == "true" || low == "yes"
+            })
+            .unwrap_or(false);
+
+        let token_id = if auto_btc5m {
+            std::env::var("TOKEN_ID").unwrap_or_default()
+        } else {
+            std::env::var("TOKEN_ID").context("TOKEN_ID is required (or set AUTO_BTC5M=1)")?
+        };
+
+        let outcome_up = std::env::var("OUTCOME")
+            .map(|v| {
+                let low = v.to_lowercase();
+                low != "down" && low != "no"
+            })
+            .unwrap_or(true);
 
         let order_size = parse_env_decimal("ORDER_SIZE", dec!(100))?;
         let max_position = parse_env_decimal("MAX_POSITION", dec!(500))?;
@@ -43,6 +66,8 @@ impl Config {
 
         Ok(Self {
             token_id,
+            auto_btc5m,
+            outcome_up,
             buy_min,
             buy_max,
             take_profit_trigger,

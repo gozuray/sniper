@@ -10,35 +10,39 @@ SL uses FAK with immediate retry on partial fills.
 
 - Rust >= 1.88 (MSRV of polymarket-client-sdk)
 - A funded Polymarket wallet (USDC on Polygon)
-- The `token_id` (U256) of the YES/NO outcome you want to trade
+- Either the `token_id` (U256) of the outcome to trade, or **AUTO_BTC5M=1** to auto-rotate to the current BTC 5-min window
 
 ## Quick start
 
+**Single market (manual TOKEN_ID):**
+
 ```bash
-# Set required env vars
 export POLYMARKET_PRIVATE_KEY="0xYOUR_PRIVATE_KEY"
 export TOKEN_ID="12345..."   # U256 asset id from Polymarket
-
-# Optional env vars (with defaults shown)
-export ORDER_SIZE=100
-export MAX_POSITION=500
-export BUY_MIN=0.93
-export BUY_MAX=0.95
-export TAKE_PROFIT=0.97
-export STOP_LOSS=0.90
-export DEDUPE_TTL_MS=50       # 20-80 ms recommended
-export STALE_THRESHOLD_MS=200 # 100-250 ms for 5-min BTC
-export POLYMARKET_CLOB_URL=https://clob.polymarket.com
-
+# Optional: ORDER_SIZE=100 MAX_POSITION=500 BUY_MIN=0.93 BUY_MAX=0.95 TAKE_PROFIT=0.97 STOP_LOSS=0.90
 cargo run --release
 ```
+
+**Auto-rotate BTC 5-min markets (no TOKEN_ID):**
+
+```bash
+export POLYMARKET_PRIVATE_KEY="0xYOUR_PRIVATE_KEY"
+export AUTO_BTC5M=1
+export OUTCOME=up   # or "down" (default: up)
+# Optional: ORDER_SIZE=100 MAX_POSITION=500 BUY_MIN=0.93 BUY_MAX=0.95 TAKE_PROFIT=0.97 STOP_LOSS=0.90
+cargo run --release
+```
+
+When `AUTO_BTC5M=1`, the bot switches to the next 5-minute market automatically when the current window ends (e.g. from `btc-updown-5m-1771991400` to `btc-updown-5m-1771991700`).
 
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `POLYMARKET_PRIVATE_KEY` | yes | -- | Hex private key for signing orders |
-| `TOKEN_ID` | yes | -- | U256 token/asset ID of the outcome to trade |
+| `TOKEN_ID` | yes* | -- | U256 token/asset ID of the outcome to trade (*omit when AUTO_BTC5M=1) |
+| `AUTO_BTC5M` | no | 0 | Set to `1` or `true` to auto-rotate to the current BTC 5-min market every 5 minutes |
+| `OUTCOME` | no | up | When AUTO_BTC5M=1: `up` or `down` (which outcome to trade) |
 | `ORDER_SIZE` | no | 100 | Size per order (shares for sells, USDC for buys) |
 | `MAX_POSITION` | no | 500 | Maximum position in shares |
 | `BUY_MIN` | no | 0.93 | Lower bound of buy range |
@@ -50,12 +54,12 @@ cargo run --release
 | `POLYMARKET_CLOB_URL` | no | https://clob.polymarket.com | CLOB endpoint |
 | `RUST_LOG` | no | sniper=info | Log level filter |
 
-## How to find the token_id
+## How to find the token_id (when not using AUTO_BTC5M)
 
 1. Open the market on [polymarket.com](https://polymarket.com).
 2. Open browser DevTools -> Network tab.
 3. Look for requests to `clob.polymarket.com` containing `token_id` or `asset_id`.
-4. Alternatively, use the Gamma API: `GET https://gamma-api.polymarket.com/markets/slug/{slug}` and read the `tokens[].token_id` field.
+4. Alternatively, use the Gamma API: `GET https://gamma-api.polymarket.com/markets/slug/{slug}` and read the `clobTokenIds` array (first = Up, second = Down).
 
 ## Trading logic
 
@@ -110,8 +114,9 @@ All decisions and order sends happen inline on each WS event.
 
 ```
 src/
-  main.rs        -- entry point, WS event loop, tick handler
+  main.rs        -- entry point, WS event loop, tick handler, AUTO_BTC5M rotation
   config.rs      -- environment / CLI configuration
+  gamma.rs       -- Gamma API: resolve token_id for btc-updown-5m-{window} slug
   orderbook.rs   -- book state with monotonic stale detection
   position.rs    -- local expected position tracking
   dedupe.rs      -- intent deduplication (kind + size, TTL)
