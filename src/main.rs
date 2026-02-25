@@ -136,6 +136,10 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     let mut tick_count: u64 = 0;
     let mut traded_this_interval = false;
 
+    // Throttle repeated "tick error" to avoid spamming logs (e.g. "not enough balance" every tick)
+    let mut last_tick_error: Option<(String, std::time::Instant)> = None;
+    const TICK_ERROR_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
     let ws_client = polymarket_client_sdk::clob::ws::Client::default();
     let asset_ids = vec![asset_id];
 
@@ -155,7 +159,7 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
     let mut last_printed_bid: Option<Decimal> = None;
     let mut last_printed_ask: Option<Decimal> = None;
     let mut ws_first_update_logged = false;
-    const PRICE_LOG_EVERY_N_TICKS: u64 = 50;
+    const PRICE_LOG_EVERY_N_TICKS: u64 = 300;
 
     match executor.get_book().await {
         Ok(snap) => {
@@ -284,7 +288,19 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
         .await;
 
         if let Err(e) = result {
-            tracing::error!(?e, "tick error");
+            let err_msg = format!("{:?}", e);
+            let should_log = match &last_tick_error {
+                None => true,
+                Some((prev, ts)) => {
+                    prev != &err_msg || ts.elapsed() >= TICK_ERROR_LOG_COOLDOWN
+                }
+            };
+            if should_log {
+                tracing::error!(?e, "tick error");
+                last_tick_error = Some((err_msg, std::time::Instant::now()));
+            }
+        } else {
+            last_tick_error = None; // clear so next error is logged
         }
 
         // Dynamic 5-min: detect interval close or out-of-sync and signal switch to next active market

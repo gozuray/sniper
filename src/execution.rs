@@ -90,7 +90,7 @@ impl<S: SignerTrait + Send + Sync> Executor<S> {
         size: Decimal,
         price: Decimal,
     ) -> Result<OrderResult> {
-        tracing::info!(size = %size, price = %price, "placing buy limit GTC");
+        tracing::debug!(size = %size, price = %price, "placing buy limit GTC");
 
         let order = self
             .client
