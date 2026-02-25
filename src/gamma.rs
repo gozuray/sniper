@@ -47,7 +47,7 @@ pub fn current_window_start_unix() -> u64 {
 }
 
 /// Slug for the *active* 5-min market (the window we're currently in). Uses window start so we subscribe to the correct live market.
-/// E.g. between 12:05 and 12:10 ET we use btc-updown-5m-1771995900; from 12:10 we use btc-updown-5m-1771996200.
+/// Polymarket URLs: 12:25-12:30 ET = btc-updown-5m-1771997100, 12:30-12:35 ET = btc-updown-5m-1771997400 (cada +300s).
 pub fn get_active_5min_slug() -> String {
     format!("btc-updown-5m-{}", current_window_start_unix())
 }

@@ -11,6 +11,7 @@ use futures::StreamExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
+use std::time::Duration;
 
 use polymarket_client_sdk::auth::Signer as SignerTrait;
 
@@ -47,6 +48,14 @@ async fn main() -> Result<()> {
         // Dynamic 5-min: operate on the *active* interval (current 5-min window); switch when interval closes or out of sync.
         loop {
             let slug = gamma::get_active_5min_slug();
+            let now_unix = gamma::now_unix();
+            let window_start = gamma::current_window_start_unix();
+            tracing::info!(
+                slug = %slug,
+                window_start_unix = window_start,
+                now_unix,
+                "active 5-min market (Polymarket: btc-updown-5m-<window_start>, ventana 300s)"
+            );
             let market = gamma::fetch_market_info(&slug, config.outcome_up)
                 .await
                 .with_context(|| format!("fetch market for slug {slug}"))?;
@@ -154,6 +163,11 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
         Err(e) => tracing::warn!(?e, "failed to fetch initial book via REST"),
     }
 
+    // Wake-up cada 15s para log y chequeo de cambio de intervalo aunque el WS no envíe nada
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await; // first tick fires immediately, skip it
+
     loop {
         tokio::select! {
             Some(result) = book_stream.next() => {
@@ -189,6 +203,13 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
                         continue;
                     }
                 }
+            }
+            _ = heartbeat.tick() => {
+                tracing::info!(
+                    best_bid = ?book.best_bid,
+                    best_ask = ?book.best_ask,
+                    "heartbeat (cada 15s si WS no envía; comprobando cambio de intervalo)"
+                );
             }
             else => {
                 tracing::warn!("all WS streams closed, reconnecting...");
