@@ -62,6 +62,8 @@ async fn main() -> Result<()> {
     let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
         .with_chain_id(Some(polymarket_client_sdk::POLYGON));
 
+    preflight_check_ctf_approval(&private_key).await?;
+
     if config.auto_btc5m {
         // Dynamic 5-min: operate on the *active* interval (current 5-min window); switch when interval closes or out of sync.
         loop {
@@ -628,6 +630,102 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
             }
         }
     }
+}
+
+/// Pre-flight: verify the Safe wallet has CTF approvals for selling.
+/// Without these, buy orders succeed but sell (SL/TP) fails with "not enough balance / allowance".
+async fn preflight_check_ctf_approval(private_key: &str) -> Result<()> {
+    let signer = polymarket_client_sdk::auth::LocalSigner::from_str(private_key)?
+        .with_chain_id(Some(polymarket_client_sdk::POLYGON));
+    let eoa = signer.address();
+    let safe = polymarket_client_sdk::derive_safe_wallet(eoa, polymarket_client_sdk::POLYGON)
+        .context("could not derive Safe wallet address")?;
+
+    let config = polymarket_client_sdk::contract_config(polymarket_client_sdk::POLYGON, false)
+        .context("contract_config(POLYGON, false) not available")?;
+    let neg_config = polymarket_client_sdk::contract_config(polymarket_client_sdk::POLYGON, true)
+        .context("contract_config(POLYGON, true) not available")?;
+
+    let rpc_url = std::env::var("POLYGON_RPC_URL")
+        .unwrap_or_else(|_| "https://polygon-rpc.com".into());
+    let http = reqwest::Client::new();
+    let safe_hex = addr_hex64(&safe);
+    let ctf_addr = format!("{}", config.conditional_tokens);
+
+    let mut targets: Vec<(&str, polymarket_client_sdk::types::Address)> = vec![
+        ("CTF Exchange", config.exchange),
+        ("Neg Risk CTF Exchange", neg_config.exchange),
+    ];
+    if let Some(adapter) = neg_config.neg_risk_adapter {
+        targets.push(("Neg Risk Adapter", adapter));
+    }
+
+    for (name, operator) in &targets {
+        let op_hex = addr_hex64(operator);
+        let data = format!("0xe985e9c5{safe_hex}{op_hex}");
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": &ctf_addr, "data": &data}, "latest"],
+            "id": 1
+        });
+
+        let resp: serde_json::Value = http
+            .post(&rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("RPC failed checking CTF approval for {name}"))?
+            .json()
+            .await?;
+
+        let hex = resp
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0x0");
+        let approved = hex.trim_start_matches("0x").ends_with('1');
+
+        if !approved {
+            anyhow::bail!(
+                "\n\
+                 ══════════════════════════════════════════════════════════════\n\
+                 CTF APPROVAL MISSING — the bot CANNOT SELL (SL/TP) tokens.\n\
+                 ══════════════════════════════════════════════════════════════\n\
+                 Safe wallet:   {safe}\n\
+                 Missing for:   {name} ({operator})\n\
+                 \n\
+                 Your Safe has NOT called setApprovalForAll(exchange, true)\n\
+                 on the Conditional Tokens (ERC-1155) contract.\n\
+                 The bot can BUY but the exchange CANNOT transfer tokens to SELL.\n\
+                 \n\
+                 FIX (choose one):\n\
+                 1. Go to polymarket.com -> open any market -> place a sell order.\n\
+                    Polymarket will prompt CTF approval — accept it.\n\
+                 2. Run the SDK approvals example once for your wallet.\n\
+                 \n\
+                 Then restart the bot.\n\
+                 Verify with: cargo run --bin check_balance\n\
+                 ══════════════════════════════════════════════════════════════"
+            );
+        }
+
+        tracing::info!(contract = name, "CTF approval OK for Safe");
+    }
+
+    tracing::info!(safe = %safe, "pre-flight: all CTF approvals verified");
+    Ok(())
+}
+
+fn addr_hex64(addr: &polymarket_client_sdk::types::Address) -> String {
+    let s = format!("{addr}");
+    let s = s.trim_start_matches("0x");
+    let s = if s.len() >= 40 {
+        &s[s.len() - 40..]
+    } else {
+        s
+    };
+    format!("{:0>64}", s.to_lowercase())
 }
 
 /// Process a single tick. Implements:
