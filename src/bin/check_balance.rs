@@ -35,9 +35,24 @@ const SELECTOR_IS_APPROVED_FOR_ALL: &str = "e985e9c5";
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
+    #[serde(default, deserialize_with = "deserialize_rpc_result")]
     result: Option<String>,
-    #[serde(deserialize_with = "deserialize_rpc_error")]
+    #[serde(default, deserialize_with = "deserialize_rpc_error")]
     error: Option<RpcErrorKind>,
+}
+
+/// Acepta "result" como string, null o ausente; evita error de decoding si viene en otro formato.
+fn deserialize_rpc_result<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(v) = opt else { return Ok(None) };
+    Ok(match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Null => None,
+        _ => None,
+    })
 }
 
 #[derive(Debug)]
