@@ -652,24 +652,44 @@ async fn handle_tick<S: SignerTrait + Send + Sync>(
     last_order_sync: &mut Option<std::time::Instant>,
 ) -> Result<()> {
     // Sync position from resting buy order at most every order_sync_interval_ms (HFT: avoid REST on every WS message).
+    // When best_bid is already in TP/SL zone, force sync so we don't miss a sell because position wasn't updated yet.
     let sync_interval = std::time::Duration::from_millis(config.order_sync_interval_ms);
+    let in_sl_tp_zone = book.best_bid
+        .map(|b| b <= config.stop_loss_trigger || b >= config.take_profit_trigger)
+        .unwrap_or(false);
     if let Some(buy) = live_buy.as_mut() {
         let should_sync = last_order_sync
             .map(|t| t.elapsed() >= sync_interval)
-            .unwrap_or(true);
+            .unwrap_or(true)
+            || in_sl_tp_zone;
         if should_sync {
-            if let Ok(Some((size_matched, is_live))) = executor.get_order_matched(&buy.order_id).await {
-                let delta = size_matched - buy.filled_so_far;
-                if delta > dec!(0) {
-                    position.add_fill(delta);
-                    buy.filled_so_far = size_matched;
-                    tracing::info!(order_id = %buy.order_id, size_matched = %size_matched, delta = %delta, "buy order fill synced to position");
+            match executor.get_order_matched(&buy.order_id).await {
+                Ok(Some((size_matched, is_live))) => {
+                    let delta = size_matched - buy.filled_so_far;
+                    if delta > dec!(0) {
+                        position.add_fill(delta);
+                        buy.filled_so_far = size_matched;
+                        tracing::info!(order_id = %buy.order_id, size_matched = %size_matched, delta = %delta, "buy order fill synced to position");
+                    }
+                    if !is_live {
+                        let order_id = buy.order_id.clone();
+                        let _ = executor.cancel_order(&order_id).await;
+                        *live_buy = None;
+                        tracing::debug!(order_id = %order_id, "live buy order no longer on book, cleared");
+                    }
                 }
-                if !is_live {
-                    let order_id = buy.order_id.clone();
-                    let _ = executor.cancel_order(&order_id).await;
+                Ok(None) => {
+                    // Order not found (fully filled and removed from exchange, or cancelled). Treat remainder as filled
+                    // so we have position for TP/SL; if it was cancelled we may overcount until next sell fails.
+                    let remainder = buy.size - buy.filled_so_far;
+                    if remainder > dec!(0) {
+                        position.add_fill(remainder);
+                        tracing::info!(order_id = %buy.order_id, remainder = %remainder, "order gone from API, treating remainder as filled for TP/SL");
+                    }
                     *live_buy = None;
-                    tracing::debug!(order_id = %order_id, "live buy order no longer on book, cleared");
+                }
+                Err(e) => {
+                    tracing::debug!(order_id = %buy.order_id, ?e, "get_order_matched failed, skipping sync this tick");
                 }
             }
             *last_order_sync = Some(std::time::Instant::now());
