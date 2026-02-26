@@ -8,7 +8,8 @@
 //!   cargo run --bin check_balance
 //!
 //! Requiere POLYMARKET_PRIVATE_KEY en .env o en el entorno.
-//! Opcional: POLYGON_RPC_URL (por defecto https://polygon-rpc.com)
+//! Opcional: POLYGON_RPC_URL. Si no está definida, se usa un RPC público de Polygon
+//! (p. ej. https://polygon-rpc.com o https://rpc.ankr.com/polygon como respaldo).
 
 use anyhow::{Context, Result};
 use polymarket_client_sdk::auth::Signer as SignerTrait;
@@ -17,7 +18,12 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 const USDC_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-const DEFAULT_RPC: &str = "https://polygon-rpc.com";
+/// Variable de entorno para la URL RPC de Polygon. Si no está definida, se usan los fallbacks públicos.
+const POLYGON_RPC_URL_VAR: &str = "POLYGON_RPC_URL";
+/// RPC público de Polygon usado cuando POLYGON_RPC_URL no está definida.
+const DEFAULT_POLYGON_RPC: &str = "https://polygon-rpc.com";
+/// Respaldo si el RPC por defecto falla (misma red de seguridad que en el proyecto).
+const FALLBACK_POLYGON_RPC: &str = "https://rpc.ankr.com/polygon";
 const USDC_DECIMALS: u32 = 6;
 
 /// balanceOf(address) selector
@@ -68,6 +74,21 @@ fn address_to_hex_64(addr: &impl std::fmt::Display) -> String {
     format!("{:0>64}", s.to_lowercase())
 }
 
+/// Devuelve la lista de URLs RPC a usar: si POLYGON_RPC_URL está definida, solo esa;
+/// si no, los dos RPCs públicos en orden (red de seguridad).
+fn polygon_rpc_urls() -> Vec<String> {
+    if let Ok(url) = std::env::var(POLYGON_RPC_URL_VAR) {
+        let s = url.trim().to_string();
+        if !s.is_empty() {
+            return vec![s];
+        }
+    }
+    vec![
+        DEFAULT_POLYGON_RPC.to_string(),
+        FALLBACK_POLYGON_RPC.to_string(),
+    ]
+}
+
 async fn main_impl() -> Result<()> {
     let _ = dotenvy::dotenv();
 
@@ -85,7 +106,7 @@ async fn main_impl() -> Result<()> {
     let exchange_hex = address_to_hex_64(&config.exchange);
     let ctf_contract = format!("{:?}", config.conditional_tokens);
 
-    let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC.to_string());
+    let rpc_urls = polygon_rpc_urls();
     let client = reqwest::Client::new();
 
     println!("EOA (tu clave Phantom/MetaMask):     {:?}\n", eoa);
@@ -93,7 +114,7 @@ async fn main_impl() -> Result<()> {
 
     // --- Saldo y allowance de la EOA ---
     let data_balance_eoa = format!("0x{}{}", SELECTOR_BALANCE, eoa_hex);
-    let balance_raw_eoa = eth_call(&client, &rpc_url, USDC_POLYGON, &data_balance_eoa).await?;
+    let balance_raw_eoa = eth_call(&client, &rpc_urls, USDC_POLYGON, &data_balance_eoa).await?;
     let balance_eoa = parse_hex_u256(&balance_raw_eoa)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
     let data_allow_eoa = format!(
         "0x{}{}{}",
@@ -101,7 +122,7 @@ async fn main_impl() -> Result<()> {
         eoa_hex,
         exchange_hex
     );
-    let allow_raw_eoa = eth_call(&client, &rpc_url, USDC_POLYGON, &data_allow_eoa).await?;
+    let allow_raw_eoa = eth_call(&client, &rpc_urls, USDC_POLYGON, &data_allow_eoa).await?;
     let allowance_eoa = parse_hex_u256(&allow_raw_eoa)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
     println!("  EOA  — USDC balance: {} USDC, USDC allowance (to exchange): {} USDC", balance_eoa, allowance_eoa);
 
@@ -111,7 +132,7 @@ async fn main_impl() -> Result<()> {
         .context("derived Safe wallet address (Polymarket) no disponible")?;
     let safe_hex = address_to_hex_64(safe_addr);
     let data_balance_safe = format!("0x{}{}", SELECTOR_BALANCE, safe_hex);
-    let balance_raw_safe = eth_call(&client, &rpc_url, USDC_POLYGON, &data_balance_safe).await?;
+    let balance_raw_safe = eth_call(&client, &rpc_urls, USDC_POLYGON, &data_balance_safe).await?;
     let balance_safe = parse_hex_u256(&balance_raw_safe)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
     let data_allow_safe = format!(
         "0x{}{}{}",
@@ -119,7 +140,7 @@ async fn main_impl() -> Result<()> {
         safe_hex,
         exchange_hex
     );
-    let allow_raw_safe = eth_call(&client, &rpc_url, USDC_POLYGON, &data_allow_safe).await?;
+    let allow_raw_safe = eth_call(&client, &rpc_urls, USDC_POLYGON, &data_allow_safe).await?;
     let allowance_safe = parse_hex_u256(&allow_raw_safe)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
     // CTF (Conditional Tokens ERC-1155): isApprovedForAll(Safe, exchange) — required for SELL (SL/TP)
     let data_ctf_safe = format!(
@@ -128,7 +149,7 @@ async fn main_impl() -> Result<()> {
         safe_hex,
         exchange_hex
     );
-    let ctf_approved_safe = eth_call(&client, &rpc_url, ctf_contract.as_str(), &data_ctf_safe).await
+    let ctf_approved_safe = eth_call(&client, &rpc_urls, ctf_contract.as_str(), &data_ctf_safe).await
         .map(|r| parse_ctf_approved(&r))
         .unwrap_or(Ok(false))
         .unwrap_or(false);
@@ -157,7 +178,7 @@ async fn main() -> Result<()> {
 
 async fn eth_call(
     client: &reqwest::Client,
-    rpc_url: &str,
+    rpc_urls: &[String],
     to: &str,
     data: &str,
 ) -> Result<String> {
@@ -167,23 +188,38 @@ async fn eth_call(
         "params": [{"to": to, "data": data}, "latest"],
         "id": 1
     });
-    let res = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .context("RPC request failed")?;
-    let rpc: RpcResponse = res.json().await.context("RPC response parse")?;
-    if let Some(e) = rpc.error {
-        let msg = match e {
-            RpcErrorKind::Object { message } => message,
-            RpcErrorKind::String(s) => s,
+    let mut last_err = None;
+    for url in rpc_urls {
+        let res = match client.post(url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("{}", e));
+                continue;
+            }
         };
-        anyhow::bail!("RPC error: {}", msg);
+        let rpc: RpcResponse = match res.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        if let Some(e) = rpc.error {
+            let msg = match e {
+                RpcErrorKind::Object { message } => message,
+                RpcErrorKind::String(s) => s,
+            };
+            last_err = Some(anyhow::anyhow!("RPC error: {}", msg));
+            continue;
+        }
+        if let Some(result) = rpc.result {
+            return Ok(result.trim_start_matches("0x").to_string());
+        }
+        last_err = Some(anyhow::anyhow!("RPC result missing"));
     }
-    rpc.result
-        .context("RPC result missing")
-        .map(|s| s.trim_start_matches("0x").to_string())
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("No RPC URLs to try"))
+        .context("Todos los RPCs fallaron"))
 }
 
 /// Parse ERC-1155 isApprovedForAll return: 32-byte bool (true = 0x...01, false = 0x...00).
