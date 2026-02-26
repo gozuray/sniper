@@ -209,7 +209,8 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
     let mut traded_down_this_interval = false;
     let mut tick_count: u64 = 0;
 
-    let mut last_tick_error: Option<(String, std::time::Instant)> = None;
+    let mut last_tick_error_up: Option<(String, std::time::Instant)> = None;
+    let mut last_tick_error_down: Option<(String, std::time::Instant)> = None;
     const TICK_ERROR_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
     let ws_client = polymarket_client_sdk::clob::ws::Client::default();
@@ -346,7 +347,7 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
         .await;
         if let Err(e) = result_up {
             let err_msg = format!("{:?}", e);
-            let should_log = match &last_tick_error {
+            let should_log = match &last_tick_error_up {
                 None => true,
                 Some((prev, ts)) => prev != &err_msg || ts.elapsed() >= TICK_ERROR_LOG_COOLDOWN,
             };
@@ -358,10 +359,10 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
                         Revisa README: cargo run --bin check_balance y approvals (USDC + CTF)."
                     );
                 }
-                last_tick_error = Some((err_msg, std::time::Instant::now()));
+                last_tick_error_up = Some((err_msg, std::time::Instant::now()));
             }
         } else {
-            last_tick_error = None;
+            last_tick_error_up = None;
         }
 
         let result_down = handle_tick(
@@ -381,7 +382,7 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
         .await;
         if let Err(e) = result_down {
             let err_msg = format!("{:?}", e);
-            let should_log = match &last_tick_error {
+            let should_log = match &last_tick_error_down {
                 None => true,
                 Some((prev, ts)) => prev != &err_msg || ts.elapsed() >= TICK_ERROR_LOG_COOLDOWN,
             };
@@ -393,10 +394,10 @@ async fn run_loop_dual<S: SignerTrait + Send + Sync>(
                         Revisa README: cargo run --bin check_balance y approvals (USDC + CTF)."
                     );
                 }
-                last_tick_error = Some((err_msg, std::time::Instant::now()));
+                last_tick_error_down = Some((err_msg, std::time::Instant::now()));
             }
         } else {
-            last_tick_error = None;
+            last_tick_error_down = None;
         }
 
         let expected_slug = gamma::get_active_5min_slug();
