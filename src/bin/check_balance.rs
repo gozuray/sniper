@@ -24,6 +24,8 @@ const USDC_DECIMALS: u32 = 6;
 const SELECTOR_BALANCE: &str = "70a08231";
 /// allowance(address,address) selector
 const SELECTOR_ALLOWANCE: &str = "dd62ed3e";
+/// isApprovedForAll(address,address) selector (ERC-1155 Conditional Tokens)
+const SELECTOR_IS_APPROVED_FOR_ALL: &str = "e985e9c5";
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
@@ -58,6 +60,7 @@ async fn main_impl() -> Result<()> {
     let config = contract_config(POLYGON, false)
         .context("contract_config(POLYGON) no disponible en este build del SDK")?;
     let exchange_hex = address_to_hex_64(&config.exchange);
+    let ctf_contract = format!("{:?}", config.conditional_tokens);
 
     let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC.to_string());
     let client = reqwest::Client::new();
@@ -77,7 +80,7 @@ async fn main_impl() -> Result<()> {
     );
     let allow_raw_eoa = eth_call(&client, &rpc_url, USDC_POLYGON, &data_allow_eoa).await?;
     let allowance_eoa = parse_hex_u256(&allow_raw_eoa)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
-    println!("  EOA  — USDC balance: {} USDC, allowance (CTF): {} USDC", balance_eoa, allowance_eoa);
+    println!("  EOA  — USDC balance: {} USDC, USDC allowance (to exchange): {} USDC", balance_eoa, allowance_eoa);
 
     // --- Saldo y allowance de la Safe (Polymarket) ---
     let safe_addr = safe_address
@@ -95,7 +98,22 @@ async fn main_impl() -> Result<()> {
     );
     let allow_raw_safe = eth_call(&client, &rpc_url, USDC_POLYGON, &data_allow_safe).await?;
     let allowance_safe = parse_hex_u256(&allow_raw_safe)? as f64 / 10f64.powi(USDC_DECIMALS as i32);
-    println!("  Safe — USDC balance: {} USDC, allowance (CTF): {} USDC\n", balance_safe, allowance_safe);
+    // CTF (Conditional Tokens ERC-1155): isApprovedForAll(Safe, exchange) — required for SELL (SL/TP)
+    let data_ctf_safe = format!(
+        "0x{}{}{}",
+        SELECTOR_IS_APPROVED_FOR_ALL,
+        safe_hex,
+        exchange_hex
+    );
+    let ctf_approved_safe = eth_call(&client, &rpc_url, ctf_contract.as_str(), &data_ctf_safe).await
+        .map(|r| parse_ctf_approved(&r))
+        .unwrap_or(Ok(false))
+        .unwrap_or(false);
+    println!(
+        "  Safe — USDC balance: {} USDC, USDC allowance: {} USDC, CTF approved (sell): {}",
+        balance_safe, allowance_safe, ctf_approved_safe
+    );
+    println!();
 
     if balance_safe > 0.0 {
         println!("✓ El bot usa la wallet Safe (Polymarket). Saldo disponible para trading: {} USDC.", balance_safe);
@@ -139,6 +157,18 @@ async fn eth_call(
     rpc.result
         .context("RPC result missing")
         .map(|s| s.trim_start_matches("0x").to_string())
+}
+
+/// Parse ERC-1155 isApprovedForAll return: 32-byte bool (true = 0x...01, false = 0x...00).
+fn parse_ctf_approved(hex: &str) -> Result<bool> {
+    let hex = hex.trim_start_matches("0x");
+    let last_byte = if hex.len() >= 2 {
+        &hex[hex.len().saturating_sub(2)..]
+    } else {
+        hex
+    };
+    let byte = u8::from_str_radix(last_byte, 16).unwrap_or(0);
+    Ok(byte != 0)
 }
 
 fn parse_hex_u256(hex: &str) -> Result<u64> {

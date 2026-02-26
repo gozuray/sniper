@@ -92,7 +92,41 @@ trading. See the
 Proxy/Safe wallets (email login, browser extension) do **not** need manual
 approvals.
 
-### "Not enough balance / allowance" but I have balance
+### Why the bot buys but does not sell (SL/TP): "not enough balance / allowance"
+
+The bot **trades with your Polymarket (Safe) wallet**. To **buy**, the Safe needs USDC and
+USDC allowance to the exchange. To **sell** (SL/TP), the Safe needs:
+
+1. **Outcome token balance** (the shares you bought — e.g. 5.02 Down).
+2. **Conditional Token (CTF) approval** — the Safe must have called
+   `setApprovalForAll(exchange, true)` on the Conditional Tokens (ERC-1155) contract.
+   Without this, the exchange cannot debit your outcome tokens and the CLOB returns
+   "not enough balance / allowance" on sell orders.
+
+So: **buy** = USDC + USDC allowance; **sell** = outcome tokens + **CTF setApprovalForAll**.
+
+- If you use the **Safe** (browser wallet): the **Safe** must have given both approvals.
+  Usually the first time you trade on [polymarket.com](https://polymarket.com) (buy or sell)
+  the site prompts you to approve USDC and Conditional Tokens for the Safe. If you only
+  ever bought from the UI and never sold, the Safe might have USDC approval but not CTF.
+  **Fix:** Open Polymarket in the browser, go to the same market, and try to place a small
+  sell (or open the market and accept any approval prompt). That will set CTF approval for
+  the Safe. Then the bot will be able to sell at SL/TP.
+- If you use a **plain EOA** (no Safe): run the
+  [approvals example](https://github.com/Polymarket/rs-clob-client/blob/main/examples/approvals.rs)
+  once. It sets both USDC and CTF approvals for the EOA.
+
+**Check balances and approvals (read-only):**
+
+```bash
+cargo run --bin check_balance
+```
+
+This prints your **EOA**, the **Polymarket trading wallet (Safe)**, USDC balance/allowance,
+and **CTF approved for sell** (Safe only). If "CTF approved (sell): false" for the Safe,
+do the browser approval step above or run the SDK approvals from the Safe if you have a flow for it.
+
+### "Not enough balance / allowance" but I have balance (EOA)
 
 The CLOB rejects orders when **either** your USDC **balance** on Polygon is too low
 **or** your **allowance** (permission for the exchange contract to spend USDC) is
