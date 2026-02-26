@@ -36,6 +36,22 @@ fn api_credentials_from_env() -> Result<Option<polymarket_client_sdk::auth::Cred
     Ok(Some(polymarket_client_sdk::auth::Credentials::new(api_key, secret, passphrase)))
 }
 
+/// Optional funder address (Safe). When set, orders are sent in context of this address
+/// and the CLOB checks balance/allowance for it. Env: FUNDER_ADDRESS.
+fn funder_address_from_env() -> Result<Option<polymarket_client_sdk::types::Address>> {
+    let s = match std::env::var("FUNDER_ADDRESS") {
+        Ok(v) => v.trim().to_string(),
+        Err(_) => return Ok(None),
+    };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let addr: polymarket_client_sdk::types::Address = s
+        .parse()
+        .context("FUNDER_ADDRESS must be a valid Ethereum address (0x...)")?;
+    Ok(Some(addr))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Fijar proveedor crypto de rustls una sola vez por proceso (evita panic al abrir nuevas conexiones TLS/WS).
@@ -62,7 +78,12 @@ async fn main() -> Result<()> {
     let signer = polymarket_client_sdk::auth::LocalSigner::from_str(&private_key)?
         .with_chain_id(Some(polymarket_client_sdk::POLYGON));
 
-    preflight_check_ctf_approval(&private_key).await?;
+    let funder_address_opt = funder_address_from_env()?;
+    if let Some(ref a) = funder_address_opt {
+        tracing::info!(funder = %a, "using FUNDER_ADDRESS for orders (Safe context)");
+    }
+
+    preflight_check_ctf_approval(&private_key, funder_address_opt).await?;
 
     if config.auto_btc5m {
         // Dynamic 5-min: operate on the *active* interval (current 5-min window); switch when interval closes or out of sync.
@@ -102,6 +123,9 @@ async fn main() -> Result<()> {
                 let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
                     .authentication_builder(&signer)
                     .signature_type(SignatureType::GnosisSafe);
+                if let Some(funder) = funder_address_opt {
+                    builder = builder.funder(funder);
+                }
                 if let Some(creds) = api_credentials_from_env()? {
                     builder = builder.credentials(creds);
                 }
@@ -128,6 +152,9 @@ async fn main() -> Result<()> {
                 let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
                     .authentication_builder(&signer)
                     .signature_type(SignatureType::GnosisSafe);
+                if let Some(funder) = funder_address_opt {
+                    builder = builder.funder(funder);
+                }
                 if let Some(creds) = api_credentials_from_env()? {
                     builder = builder.credentials(creds);
                 }
@@ -175,6 +202,9 @@ async fn main() -> Result<()> {
         let mut builder = polymarket_client_sdk::clob::Client::new(&config.clob_url, sdk_config)?
             .authentication_builder(&signer)
             .signature_type(SignatureType::GnosisSafe);
+        if let Some(funder) = funder_address_opt {
+            builder = builder.funder(funder);
+        }
         if let Some(creds) = api_credentials_from_env()? {
             builder = builder.credentials(creds);
         }
@@ -634,12 +664,21 @@ async fn run_loop<S: SignerTrait + Send + Sync>(
 
 /// Pre-flight: verify the Safe wallet has CTF approvals for selling.
 /// Without these, buy orders succeed but sell (SL/TP) fails with "not enough balance / allowance".
-async fn preflight_check_ctf_approval(private_key: &str) -> Result<()> {
-    let signer = polymarket_client_sdk::auth::LocalSigner::from_str(private_key)?
-        .with_chain_id(Some(polymarket_client_sdk::POLYGON));
-    let eoa = signer.address();
-    let safe = polymarket_client_sdk::derive_safe_wallet(eoa, polymarket_client_sdk::POLYGON)
-        .context("could not derive Safe wallet address")?;
+/// When funder_opt is set, that address is checked; otherwise the Safe is derived from the signer.
+async fn preflight_check_ctf_approval(
+    private_key: &str,
+    funder_opt: Option<polymarket_client_sdk::types::Address>,
+) -> Result<()> {
+    let safe = match funder_opt {
+        Some(addr) => addr,
+        None => {
+            let signer = polymarket_client_sdk::auth::LocalSigner::from_str(private_key)?
+                .with_chain_id(Some(polymarket_client_sdk::POLYGON));
+            let eoa = signer.address();
+            polymarket_client_sdk::derive_safe_wallet(eoa, polymarket_client_sdk::POLYGON)
+                .context("could not derive Safe wallet address; set FUNDER_ADDRESS to your Safe")?
+        }
+    };
 
     let config = polymarket_client_sdk::contract_config(polymarket_client_sdk::POLYGON, false)
         .context("contract_config(POLYGON, false) not available")?;
