@@ -30,12 +30,35 @@ const SELECTOR_IS_APPROVED_FOR_ALL: &str = "e985e9c5";
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
     result: Option<String>,
-    error: Option<RpcError>,
+    #[serde(deserialize_with = "deserialize_rpc_error")]
+    error: Option<RpcErrorKind>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RpcError {
-    message: String,
+#[derive(Debug)]
+enum RpcErrorKind {
+    Object { message: String },
+    String(String),
+}
+
+fn deserialize_rpc_error<'de, D>(deserializer: D) -> Result<Option<RpcErrorKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let opt: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(v) = opt else { return Ok(None) };
+    Ok(Some(match v {
+        serde_json::Value::String(s) => RpcErrorKind::String(s),
+        serde_json::Value::Object(m) => {
+            let message = m
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown RPC error")
+                .to_string();
+            RpcErrorKind::Object { message }
+        }
+        _ => return Err(Error::custom("RPC error must be string or object")),
+    }))
 }
 
 fn address_to_hex_64(addr: &impl std::fmt::Display) -> String {
@@ -152,7 +175,11 @@ async fn eth_call(
         .context("RPC request failed")?;
     let rpc: RpcResponse = res.json().await.context("RPC response parse")?;
     if let Some(e) = rpc.error {
-        anyhow::bail!("RPC error: {}", e.message);
+        let msg = match e {
+            RpcErrorKind::Object { message } => message,
+            RpcErrorKind::String(s) => s,
+        };
+        anyhow::bail!("RPC error: {}", msg);
     }
     rpc.result
         .context("RPC result missing")
