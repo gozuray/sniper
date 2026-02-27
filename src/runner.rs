@@ -25,6 +25,8 @@ const LOG_BOOK_EVERY_TICKS: u64 = 10;
 const FAK_RETRY_DELAY_MS: u64 = 30;
 /// Max FAK retries to liquidate position.
 const FAK_MAX_RETRIES: u32 = 50;
+/// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
+const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -318,10 +320,12 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled)
+        // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled).
+        // Always use position.token_id (the token we bought), never derive from book; sell_size = min(position.size, available).
         if state.config.enable_stop_loss {
             if let Some(ref sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
+                    // Use book only for best_bid; token to sell is always position.token_id.
                     let is_up = sl.token_id == market.token_id_up;
                     let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
                     let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
@@ -336,6 +340,7 @@ pub async fn run() -> Result<()> {
                         }
                         // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                         tokio::time::sleep(Duration::from_millis(350)).await;
+                        // SELL FAK must cross: limit_price = best_bid (or best_bid - tick). Use best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
                         let available = clob.get_available_balance(&sl.token_id).await.ok().flatten();
@@ -369,17 +374,28 @@ pub async fn run() -> Result<()> {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                 m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
                             });
-                            // On balance/allowance error do NOT assume position closed: retry at best bid until sold (SL semantics)
+                            // On balance/allowance error: cancel open orders once, then retry with backoff (100→200→400 ms), selling position.size.
                             let is_balance_error = is_position_closed_error(result.error_msg.as_deref());
                             if is_no_match || is_balance_error {
                                 if is_balance_error {
-                                    info!("[IntervalSniper] stop loss: balance/allowance error, retrying at best bid until sold");
+                                    info!("[IntervalSniper] stop loss: balance/allowance error, canceling open orders once and retrying with backoff");
                                 } else {
                                     info!("[IntervalSniper] stop loss no match, retrying FAK at latest bid until liquidated");
                                 }
                                 let mut filled = false;
+                                let mut canceled_once_for_balance = false;
                                 for attempt in 0..FAK_MAX_RETRIES {
-                                    tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
+                                    let delay_ms = if is_balance_error {
+                                        BALANCE_RETRY_BACKOFF_MS.get(attempt as usize).copied().unwrap_or(400)
+                                    } else {
+                                        FAK_RETRY_DELAY_MS
+                                    };
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    if is_balance_error && !canceled_once_for_balance {
+                                        let _ = clob.cancel_orders_for_token(&sl.token_id).await;
+                                        canceled_once_for_balance = true;
+                                        tokio::time::sleep(Duration::from_millis(350)).await;
+                                    }
                                     let top_retry = if let Some(ref ws) = state.ws_book {
                                         ws.get_top_of_book().await
                                     } else {
@@ -426,12 +442,9 @@ pub async fn run() -> Result<()> {
                                         filled = true;
                                         break;
                                     }
-                                    // Balance/allowance error means shares may still be locked in an open order.
-                                    // Re-cancel then wait before the next attempt so the CLOB can free them.
+                                    // Balance/allowance: we already canceled once; just backoff and retry with position.size (no re-cancel).
                                     if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error, re-cancelling orders to free locked balance", attempt + 1);
-                                        let _ = clob.cancel_orders_for_token(&sl.token_id).await;
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt + 1);
                                         continue;
                                     }
                                     if result_retry.http_status == Some(400) {
@@ -460,12 +473,14 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid from real-time book until filled)
+        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid until filled).
+        // Always use position.token_id (the token we bought); sell_size = min(position.size, available).
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
                     let elapsed_sec = (now_ms_u - tp.placed_at_ms) / 1000;
                     if elapsed_sec >= state.config.min_seconds_after_buy_before_auto_sell as u64 {
+                        // Use book only for best_bid; token to sell is always position.token_id.
                         let is_up = tp.token_id == market.token_id_up;
                         let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
                         let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
@@ -486,7 +501,11 @@ pub async fn run() -> Result<()> {
                             let sell_size = available
                                 .map(|a| position_size_real.min(a))
                                 .unwrap_or(position_size_real);
-                            let price = round_to_tick(best_bid.min(target + state.config.take_profit_price_margin));
+                            // SELL FAK must cross: use best_bid so order matches; avoid posting above bid.
+                            let price = match state.config.take_profit_time_in_force {
+                                crate::types::SellOrderTimeInForce::Fak => round_to_tick(best_bid),
+                                _ => round_to_tick(best_bid.min(target + state.config.take_profit_price_margin)),
+                            };
                             let size = size_4_decimals(sell_size);
                             let result = clob
                                 .place_sell_order(
@@ -514,17 +533,27 @@ pub async fn run() -> Result<()> {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                     m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
                                 });
-                                // On balance/allowance error do NOT assume position closed: retry at best bid (same as SL)
                                 let is_balance_error = is_position_closed_error(result.error_msg.as_deref());
                                 if is_no_match || is_balance_error {
                                     if is_balance_error {
-                                        info!("[IntervalSniper] take profit: balance/allowance error, retrying at best bid until sold");
+                                        info!("[IntervalSniper] take profit: balance/allowance error, canceling open orders once and retrying with backoff");
                                     } else {
                                         info!("[IntervalSniper] take profit no match, retrying FAK at latest bid until liquidated");
                                     }
                                     let mut filled = false;
+                                    let mut canceled_once_for_balance = false;
                                     for attempt in 0..FAK_MAX_RETRIES {
-                                        tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
+                                        let delay_ms = if is_balance_error {
+                                            BALANCE_RETRY_BACKOFF_MS.get(attempt as usize).copied().unwrap_or(400)
+                                        } else {
+                                            FAK_RETRY_DELAY_MS
+                                        };
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                        if is_balance_error && !canceled_once_for_balance {
+                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                            canceled_once_for_balance = true;
+                                            tokio::time::sleep(Duration::from_millis(350)).await;
+                                        }
                                         let top_retry = if let Some(ref ws) = state.ws_book {
                                             ws.get_top_of_book().await
                                         } else {
@@ -541,7 +570,6 @@ pub async fn run() -> Result<()> {
                                             }
                                         };
                                         let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
-                                        // Real-time book: for SELL FAK we use best_bid (executable price; best_ask would be passive).
                                         let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                                         if bid < target {
                                             continue;
@@ -552,7 +580,7 @@ pub async fn run() -> Result<()> {
                                             .map(|a| position_size_real.min(a))
                                             .unwrap_or(position_size_real);
                                         let size_retry = size_4_decimals(sell_size_retry);
-                                        let price_retry = round_to_tick(bid.min(target + state.config.take_profit_price_margin));
+                                        let price_retry = round_to_tick(bid);
                                         let result_retry = clob
                                             .place_sell_order(
                                                 &tp.token_id,
@@ -572,12 +600,8 @@ pub async fn run() -> Result<()> {
                                             filled = true;
                                             break;
                                         }
-                                        // Balance/allowance error means shares may still be locked in an open order.
-                                        // Re-cancel then wait before the next attempt so the CLOB can free them.
                                         if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error, re-cancelling orders to free locked balance", attempt + 1);
-                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
-                                            tokio::time::sleep(Duration::from_millis(500)).await;
+                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt + 1);
                                             continue;
                                         }
                                         if result_retry.http_status == Some(400) {
@@ -633,12 +657,13 @@ pub async fn run() -> Result<()> {
                         EntrySide::Down => &market.token_id_down,
                     };
                     // Enforce price within [min_buy_price, max_buy_price]: we cross the spread (best_ask + 1 tick)
-                    // but never go below min nor above max (avoids buying at 0.89 when min is 0.92).
+                    // but never go below min nor above max. FAK must cross: limit_price >= best_ask (or "no orders found").
                     let effective_price = round_to_tick(
                         (best_ask + TICK_SIZE)
                             .max(state.config.min_buy_price)
                             .min(state.config.max_buy_price),
                     );
+                    let effective_price = effective_price.max(best_ask);
                     let shares_left = state.config.size_shares - state.total_shares_this_interval;
                     // Cap at shares_left so we never order more than configured size (e.g. exactly 7 shares).
                     // Round to 2 decimals so we never send 7.24000001 when user wants 7.
@@ -659,8 +684,7 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // Use actual filled size from API when available (FAK can fill more/less than requested).
-                            // If API returns 0 or missing (e.g. order "live" not yet matched), use order size so TP/SL sell the right amount.
+                            // Position must use actual filled_size from CLOB (FAK can be partial; TP/SL must sell only what we have).
                             let filled = result
                                 .filled_size
                                 .filter(|s| *s > Decimal::ZERO && *s >= size.clone() * dec!(0.01))
