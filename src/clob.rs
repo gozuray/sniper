@@ -285,13 +285,13 @@ impl ClobClient for LiveClob {
         let token_id = parse_token_id(&params.token_id)?;
         let signer_addr = format!("0x{:x}", self.wallet.address());
         let taker = H160::from_str("0x0000000000000000000000000000000000000000").unwrap();
-        // For non-GTD orders Polymarket API expects expiration "e"; use 0 in signature.
+        // For non-GTD orders use expiration 0 in both signature and API (API parses as big.Int).
         let (expiration_for_sig, expiration_for_api) = match order_type {
             OrderType::Gtd => {
                 let e = params.expiration_unix.unwrap_or(0);
                 (e, serde_json::Value::String(e.to_string()))
             }
-            _ => (0u64, serde_json::Value::String("e".to_string())),
+            _ => (0u64, serde_json::Value::String("0".to_string())),
         };
         let expiration = expiration_for_sig;
         let nonce = 0u64;
