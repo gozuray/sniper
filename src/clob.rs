@@ -271,19 +271,23 @@ impl LiveClob {
                 filled_size: None,
             });
         }
-        // Parse filled size from API: takingAmount is in 6 decimals. For BUY = shares filled; for SELL = (size*price) so size = takingAmount/1e6/price.
-        let filled_size = json
+        // Parse filled size from API: takingAmount is in 6 decimals (string or number). For BUY = shares filled; for SELL = (size*price) so size = takingAmount/1e6/price.
+        let taker_6dec_opt = json
             .get("takingAmount")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Decimal::from_str(s).ok())
-            .map(|taker_6dec| {
-                let human = taker_6dec / dec!(1000000);
-                match (side, price) {
-                    (OrderSide::Buy, _) => human,
-                    (OrderSide::Sell, Some(p)) if !p.is_zero() => human / p,
-                    _ => human,
-                }
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| Decimal::from_str(s).ok())
+                    .or_else(|| v.as_i64().map(|n| Decimal::from(n)))
+                    .or_else(|| v.as_u64().map(|n| Decimal::from(n)))
             });
+        let filled_size = taker_6dec_opt.map(|taker_6dec| {
+            let human = taker_6dec / dec!(1000000);
+            match (side, price) {
+                (OrderSide::Buy, _) => human,
+                (OrderSide::Sell, Some(p)) if !p.is_zero() => human / p,
+                _ => human,
+            }
+        });
         Ok(PlaceOrderResult {
             order_id,
             success,

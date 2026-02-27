@@ -574,11 +574,13 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // Use actual filled size from API when available (FAK can fill more/less than requested)
+                            // Use actual filled size from API when available (FAK can fill more/less than requested).
+                            // If API returns 0 or missing (e.g. order "live" not yet matched), use order size so TP/SL sell the right amount.
                             let filled = result
                                 .filled_size
-                                .filter(|s| *s > Decimal::ZERO)
+                                .filter(|s| *s > Decimal::ZERO && *s >= size.clone() * dec!(0.01))
                                 .unwrap_or(size.clone());
+                            let filled = filled.min(size.clone());
                             state.ordered_this_interval = true;
                             state.total_shares_this_interval += filled.clone();
                             let entry_price = effective_price;
@@ -595,17 +597,22 @@ pub async fn run() -> Result<()> {
                             } else {
                                 round_to_tick(state.config.take_profit_price)
                             };
+                            // TP/SL size must be > 0 or API rejects; use at least 0.0001 and never exceed filled
+                            let pct_tp = Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
+                            let pct_sl = Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
+                            let tp_size = (filled.clone() * pct_tp).max(dec!(0.0001)).min(filled.clone());
+                            let sl_size = (filled.clone() * pct_sl).max(dec!(0.0001)).min(filled.clone());
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.to_string(),
                                 target_price,
-                                size: filled.clone() * Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100),
+                                size: tp_size,
                                 placed_at_ms: now_ms_u,
                             });
                             let trigger_price = round_to_tick(state.config.stop_loss_price);
                             state.pending_stop_loss = Some(PendingStopLoss {
                                 token_id: token_id.to_string(),
                                 entry_price: entry_price.clone(),
-                                size: filled * Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100),
+                                size: sl_size,
                                 trigger_price,
                                 placed_at_ms: now_ms_u,
                             });
