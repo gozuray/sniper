@@ -613,11 +613,12 @@ pub async fn run() -> Result<()> {
                             } else {
                                 round_to_tick(state.config.take_profit_price)
                             };
-                            // TP/SL size must be > 0 or API rejects; use at least 0.0001 and never exceed filled
+                            // TP/SL size must be > 0 or API rejects; use at least 0.0001, never exceed filled, and cap at total share size from .env (MM_SIZE_SHARES)
                             let pct_tp = Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
                             let pct_sl = Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
-                            let tp_size = (filled.clone() * pct_tp).max(dec!(0.0001)).min(filled.clone());
-                            let sl_size = (filled.clone() * pct_sl).max(dec!(0.0001)).min(filled.clone());
+                            let max_sell = state.config.size_shares.min(filled.clone());
+                            let tp_size = (filled.clone() * pct_tp).max(dec!(0.0001)).min(max_sell.clone());
+                            let sl_size = (filled.clone() * pct_sl).max(dec!(0.0001)).min(max_sell);
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.to_string(),
                                 target_price,
