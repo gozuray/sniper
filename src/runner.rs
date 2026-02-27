@@ -327,9 +327,15 @@ pub async fn run() -> Result<()> {
                     let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                     if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
                         // Cancel any open orders for this token so balance is not locked (e.g. by a GTC TP order).
-                        if let Err(e) = clob.cancel_orders_for_token(&sl.token_id).await {
-                            warn!("[IntervalSniper] cancel orders before SL failed: {} (continuing with sell)", e);
+                        match clob.cancel_orders_for_token(&sl.token_id).await {
+                            Err(e) => warn!("[IntervalSniper] cancel orders before SL failed: {} (continuing with sell)", e),
+                            Ok(res) if !res.not_canceled.is_empty() => {
+                                warn!("[IntervalSniper] cancel before SL: {} order(s) not canceled, balance may still be locked", res.not_canceled.len());
+                            }
+                            _ => {}
                         }
+                        // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
+                        tokio::time::sleep(Duration::from_millis(350)).await;
                         let price = round_to_tick(best_bid);
                         let size = size_4_decimals(sl.size.clone());
                         let result = clob
@@ -438,9 +444,15 @@ pub async fn run() -> Result<()> {
                         let target = tp.target_price - state.config.take_profit_price_margin;
                         if best_bid >= target {
                             // Cancel any open orders for this token so balance is not locked (e.g. by a GTC SL order).
-                            if let Err(e) = clob.cancel_orders_for_token(&tp.token_id).await {
-                                warn!("[IntervalSniper] cancel orders before TP failed: {} (continuing with sell)", e);
+                            match clob.cancel_orders_for_token(&tp.token_id).await {
+                                Err(e) => warn!("[IntervalSniper] cancel orders before TP failed: {} (continuing with sell)", e),
+                                Ok(res) if !res.not_canceled.is_empty() => {
+                                    warn!("[IntervalSniper] cancel before TP: {} order(s) not canceled, balance may still be locked", res.not_canceled.len());
+                                }
+                                _ => {}
                             }
+                            // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
+                            tokio::time::sleep(Duration::from_millis(350)).await;
                             let price = round_to_tick(best_bid.min(target + state.config.take_profit_price_margin));
                             let size = size_4_decimals(tp.size.clone());
                             let result = clob

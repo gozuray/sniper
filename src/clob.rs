@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Order type for placement.
 #[derive(Debug, Clone, Copy)]
@@ -451,6 +451,9 @@ impl ClobClient for LiveClob {
             .unwrap_or_default();
         if !canceled.is_empty() {
             info!("[LiveClob] canceled {} open order(s) for token to free balance", canceled.len());
+        }
+        if !not_canceled.is_empty() {
+            warn!("[LiveClob] {} order(s) could not be canceled (balance may stay locked): {:?}", not_canceled.len(), not_canceled);
         }
         Ok(CancelOrdersResult {
             canceled,
