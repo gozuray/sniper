@@ -295,7 +295,7 @@ impl ClobClient for LiveClob {
         };
         let expiration = expiration_for_sig;
         let nonce = 0u64;
-        let fee_rate_bps = params.fee_rate_bps.unwrap_or(0);
+        let fee_rate_bps = params.fee_rate_bps.unwrap_or(1000);
         let side = match params.side {
             OrderSide::Buy => 0u8,
             OrderSide::Sell => 1u8,
