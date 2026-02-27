@@ -48,6 +48,13 @@ pub enum OrderSide {
     Sell,
 }
 
+/// Result of cancelling orders (e.g. cancel-market-orders).
+#[derive(Debug, Default)]
+pub struct CancelOrdersResult {
+    pub canceled: Vec<String>,
+    pub not_canceled: std::collections::HashMap<String, String>,
+}
+
 /// Abstraction for CLOB order placement (dry-run or live).
 #[async_trait::async_trait]
 pub trait ClobClient: Send + Sync {
@@ -56,6 +63,12 @@ pub trait ClobClient: Send + Sync {
         params: LimitOrderParams,
         order_type: OrderType,
     ) -> Result<PlaceOrderResult>;
+
+    /// Cancel all open orders for a given outcome token. Use before placing SL/TP sell so any
+    /// resting GTC order (e.g. TP) does not lock balance and cause "not enough balance" on SL.
+    async fn cancel_orders_for_token(&self, _token_id: &str) -> Result<CancelOrdersResult> {
+        Ok(CancelOrdersResult::default())
+    }
 
     async fn place_sell_order(
         &self,
@@ -385,6 +398,64 @@ impl ClobClient for LiveClob {
             info!("[LiveClob] order failed: {}", msg);
         }
         Ok(result)
+    }
+
+    async fn cancel_orders_for_token(&self, token_id: &str) -> Result<CancelOrdersResult> {
+        let path = "/cancel-market-orders";
+        let body = serde_json::json!({ "asset_id": token_id });
+        let body_str = body.to_string();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = build_poly_hmac(
+            &self.api_secret,
+            timestamp,
+            "DELETE",
+            path,
+            Some(&body_str),
+        )?;
+        let url = format!("{}{}", self.clob_host, path);
+        let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
+        let res = self
+            .client
+            .request(reqwest::Method::DELETE, &url)
+            .header("Content-Type", "application/json")
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_ADDRESS", &signer_addr)
+            .header("POLY_SIGNATURE", &sig)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .body(body_str)
+            .send()
+            .await?;
+        let text = res.text().await.unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let canceled: Vec<String> = json
+            .get("canceled")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let not_canceled = json
+            .get("not_canceled")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !canceled.is_empty() {
+            info!("[LiveClob] canceled {} open order(s) for token to free balance", canceled.len());
+        }
+        Ok(CancelOrdersResult {
+            canceled,
+            not_canceled,
+        })
     }
 }
 
