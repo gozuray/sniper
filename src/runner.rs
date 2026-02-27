@@ -126,7 +126,8 @@ pub async fn run() -> Result<()> {
         let now_u = now_unix();
         let now_ms_u = now_ms();
 
-        // Refresh market if needed (interval switch)
+        // Refresh market if needed (interval switch) — always use current 5-min window slug
+        // e.g. 5:15–5:20 → btc-updown-5m-1772169300, 5:20–5:25 → btc-updown-5m-1772169600
         let current_slug = current_5min_slug(config.interval_market);
         let need_new_market = state.market.is_none()
             || state.market.as_ref().map(|m| now_u >= m.close_time_unix).unwrap_or(true)

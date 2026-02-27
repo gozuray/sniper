@@ -74,13 +74,9 @@ pub fn load_config() -> Result<Config> {
         env("INTERVAL_SNIPER_MARKET", "btc_5m").as_str(),
     );
     let interval_market = interval_market.unwrap(); // FromStr Err is Infallible
-    let env_slug = env("MM_MARKET_SLUG", "");
-    let use_dynamic_slug = env_slug.is_empty() || env_slug == "btc-up-or-down-5-min";
-    let market_slug = if use_dynamic_slug {
-        current_5min_slug(interval_market)
-    } else {
-        env_slug
-    };
+    // For BTC/SOL 5m we always use the current 5-min interval slug (e.g. btc-updown-5m-1772169300 for 5:15–5:20).
+    // Do not pin to a fixed MM_MARKET_SLUG so the bot subscribes to the live interval.
+    let market_slug = current_5min_slug(interval_market);
 
     let order_strategy = match env("MM_ORDER_STRATEGY", "fak_cross_spread").to_lowercase().as_str() {
         "gtc_resting" => OrderStrategy::GtcResting,
