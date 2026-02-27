@@ -28,6 +28,8 @@ pub struct PlaceOrderResult {
     pub error_msg: Option<String>,
     /// Filled size in shares (from API takingAmount when matched). Use this for TP/SL so we sell 100% of what was actually bought.
     pub filled_size: Option<Decimal>,
+    /// HTTP status from the order API (e.g. 400 when TP/SL fails with balance/allowance).
+    pub http_status: Option<u16>,
 }
 
 /// Parameters for a limit order.
@@ -68,6 +70,12 @@ pub trait ClobClient: Send + Sync {
     /// resting GTC order (e.g. TP) does not lock balance and cause "not enough balance" on SL.
     async fn cancel_orders_for_token(&self, _token_id: &str) -> Result<CancelOrdersResult> {
         Ok(CancelOrdersResult::default())
+    }
+
+    /// Fetch balance/allowance for conditional token (GET /balance-allowance?asset_type=CONDITIONAL&token_id=...&signature_type=...).
+    /// Used when TP/SL returns 400 to debug balance/allowance.
+    async fn get_balance_allowance(&self, _token_id: &str) -> Result<String> {
+        Ok("(not available)".to_string())
     }
 
     async fn place_sell_order(
@@ -132,6 +140,7 @@ impl ClobClient for DryRunClob {
             success: true,
             error_msg: None,
             filled_size: Some(params.size),
+            http_status: None,
         })
     }
 }
@@ -282,6 +291,7 @@ impl LiveClob {
                 success: false,
                 error_msg: Some(format!("HTTP {}: {}", status, text.chars().take(200).collect::<String>())),
                 filled_size: None,
+                http_status: Some(status.as_u16()),
             });
         }
         // Parse filled size from API: takingAmount is in 6 decimals (string or number). For BUY = shares filled; for SELL = (size*price) so size = takingAmount/1e6/price.
@@ -306,7 +316,40 @@ impl LiveClob {
             success,
             error_msg,
             filled_size,
+            http_status: Some(status.as_u16()),
         })
+    }
+
+    /// GET /balance-allowance with HMAC auth (path includes query string).
+    async fn get_balance_allowance_inner(&self, token_id: &str) -> Result<String> {
+        let path = format!(
+            "/balance-allowance?asset_type=CONDITIONAL&token_id={}&signature_type={}",
+            urlencoding::encode(token_id),
+            self.signature_type
+        );
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = build_poly_hmac(&self.api_secret, timestamp, "GET", &path, None)?;
+        let url = format!("{}{}", self.clob_host, path);
+        let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
+        let res = self
+            .client
+            .get(&url)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_ADDRESS", &signer_addr)
+            .header("POLY_SIGNATURE", &sig)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .send()
+            .await?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("balance-allowance HTTP {}: {}", status, text.chars().take(200).collect::<String>());
+        }
+        Ok(text)
     }
 }
 
@@ -459,6 +502,10 @@ impl ClobClient for LiveClob {
             canceled,
             not_canceled,
         })
+    }
+
+    async fn get_balance_allowance(&self, token_id: &str) -> Result<String> {
+        self.get_balance_allowance_inner(token_id).await
     }
 }
 

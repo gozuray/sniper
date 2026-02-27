@@ -354,6 +354,13 @@ pub async fn run() -> Result<()> {
                             state.stop_loss_placed = true;
                             state.auto_sell_placed = true; // TP no longer needed, position closed
                         } else {
+                            if result.http_status == Some(400) {
+                                let ba = clob.get_balance_allowance(&sl.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                info!(
+                                    "[IntervalSniper] SL 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
+                                    sl.token_id, size, ba
+                                );
+                            }
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                 m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
                             });
@@ -416,6 +423,13 @@ pub async fn run() -> Result<()> {
                                         tokio::time::sleep(Duration::from_millis(500)).await;
                                         continue;
                                     }
+                                    if result_retry.http_status == Some(400) {
+                                        let ba = clob.get_balance_allowance(&sl.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                        info!(
+                                            "[IntervalSniper] SL retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
+                                            sl.token_id, size, ba
+                                        );
+                                    }
                                     if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
                                         if let Some(msg) = result_retry.error_msg {
                                 warn!("[IntervalSniper]  FAIL  SL    {}", msg);
@@ -474,6 +488,13 @@ pub async fn run() -> Result<()> {
                                 state.auto_sell_placed = true;
                                 state.stop_loss_placed = true; // SL no longer needed, position closed
                             } else {
+                                if result.http_status == Some(400) {
+                                    let ba = clob.get_balance_allowance(&tp.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                    info!(
+                                        "[IntervalSniper] TP 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
+                                        tp.token_id, size, ba
+                                    );
+                                }
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                     m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
                                 });
@@ -535,6 +556,13 @@ pub async fn run() -> Result<()> {
                                             let _ = clob.cancel_orders_for_token(&tp.token_id).await;
                                             tokio::time::sleep(Duration::from_millis(500)).await;
                                             continue;
+                                        }
+                                        if result_retry.http_status == Some(400) {
+                                            let ba = clob.get_balance_allowance(&tp.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                            info!(
+                                                "[IntervalSniper] TP retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
+                                                tp.token_id, size, ba
+                                            );
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
                                             if let Some(msg) = result_retry.error_msg {
