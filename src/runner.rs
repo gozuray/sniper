@@ -47,7 +47,7 @@ fn top_has_book_data(top: &TopOfBook) -> bool {
     up_ok || down_ok
 }
 
-/// Maximum number of trades (buy + sell) allowed per interval; after stop loss we allow re-entry once.
+/// Maximum number of trades (buy + sell) allowed per interval; second trade only when the first was closed by SL.
 const MAX_TRADES_PER_INTERVAL: u32 = 2;
 
 struct RunnerState {
@@ -56,8 +56,10 @@ struct RunnerState {
     /// WebSocket order book when connected; None = use REST only.
     ws_book: Option<ClobWsBook>,
     ordered_this_interval: bool,
-    /// Number of buys executed this interval (max MAX_TRADES_PER_INTERVAL); re-entry after SL counts as second trade.
+    /// Number of buys executed this interval (max MAX_TRADES_PER_INTERVAL); re-entry only after SL.
     trades_this_interval: u32,
+    /// True only when the last position in this interval was closed by SL; allows one re-entry (second trade).
+    re_entry_allowed_after_sl: bool,
     total_shares_this_interval: Decimal,
     last_buy_order: Option<LastBuyOrder>,
     pending_auto_sell: Option<PendingAutoSell>,
@@ -190,6 +192,7 @@ pub async fn run() -> Result<()> {
         config: config.clone(),
         ordered_this_interval: false,
         trades_this_interval: 0,
+        re_entry_allowed_after_sl: false,
         total_shares_this_interval: Decimal::ZERO,
         last_buy_order: None,
         pending_auto_sell: None,
@@ -249,6 +252,7 @@ pub async fn run() -> Result<()> {
                     state.market = Some(market.clone());
                     state.ordered_this_interval = false;
                     state.trades_this_interval = 0;
+                    state.re_entry_allowed_after_sl = false;
                     state.total_shares_this_interval = Decimal::ZERO;
                     state.last_buy_order = None;
                     state.pending_auto_sell = None;
@@ -433,6 +437,7 @@ pub async fn run() -> Result<()> {
                             );
                             state.stop_loss_placed = true;
                             state.auto_sell_placed = true;
+                            state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
                             // Clear position state so we can re-enter at target price (max 2 trades per interval).
                             state.pending_auto_sell = None;
                             state.pending_stop_loss = None;
@@ -547,6 +552,7 @@ pub async fn run() -> Result<()> {
                                         );
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
                                         state.last_buy_order = None;
@@ -661,6 +667,7 @@ pub async fn run() -> Result<()> {
                                 );
                                 state.auto_sell_placed = true;
                                 state.stop_loss_placed = true;
+                                state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
                                 state.last_buy_order = None;
@@ -776,6 +783,7 @@ pub async fn run() -> Result<()> {
                                             );
                                             state.auto_sell_placed = true;
                                             state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.last_buy_order = None;
@@ -818,9 +826,12 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Buy path: up to MAX_TRADES_PER_INTERVAL per interval; after SL/TP we allow re-entry when price is in range
+        // Buy path: up to MAX_TRADES_PER_INTERVAL per interval; re-entry only after SL (not after TP).
         let no_open_position = state.pending_auto_sell.is_none() && state.pending_stop_loss.is_none();
-        if no_open_position && state.trades_this_interval < MAX_TRADES_PER_INTERVAL {
+        let can_buy = no_open_position
+            && (state.trades_this_interval == 0
+                || (state.trades_this_interval == 1 && state.re_entry_allowed_after_sl));
+        if can_buy {
             let in_window = state.config.no_window_all_intervals
                 || secs_to_close <= state.config.seconds_before_close as u64;
             let sec_since_start = 300u64.saturating_sub(secs_to_close);
