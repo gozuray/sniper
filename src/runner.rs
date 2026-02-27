@@ -408,18 +408,28 @@ pub async fn run() -> Result<()> {
                             .await
                             .ok()
                             .flatten();
-                        let size = effective_sell_size(position_size_real, available.clone());
-                        if size < MIN_SELL_SIZE {
-                            warn!(
-                                "[IntervalSniper] SL available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
-                                sl.token_id,
-                                available,
-                                size,
-                                MIN_SELL_SIZE
-                            );
-                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                            continue;
-                        }
+                        let size = {
+                            let from_api = effective_sell_size(position_size_real.clone(), available.clone());
+                            if from_api >= MIN_SELL_SIZE {
+                                from_api
+                            } else {
+                                let fallback = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS);
+                                if fallback >= MIN_SELL_SIZE {
+                                    info!(
+                                        "[IntervalSniper] SL using position size (API reported low/zero): size={}",
+                                        fallback
+                                    );
+                                    fallback
+                                } else {
+                                    warn!(
+                                        "[IntervalSniper] SL skip: token_id={} available_shares={:?} position_size={} min_sell_size={}",
+                                        sl.token_id, available, fallback, MIN_SELL_SIZE
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                    continue;
+                                }
+                            }
+                        };
                         let result = clob
                             .place_sell_order(
                                 &sl.token_id,
@@ -521,19 +531,29 @@ pub async fn run() -> Result<()> {
                                         .await
                                         .ok()
                                         .flatten();
-                                    let size_retry =
-                                        effective_sell_size(position_size_real, available.clone());
-                                    if size_retry < MIN_SELL_SIZE {
-                                        warn!(
-                                            "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
-                                            sl.token_id,
-                                            attempt,
-                                            available,
-                                            size_retry,
-                                            MIN_SELL_SIZE
-                                        );
-                                        break;
-                                    }
+                                    let size_retry = {
+                                        let from_api =
+                                            effective_sell_size(position_size_real.clone(), available.clone());
+                                        if from_api >= MIN_SELL_SIZE {
+                                            from_api
+                                        } else {
+                                            let fallback =
+                                                floor_to_decimals(position_size_real, SELL_SIZE_DECIMALS);
+                                            if fallback >= MIN_SELL_SIZE {
+                                                info!(
+                                                    "[IntervalSniper] SL retry using position size (API low/zero): attempt={} size={}",
+                                                    attempt, fallback
+                                                );
+                                                fallback
+                                            } else {
+                                                warn!(
+                                                    "[IntervalSniper] SL retry abort: token_id={} attempt={} available_shares={:?} position_size={} min_sell_size={}",
+                                                    sl.token_id, attempt, available, fallback, MIN_SELL_SIZE
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    };
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
                                         .place_sell_order(
@@ -633,18 +653,28 @@ pub async fn run() -> Result<()> {
                                 .await
                                 .ok()
                                 .flatten();
-                            let size = effective_sell_size(position_size_real, available.clone());
-                            if size < MIN_SELL_SIZE {
-                                warn!(
-                                "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
-                                tp.token_id,
-                                available,
-                                size,
-                                MIN_SELL_SIZE
-                            );
-                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                continue;
-                            }
+                            let size = {
+                                let from_api = effective_sell_size(position_size_real.clone(), available.clone());
+                                if from_api >= MIN_SELL_SIZE {
+                                    from_api
+                                } else {
+                                    let fallback = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS);
+                                    if fallback >= MIN_SELL_SIZE {
+                                        info!(
+                                            "[IntervalSniper] TP using position size (API reported low/zero): size={}",
+                                            fallback
+                                        );
+                                        fallback
+                                    } else {
+                                        warn!(
+                                            "[IntervalSniper] TP skip: token_id={} available_shares={:?} position_size={} min_sell_size={}",
+                                            tp.token_id, available, fallback, MIN_SELL_SIZE
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                        continue;
+                                    }
+                                }
+                            };
                             // SELL FAK must cross: use best_bid so order matches; avoid posting above bid.
                             let price = match state.config.take_profit_time_in_force {
                                 crate::types::SellOrderTimeInForce::Fak => round_to_tick(best_bid),
@@ -753,21 +783,31 @@ pub async fn run() -> Result<()> {
                                             .await
                                             .ok()
                                             .flatten();
-                                        let size_retry = effective_sell_size(
-                                            position_size_real,
-                                            available.clone(),
-                                        );
-                                        if size_retry < MIN_SELL_SIZE {
-                                            warn!(
-                                                "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
-                                                tp.token_id,
-                                                attempt,
-                                                available,
-                                                size_retry,
-                                                MIN_SELL_SIZE
+                                        let size_retry = {
+                                            let from_api = effective_sell_size(
+                                                position_size_real.clone(),
+                                                available.clone(),
                                             );
-                                            break;
-                                        }
+                                            if from_api >= MIN_SELL_SIZE {
+                                                from_api
+                                            } else {
+                                                let fallback =
+                                                    floor_to_decimals(position_size_real, SELL_SIZE_DECIMALS);
+                                                if fallback >= MIN_SELL_SIZE {
+                                                    info!(
+                                                        "[IntervalSniper] TP retry using position size (API low/zero): attempt={} size={}",
+                                                        attempt, fallback
+                                                    );
+                                                    fallback
+                                                } else {
+                                                    warn!(
+                                                        "[IntervalSniper] TP retry abort: token_id={} attempt={} available_shares={:?} position_size={} min_sell_size={}",
+                                                        tp.token_id, attempt, available, fallback, MIN_SELL_SIZE
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        };
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
                                             .place_sell_order(
