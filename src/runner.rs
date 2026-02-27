@@ -23,8 +23,6 @@ const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
 /// Delay between FAK retries when no match (ms). Kept low for near-instant retries.
 const FAK_RETRY_DELAY_MS: u64 = 30;
-/// Max FAK retries to liquidate position.
-const FAK_MAX_RETRIES: u32 = 50;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
 /// Sell size precision to avoid sending oversell due to rounding.
@@ -453,10 +451,12 @@ pub async fn run() -> Result<()> {
                                 }
                                 let mut filled = false;
                                 let mut canceled_once_for_balance = false;
-                                for attempt in 0..FAK_MAX_RETRIES {
+                                let mut attempt: u32 = 0;
+                                loop {
+                                    attempt += 1;
                                     let delay_ms = if is_balance_error {
                                         BALANCE_RETRY_BACKOFF_MS
-                                            .get(attempt as usize)
+                                            .get((attempt as usize).saturating_sub(1))
                                             .copied()
                                             .unwrap_or(400)
                                     } else {
@@ -507,7 +507,7 @@ pub async fn run() -> Result<()> {
                                         warn!(
                                             "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
                                             sl.token_id,
-                                            attempt + 1,
+                                            attempt,
                                             available,
                                             size_retry,
                                             MIN_SELL_SIZE
@@ -527,7 +527,7 @@ pub async fn run() -> Result<()> {
                                         info!(
                                             "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, waiting next interval",
                                             fmt_price(Some(&price_retry)),
-                                            attempt + 1
+                                            attempt
                                         );
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true; // TP no longer needed
@@ -536,7 +536,7 @@ pub async fn run() -> Result<()> {
                                     }
                                     // Balance/allowance: we already canceled once; just backoff and retry with position.size (no re-cancel).
                                     if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt + 1);
+                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
                                         continue;
                                     }
                                     if result_retry.http_status == Some(400) {
@@ -559,9 +559,6 @@ pub async fn run() -> Result<()> {
                                         }
                                         break;
                                     }
-                                }
-                                if !filled {
-                                    warn!("[IntervalSniper]  WARN  SL    FAK retries exhausted, will retry next tick");
                                 }
                             } else if let Some(msg) = result.error_msg {
                                 warn!("[IntervalSniper]  FAIL  SL    {}", msg);
@@ -668,10 +665,12 @@ pub async fn run() -> Result<()> {
                                     }
                                     let mut filled = false;
                                     let mut canceled_once_for_balance = false;
-                                    for attempt in 0..FAK_MAX_RETRIES {
+                                    let mut attempt: u32 = 0;
+                                    loop {
+                                        attempt += 1;
                                         let delay_ms = if is_balance_error {
                                             BALANCE_RETRY_BACKOFF_MS
-                                                .get(attempt as usize)
+                                                .get((attempt as usize).saturating_sub(1))
                                                 .copied()
                                                 .unwrap_or(400)
                                         } else {
@@ -725,7 +724,7 @@ pub async fn run() -> Result<()> {
                                             warn!(
                                                 "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
                                                 tp.token_id,
-                                                attempt + 1,
+                                                attempt,
                                                 available,
                                                 size_retry,
                                                 MIN_SELL_SIZE
@@ -745,7 +744,7 @@ pub async fn run() -> Result<()> {
                                             info!(
                                                 "[IntervalSniper]  SELL  TP   @ {}   (attempt {}) — position closed, waiting next interval",
                                                 fmt_price(Some(&price_retry)),
-                                                attempt + 1
+                                                attempt
                                             );
                                             state.auto_sell_placed = true;
                                             state.stop_loss_placed = true; // SL no longer needed
@@ -755,7 +754,7 @@ pub async fn run() -> Result<()> {
                                         if is_position_closed_error(
                                             result_retry.error_msg.as_deref(),
                                         ) {
-                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt + 1);
+                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
                                             continue;
                                         }
                                         if result_retry.http_status == Some(400) {
@@ -776,9 +775,6 @@ pub async fn run() -> Result<()> {
                                             }
                                             break;
                                         }
-                                    }
-                                    if !filled {
-                                        warn!("[IntervalSniper]  WARN  TP    FAK retries exhausted, will retry next tick");
                                     }
                                 } else if let Some(msg) = result.error_msg {
                                     warn!("[IntervalSniper]  FAIL  TP    {}", msg);
