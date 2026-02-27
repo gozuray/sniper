@@ -19,6 +19,8 @@ thiserror = "1"
 anyhow = "1"
 urlencoding = "2"
 async-trait = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
 
 # Live CLOB: EIP-712 order signing + HMAC L2 auth
 ethers = "2"

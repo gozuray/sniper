@@ -2,6 +2,7 @@
 //! Same logic as the TypeScript bot in src/bot/marketMaker/.
 
 mod clob;
+mod clob_ws_book;
 mod config;
 mod market;
 mod orderbook;
