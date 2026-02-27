@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use crate::clob::{ClobClient, LimitOrderParams, OrderSide, OrderType};
+use crate::clob_ws_book::ClobWsBook;
 use crate::config::{current_5min_slug, load_config};
 use crate::market::fetch_market_by_slug;
 use crate::orderbook::fetch_top_of_book;
@@ -20,14 +21,31 @@ const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 /// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
-/// Delay between FAK retries when no match (ms).
-const FAK_RETRY_DELAY_MS: u64 = 50;
-/// Max FAK retries to liquidate position (total ~2s at 50ms).
-const FAK_MAX_RETRIES: u32 = 40;
+/// Delay between FAK retries when no match (ms). Kept low for near-instant retries.
+const FAK_RETRY_DELAY_MS: u64 = 30;
+/// Max FAK retries to liquidate position.
+const FAK_MAX_RETRIES: u32 = 50;
+
+/// True if top has at least one side with book data (for WS fallback to REST).
+fn top_has_book_data(top: &TopOfBook) -> bool {
+    let up_ok = top
+        .token_id_up
+        .as_ref()
+        .map(|s| s.best_ask.is_some() || s.best_bid.is_some())
+        .unwrap_or(false);
+    let down_ok = top
+        .token_id_down
+        .as_ref()
+        .map(|s| s.best_ask.is_some() || s.best_bid.is_some())
+        .unwrap_or(false);
+    up_ok || down_ok
+}
 
 struct RunnerState {
     config: Config,
     market: Option<ResolvedMarket>,
+    /// WebSocket order book when connected; None = use REST only.
+    ws_book: Option<ClobWsBook>,
     ordered_this_interval: bool,
     total_shares_this_interval: Decimal,
     last_buy_order: Option<LastBuyOrder>,
@@ -131,6 +149,7 @@ pub async fn run() -> Result<()> {
 
     let mut state = RunnerState {
         market: None,
+        ws_book: None,
         config: config.clone(),
         ordered_this_interval: false,
         total_shares_this_interval: Decimal::ZERO,
@@ -162,6 +181,26 @@ pub async fn run() -> Result<()> {
         if need_new_market {
             match fetch_market_by_slug(&http, &config.gamma_base_url, &current_slug).await {
                 Ok(market) => {
+                    state.ws_book = None; // drop previous WS before creating new
+                    let ws_url = ClobWsBook::ws_url_from_rest_host(&clob_host);
+                    match ClobWsBook::connect(
+                        &ws_url,
+                        &market.token_id_up,
+                        &market.token_id_down,
+                    )
+                    .await
+                    {
+                        Ok(ws) => {
+                            state.ws_book = Some(ws);
+                            info!("[IntervalSniper] WebSocket order book connected (real-time)");
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[IntervalSniper] WebSocket book connect failed: {}, using REST",
+                                e
+                            );
+                        }
+                    }
                     state.market = Some(market.clone());
                     state.ordered_this_interval = false;
                     state.total_shares_this_interval = Decimal::ZERO;
@@ -198,20 +237,36 @@ pub async fn run() -> Result<()> {
 
         let secs_to_close = seconds_to_close(now_u, market.close_time_unix);
 
-        // Fetch top of book
-        let top = match fetch_top_of_book(
-            &http,
-            &clob_host,
-            &market.token_id_up,
-            &market.token_id_down,
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("[IntervalSniper] order book fetch failed: {}", e);
-                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                continue;
+        // Top of book: WebSocket (instant) when connected, else REST. Fallback to REST if WS has no data yet.
+        let top = if let Some(ref ws) = state.ws_book {
+            let t = ws.get_top_of_book().await;
+            if top_has_book_data(&t) {
+                t
+            } else {
+                fetch_top_of_book(
+                    &http,
+                    &clob_host,
+                    &market.token_id_up,
+                    &market.token_id_down,
+                )
+                .await
+                .unwrap_or(t)
+            }
+        } else {
+            match fetch_top_of_book(
+                &http,
+                &clob_host,
+                &market.token_id_up,
+                &market.token_id_down,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("[IntervalSniper] order book fetch failed: {}", e);
+                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                    continue;
+                }
             }
         };
 
@@ -282,16 +337,20 @@ pub async fn run() -> Result<()> {
                                 let mut filled = false;
                                 for attempt in 0..FAK_MAX_RETRIES {
                                     tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
-                                    let top_retry = match fetch_top_of_book(
-                                        &http,
-                                        &clob_host,
-                                        &market.token_id_up,
-                                        &market.token_id_down,
-                                    )
-                                    .await
-                                    {
-                                        Ok(t) => t,
-                                        Err(_) => continue,
+                                    let top_retry = if let Some(ref ws) = state.ws_book {
+                                        ws.get_top_of_book().await
+                                    } else {
+                                        match fetch_top_of_book(
+                                            &http,
+                                            &clob_host,
+                                            &market.token_id_up,
+                                            &market.token_id_down,
+                                        )
+                                        .await
+                                        {
+                                            Ok(t) => t,
+                                            Err(_) => continue,
+                                        }
                                     };
                                     let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
                                     let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
@@ -365,16 +424,20 @@ pub async fn run() -> Result<()> {
                                     let mut filled = false;
                                     for attempt in 0..FAK_MAX_RETRIES {
                                         tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
-                                        let top_retry = match fetch_top_of_book(
-                                            &http,
-                                            &clob_host,
-                                            &market.token_id_up,
-                                            &market.token_id_down,
-                                        )
-                                        .await
-                                        {
-                                            Ok(t) => t,
-                                            Err(_) => continue,
+                                        let top_retry = if let Some(ref ws) = state.ws_book {
+                                            ws.get_top_of_book().await
+                                        } else {
+                                            match fetch_top_of_book(
+                                                &http,
+                                                &clob_host,
+                                                &market.token_id_up,
+                                                &market.token_id_down,
+                                            )
+                                            .await
+                                            {
+                                                Ok(t) => t,
+                                                Err(_) => continue,
+                                            }
                                         };
                                         let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
                                         let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
