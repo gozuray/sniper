@@ -16,7 +16,8 @@ fn env(key: &str, default: &str) -> String {
 }
 
 fn env_decimal(key: &str, default: &str) -> Decimal {
-    Decimal::from_str(env(key, default).as_str()).unwrap_or_else(|_| Decimal::from_str(default).unwrap())
+    Decimal::from_str(env(key, default).as_str())
+        .unwrap_or_else(|_| Decimal::from_str(default).unwrap())
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
@@ -35,7 +36,9 @@ fn env_bool(key: &str, default: bool) -> bool {
 /// Normalize price to 0..=1 (Polymarket probabilities). Values > 1 treated as cents (90 -> 0.9).
 fn normalize_price(v: Decimal) -> Decimal {
     if v > Decimal::ONE {
-        (v / Decimal::from(100)).min(Decimal::ONE).max(Decimal::ZERO)
+        (v / Decimal::from(100))
+            .min(Decimal::ONE)
+            .max(Decimal::ZERO)
     } else {
         v.min(Decimal::ONE).max(Decimal::ZERO)
     }
@@ -65,7 +68,11 @@ pub fn slug_prefix(asset: crate::types::IntervalMarketAsset) -> &'static str {
 
 /// Current 5min slug for asset (interval that is open now).
 pub fn current_5min_slug(asset: crate::types::IntervalMarketAsset) -> String {
-    format!("{}-{}", slug_prefix(asset), current_5min_interval_start_unix())
+    format!(
+        "{}-{}",
+        slug_prefix(asset),
+        current_5min_interval_start_unix()
+    )
 }
 
 /// Load config from environment.
@@ -74,11 +81,14 @@ pub fn load_config() -> Result<Config> {
         env("INTERVAL_SNIPER_MARKET", "btc_5m").as_str(),
     );
     let interval_market = interval_market.unwrap(); // FromStr Err is Infallible
-    // For BTC/SOL 5m we always use the current 5-min interval slug (e.g. btc-updown-5m-1772169300 for 5:15–5:20).
-    // Do not pin to a fixed MM_MARKET_SLUG so the bot subscribes to the live interval.
+                                                    // For BTC/SOL 5m we always use the current 5-min interval slug (e.g. btc-updown-5m-1772169300 for 5:15–5:20).
+                                                    // Do not pin to a fixed MM_MARKET_SLUG so the bot subscribes to the live interval.
     let market_slug = current_5min_slug(interval_market);
 
-    let order_strategy = match env("MM_ORDER_STRATEGY", "fak_cross_spread").to_lowercase().as_str() {
+    let order_strategy = match env("MM_ORDER_STRATEGY", "fak_cross_spread")
+        .to_lowercase()
+        .as_str()
+    {
         "gtc_resting" => OrderStrategy::GtcResting,
         "fok_same_price" => OrderStrategy::FokSamePrice,
         "fak_same_price" => OrderStrategy::FakSamePrice,
@@ -89,12 +99,18 @@ pub fn load_config() -> Result<Config> {
         _ => OrderStrategy::FakCrossSpread,
     };
 
-    let take_profit_tif = match env("MM_TAKE_PROFIT_TIME_IN_FORCE", "FAK").to_uppercase().as_str() {
+    let take_profit_tif = match env("MM_TAKE_PROFIT_TIME_IN_FORCE", "FAK")
+        .to_uppercase()
+        .as_str()
+    {
         "FOK" => SellOrderTimeInForce::Fok,
         "FAK" => SellOrderTimeInForce::Fak,
         _ => SellOrderTimeInForce::Gtc,
     };
-    let stop_loss_tif = match env("MM_STOP_LOSS_TIME_IN_FORCE", "FAK").to_uppercase().as_str() {
+    let stop_loss_tif = match env("MM_STOP_LOSS_TIME_IN_FORCE", "FAK")
+        .to_uppercase()
+        .as_str()
+    {
         "FOK" => SellOrderTimeInForce::Fok,
         "FAK" => SellOrderTimeInForce::Fak,
         _ => SellOrderTimeInForce::Gtc,
@@ -128,17 +144,23 @@ pub fn load_config() -> Result<Config> {
         enable_auto_sell: env_bool("MM_ENABLE_AUTO_SELL", true),
         take_profit_price,
         auto_sell_at_max_price: env_bool("MM_AUTO_SELL_AT_MAX_PRICE", false),
-        auto_sell_quantity_percent: env_u32("MM_AUTO_SELL_QUANTITY_PERCENT", 100).clamp(1, 100) as u8,
+        auto_sell_quantity_percent: env_u32("MM_AUTO_SELL_QUANTITY_PERCENT", 100).clamp(1, 100)
+            as u8,
         take_profit_time_in_force: take_profit_tif,
         enable_stop_loss: env_bool("MM_ENABLE_STOP_LOSS", true),
         stop_loss_price,
-        stop_loss_quantity_percent: env_u32("MM_STOP_LOSS_QUANTITY_PERCENT", 100).clamp(1, 100) as u8,
+        stop_loss_quantity_percent: env_u32("MM_STOP_LOSS_QUANTITY_PERCENT", 100).clamp(1, 100)
+            as u8,
         stop_loss_time_in_force: stop_loss_tif,
         loop_ms,
         cooldown_between_orders_ms: cooldown_ms,
         no_window_all_intervals: env_bool("MM_NO_WINDOW_ALL_INTERVALS", true),
         min_seconds_after_market_open: env_u32("MM_MIN_SECONDS_AFTER_MARKET_OPEN", 0).min(300),
-        min_seconds_after_buy_before_auto_sell: env_u32("MM_MIN_SECONDS_AFTER_BUY_BEFORE_AUTO_SELL", 0).min(30),
+        min_seconds_after_buy_before_auto_sell: env_u32(
+            "MM_MIN_SECONDS_AFTER_BUY_BEFORE_AUTO_SELL",
+            0,
+        )
+        .min(30),
         take_profit_price_margin: take_profit_margin,
     })
 }

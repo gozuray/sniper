@@ -8,7 +8,11 @@ use reqwest::Client;
 const FIVE_MIN_SECONDS: u64 = 300;
 
 /// Fetch market by slug: tries /markets/slug/{slug} first, then /events/slug/{slug} on 404.
-pub async fn fetch_market_by_slug(client: &Client, base_url: &str, slug: &str) -> Result<ResolvedMarket> {
+pub async fn fetch_market_by_slug(
+    client: &Client,
+    base_url: &str,
+    slug: &str,
+) -> Result<ResolvedMarket> {
     let base = base_url.trim_end_matches('/');
     let market_url = format!("{}/markets/slug/{}", base, urlencoding::encode(slug));
 
@@ -33,7 +37,9 @@ pub async fn fetch_market_by_slug(client: &Client, base_url: &str, slug: &str) -
             .and_then(|v| v.into_iter().next())
             .context("Event has no markets")?
     } else {
-        res.json::<GammaMarket>().await.context("Gamma market JSON")?
+        res.json::<GammaMarket>()
+            .await
+            .context("Gamma market JSON")?
     };
 
     parse_gamma_market(&m, slug)
@@ -120,7 +126,11 @@ fn parse_token_ids(m: &GammaMarket) -> Result<(String, String)> {
             let parts: Vec<&str> = if trimmed.starts_with('[') {
                 serde_json::from_str(trimmed).unwrap_or_else(|_| vec![])
             } else {
-                trimmed.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+                trimmed
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect()
             };
             if parts.len() >= 2 {
                 token_id_up = parts[0].to_string();

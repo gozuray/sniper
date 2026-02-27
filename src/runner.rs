@@ -27,6 +27,10 @@ const FAK_RETRY_DELAY_MS: u64 = 30;
 const FAK_MAX_RETRIES: u32 = 50;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
+/// Sell size precision to avoid sending oversell due to rounding.
+const SELL_SIZE_DECIMALS: u32 = 4;
+/// Minimum valid sell size accepted by API in this bot.
+const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -87,6 +91,18 @@ fn maker_amount_2_decimals(size: Decimal, price: Decimal) -> Decimal {
 
 fn size_4_decimals(size: Decimal) -> Decimal {
     size.round_dp(4)
+}
+
+fn floor_to_decimals(x: Decimal, decimals: u32) -> Decimal {
+    let factor = Decimal::from(10u64.pow(decimals));
+    ((x * factor).trunc()) / factor
+}
+
+fn effective_sell_size(position_size: Decimal, available: Option<Decimal>) -> Decimal {
+    let capped = available
+        .map(|a| position_size.min(a))
+        .unwrap_or(position_size);
+    floor_to_decimals(capped, SELL_SIZE_DECIMALS)
 }
 
 fn fmt_price(p: Option<&Decimal>) -> String {
@@ -154,10 +170,9 @@ fn choose_side(
 
 pub async fn run() -> Result<()> {
     let config = load_config()?;
-    let clob_host = std::env::var("POLYMARKET_CLOB_HOST").unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
-    let http = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let clob_host = std::env::var("POLYMARKET_CLOB_HOST")
+        .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+    let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let clob = Arc::new(crate::clob::create_clob_client(config.dry_run)?);
 
     let mut state = RunnerState {
@@ -174,7 +189,10 @@ pub async fn run() -> Result<()> {
         interval_switch_wall_time_ms: None,
     };
 
-    info!("[IntervalSniper] started dry_run={} slug={}", config.dry_run, config.market_slug);
+    info!(
+        "[IntervalSniper] started dry_run={} slug={}",
+        config.dry_run, config.market_slug
+    );
 
     let loop_ms = config.loop_ms;
     let mut tick_count: u64 = 0;
@@ -188,20 +206,24 @@ pub async fn run() -> Result<()> {
         // e.g. 5:15–5:20 → btc-updown-5m-1772169300, 5:20–5:25 → btc-updown-5m-1772169600
         let current_slug = current_5min_slug(config.interval_market);
         let need_new_market = state.market.is_none()
-            || state.market.as_ref().map(|m| now_u >= m.close_time_unix).unwrap_or(true)
-            || state.market.as_ref().map(|m| current_slug != m.slug).unwrap_or(true);
+            || state
+                .market
+                .as_ref()
+                .map(|m| now_u >= m.close_time_unix)
+                .unwrap_or(true)
+            || state
+                .market
+                .as_ref()
+                .map(|m| current_slug != m.slug)
+                .unwrap_or(true);
 
         if need_new_market {
             match fetch_market_by_slug(&http, &config.gamma_base_url, &current_slug).await {
                 Ok(market) => {
                     state.ws_book = None; // drop previous WS before creating new
                     let ws_url = ClobWsBook::ws_url_from_rest_host(&clob_host);
-                    match ClobWsBook::connect(
-                        &ws_url,
-                        &market.token_id_up,
-                        &market.token_id_down,
-                    )
-                    .await
+                    match ClobWsBook::connect(&ws_url, &market.token_id_up, &market.token_id_down)
+                        .await
                     {
                         Ok(ws) => {
                             state.ws_book = Some(ws);
@@ -228,8 +250,16 @@ pub async fn run() -> Result<()> {
                     info!(
                         "[IntervalSniper] interval switch -> {} (Up token={}... Down token={}...)",
                         market.slug,
-                        if up_id.len() > 12 { &up_id[..12] } else { up_id },
-                        if down_id.len() > 12 { &down_id[..12] } else { down_id }
+                        if up_id.len() > 12 {
+                            &up_id[..12]
+                        } else {
+                            up_id
+                        },
+                        if down_id.len() > 12 {
+                            &down_id[..12]
+                        } else {
+                            down_id
+                        }
                     );
                 }
                 Err(e) => {
@@ -299,7 +329,11 @@ pub async fn run() -> Result<()> {
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
                     let is_up = tp.token_id == market.token_id_up;
-                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
+                    let side_book = if is_up {
+                        &top.token_id_up
+                    } else {
+                        &top.token_id_down
+                    };
                     info!(
                         "[IntervalSniper]  POS   TP   target={}  best_bid={}  (sell when bid >= target)",
                         fmt_price(Some(&tp.target_price)),
@@ -310,7 +344,11 @@ pub async fn run() -> Result<()> {
             if let Some(ref sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
                     let is_up = sl.token_id == market.token_id_up;
-                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
+                    let side_book = if is_up {
+                        &top.token_id_up
+                    } else {
+                        &top.token_id_down
+                    };
                     info!(
                         "[IntervalSniper]  POS   SL   trigger={}  best_bid={}  (sell when bid <= trigger)",
                         fmt_price(Some(&sl.trigger_price)),
@@ -327,8 +365,15 @@ pub async fn run() -> Result<()> {
                 if !state.stop_loss_placed {
                     // Use book only for best_bid; token to sell is always position.token_id.
                     let is_up = sl.token_id == market.token_id_up;
-                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
-                    let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                    let side_book = if is_up {
+                        &top.token_id_up
+                    } else {
+                        &top.token_id_down
+                    };
+                    let best_bid = side_book
+                        .as_ref()
+                        .and_then(|s| s.best_bid)
+                        .unwrap_or(Decimal::ZERO);
                     if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
                         // Cancel any open orders for this token so balance is not locked (e.g. by a GTC TP order).
                         match clob.cancel_orders_for_token(&sl.token_id).await {
@@ -343,11 +388,23 @@ pub async fn run() -> Result<()> {
                         // SELL FAK must cross: limit_price = best_bid (or best_bid - tick). Use best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
-                        let available = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                        let sell_size = available
-                            .map(|a| position_size_real.min(a))
-                            .unwrap_or(position_size_real);
-                        let size = size_4_decimals(sell_size);
+                        let available = clob
+                            .get_available_balance(&sl.token_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        let size = effective_sell_size(position_size_real, available.clone());
+                        if size < MIN_SELL_SIZE {
+                            warn!(
+                                "[IntervalSniper] SL available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
+                                sl.token_id,
+                                available,
+                                size,
+                                MIN_SELL_SIZE
+                            );
+                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                            continue;
+                        }
                         let result = clob
                             .place_sell_order(
                                 &sl.token_id,
@@ -365,17 +422,23 @@ pub async fn run() -> Result<()> {
                             state.auto_sell_placed = true; // TP no longer needed, position closed
                         } else {
                             if result.http_status == Some(400) {
-                                let ba = clob.get_balance_allowance(&sl.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                let ba = clob
+                                    .get_balance_allowance(&sl.token_id)
+                                    .await
+                                    .unwrap_or_else(|e| format!("error: {}", e));
                                 info!(
                                     "[IntervalSniper] SL 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
                                     sl.token_id, size, ba
                                 );
                             }
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
-                                m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
+                                m.contains("no orders found to match")
+                                    || m.contains("FAK")
+                                    || m.contains("FOK")
                             });
                             // On balance/allowance error: cancel open orders once, then retry with backoff (100→200→400 ms), selling position.size.
-                            let is_balance_error = is_position_closed_error(result.error_msg.as_deref());
+                            let is_balance_error =
+                                is_position_closed_error(result.error_msg.as_deref());
                             if is_no_match || is_balance_error {
                                 if is_balance_error {
                                     info!("[IntervalSniper] stop loss: balance/allowance error, canceling open orders once and retrying with backoff");
@@ -386,7 +449,10 @@ pub async fn run() -> Result<()> {
                                 let mut canceled_once_for_balance = false;
                                 for attempt in 0..FAK_MAX_RETRIES {
                                     let delay_ms = if is_balance_error {
-                                        BALANCE_RETRY_BACKOFF_MS.get(attempt as usize).copied().unwrap_or(400)
+                                        BALANCE_RETRY_BACKOFF_MS
+                                            .get(attempt as usize)
+                                            .copied()
+                                            .unwrap_or(400)
                                     } else {
                                         FAK_RETRY_DELAY_MS
                                     };
@@ -411,17 +477,37 @@ pub async fn run() -> Result<()> {
                                             Err(_) => continue,
                                         }
                                     };
-                                    let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
-                                    let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                    let side_retry = if is_up {
+                                        &top_retry.token_id_up
+                                    } else {
+                                        &top_retry.token_id_down
+                                    };
+                                    let bid = side_retry
+                                        .as_ref()
+                                        .and_then(|s| s.best_bid)
+                                        .unwrap_or(Decimal::ZERO);
                                     if bid <= Decimal::ZERO {
                                         continue;
                                     }
                                     let position_size_real = sl.size.clone();
-                                    let available = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                                    let sell_size_retry = available
-                                        .map(|a| position_size_real.min(a))
-                                        .unwrap_or(position_size_real);
-                                    let size_retry = size_4_decimals(sell_size_retry);
+                                    let available = clob
+                                        .get_available_balance(&sl.token_id)
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                    let size_retry =
+                                        effective_sell_size(position_size_real, available.clone());
+                                    if size_retry < MIN_SELL_SIZE {
+                                        warn!(
+                                            "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
+                                            sl.token_id,
+                                            attempt + 1,
+                                            available,
+                                            size_retry,
+                                            MIN_SELL_SIZE
+                                        );
+                                        break;
+                                    }
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
                                         .place_sell_order(
@@ -448,15 +534,22 @@ pub async fn run() -> Result<()> {
                                         continue;
                                     }
                                     if result_retry.http_status == Some(400) {
-                                        let ba = clob.get_balance_allowance(&sl.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                        let ba = clob
+                                            .get_balance_allowance(&sl.token_id)
+                                            .await
+                                            .unwrap_or_else(|e| format!("error: {}", e));
                                         info!(
                                             "[IntervalSniper] SL retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
                                             sl.token_id, size_retry, ba
                                         );
                                     }
-                                    if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
+                                    if result_retry
+                                        .error_msg
+                                        .as_deref()
+                                        .map_or(true, |m| !m.contains("no orders found to match"))
+                                    {
                                         if let Some(msg) = result_retry.error_msg {
-                                warn!("[IntervalSniper]  FAIL  SL    {}", msg);
+                                            warn!("[IntervalSniper]  FAIL  SL    {}", msg);
                                         }
                                         break;
                                     }
@@ -465,7 +558,7 @@ pub async fn run() -> Result<()> {
                                     warn!("[IntervalSniper]  WARN  SL    FAK retries exhausted, will retry next tick");
                                 }
                             } else if let Some(msg) = result.error_msg {
-                                    warn!("[IntervalSniper]  FAIL  SL    {}", msg);
+                                warn!("[IntervalSniper]  FAIL  SL    {}", msg);
                             }
                         }
                     }
@@ -482,8 +575,15 @@ pub async fn run() -> Result<()> {
                     if elapsed_sec >= state.config.min_seconds_after_buy_before_auto_sell as u64 {
                         // Use book only for best_bid; token to sell is always position.token_id.
                         let is_up = tp.token_id == market.token_id_up;
-                        let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
-                        let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                        let side_book = if is_up {
+                            &top.token_id_up
+                        } else {
+                            &top.token_id_down
+                        };
+                        let best_bid = side_book
+                            .as_ref()
+                            .and_then(|s| s.best_bid)
+                            .unwrap_or(Decimal::ZERO);
                         let target = tp.target_price - state.config.take_profit_price_margin;
                         if best_bid >= target {
                             // Cancel any open orders for this token so balance is not locked (e.g. by a GTC SL order).
@@ -497,16 +597,30 @@ pub async fn run() -> Result<()> {
                             // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                             tokio::time::sleep(Duration::from_millis(350)).await;
                             let position_size_real = tp.size.clone();
-                            let available = clob.get_available_balance(&tp.token_id).await.ok().flatten();
-                            let sell_size = available
-                                .map(|a| position_size_real.min(a))
-                                .unwrap_or(position_size_real);
+                            let available = clob
+                                .get_available_balance(&tp.token_id)
+                                .await
+                                .ok()
+                                .flatten();
+                            let size = effective_sell_size(position_size_real, available.clone());
+                            if size < MIN_SELL_SIZE {
+                                warn!(
+                                "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
+                                tp.token_id,
+                                available,
+                                size,
+                                MIN_SELL_SIZE
+                            );
+                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                continue;
+                            }
                             // SELL FAK must cross: use best_bid so order matches; avoid posting above bid.
                             let price = match state.config.take_profit_time_in_force {
                                 crate::types::SellOrderTimeInForce::Fak => round_to_tick(best_bid),
-                                _ => round_to_tick(best_bid.min(target + state.config.take_profit_price_margin)),
+                                _ => round_to_tick(
+                                    best_bid.min(target + state.config.take_profit_price_margin),
+                                ),
                             };
-                            let size = size_4_decimals(sell_size);
                             let result = clob
                                 .place_sell_order(
                                     &tp.token_id,
@@ -524,16 +638,22 @@ pub async fn run() -> Result<()> {
                                 state.stop_loss_placed = true; // SL no longer needed, position closed
                             } else {
                                 if result.http_status == Some(400) {
-                                    let ba = clob.get_balance_allowance(&tp.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                    let ba = clob
+                                        .get_balance_allowance(&tp.token_id)
+                                        .await
+                                        .unwrap_or_else(|e| format!("error: {}", e));
                                     info!(
                                         "[IntervalSniper] TP 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
                                         tp.token_id, size, ba
                                     );
                                 }
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
-                                    m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
+                                    m.contains("no orders found to match")
+                                        || m.contains("FAK")
+                                        || m.contains("FOK")
                                 });
-                                let is_balance_error = is_position_closed_error(result.error_msg.as_deref());
+                                let is_balance_error =
+                                    is_position_closed_error(result.error_msg.as_deref());
                                 if is_no_match || is_balance_error {
                                     if is_balance_error {
                                         info!("[IntervalSniper] take profit: balance/allowance error, canceling open orders once and retrying with backoff");
@@ -544,13 +664,17 @@ pub async fn run() -> Result<()> {
                                     let mut canceled_once_for_balance = false;
                                     for attempt in 0..FAK_MAX_RETRIES {
                                         let delay_ms = if is_balance_error {
-                                            BALANCE_RETRY_BACKOFF_MS.get(attempt as usize).copied().unwrap_or(400)
+                                            BALANCE_RETRY_BACKOFF_MS
+                                                .get(attempt as usize)
+                                                .copied()
+                                                .unwrap_or(400)
                                         } else {
                                             FAK_RETRY_DELAY_MS
                                         };
                                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                         if is_balance_error && !canceled_once_for_balance {
-                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                            let _ =
+                                                clob.cancel_orders_for_token(&tp.token_id).await;
                                             canceled_once_for_balance = true;
                                             tokio::time::sleep(Duration::from_millis(350)).await;
                                         }
@@ -569,17 +693,39 @@ pub async fn run() -> Result<()> {
                                                 Err(_) => continue,
                                             }
                                         };
-                                        let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
-                                        let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                        let side_retry = if is_up {
+                                            &top_retry.token_id_up
+                                        } else {
+                                            &top_retry.token_id_down
+                                        };
+                                        let bid = side_retry
+                                            .as_ref()
+                                            .and_then(|s| s.best_bid)
+                                            .unwrap_or(Decimal::ZERO);
                                         if bid < target {
                                             continue;
                                         }
                                         let position_size_real = tp.size.clone();
-                                        let available = clob.get_available_balance(&tp.token_id).await.ok().flatten();
-                                        let sell_size_retry = available
-                                            .map(|a| position_size_real.min(a))
-                                            .unwrap_or(position_size_real);
-                                        let size_retry = size_4_decimals(sell_size_retry);
+                                        let available = clob
+                                            .get_available_balance(&tp.token_id)
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                        let size_retry = effective_sell_size(
+                                            position_size_real,
+                                            available.clone(),
+                                        );
+                                        if size_retry < MIN_SELL_SIZE {
+                                            warn!(
+                                                "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
+                                                tp.token_id,
+                                                attempt + 1,
+                                                available,
+                                                size_retry,
+                                                MIN_SELL_SIZE
+                                            );
+                                            break;
+                                        }
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
                                             .place_sell_order(
@@ -600,20 +746,27 @@ pub async fn run() -> Result<()> {
                                             filled = true;
                                             break;
                                         }
-                                        if is_position_closed_error(result_retry.error_msg.as_deref()) {
+                                        if is_position_closed_error(
+                                            result_retry.error_msg.as_deref(),
+                                        ) {
                                             warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt + 1);
                                             continue;
                                         }
                                         if result_retry.http_status == Some(400) {
-                                            let ba = clob.get_balance_allowance(&tp.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
+                                            let ba = clob
+                                                .get_balance_allowance(&tp.token_id)
+                                                .await
+                                                .unwrap_or_else(|e| format!("error: {}", e));
                                             info!(
                                                 "[IntervalSniper] TP retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
                                                 tp.token_id, size_retry, ba
                                             );
                                         }
-                                        if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
+                                        if result_retry.error_msg.as_deref().map_or(true, |m| {
+                                            !m.contains("no orders found to match")
+                                        }) {
                                             if let Some(msg) = result_retry.error_msg {
-                                                    warn!("[IntervalSniper]  FAIL  TP    {}", msg);
+                                                warn!("[IntervalSniper]  FAIL  TP    {}", msg);
                                             }
                                             break;
                                         }
@@ -622,7 +775,7 @@ pub async fn run() -> Result<()> {
                                         warn!("[IntervalSniper]  WARN  TP    FAK retries exhausted, will retry next tick");
                                     }
                                 } else if let Some(msg) = result.error_msg {
-                                        warn!("[IntervalSniper]  FAIL  TP    {}", msg);
+                                    warn!("[IntervalSniper]  FAIL  TP    {}", msg);
                                 }
                             }
                         }
@@ -668,9 +821,13 @@ pub async fn run() -> Result<()> {
                     // Cap at shares_left so we never order more than configured size (e.g. exactly 7 shares).
                     // Round to 2 decimals so we never send 7.24000001 when user wants 7.
                     let size = size_4_decimals(
-                        shares_left.min(size_available).max(min_order_size).round_dp(2),
+                        shares_left
+                            .min(size_available)
+                            .max(min_order_size)
+                            .round_dp(2),
                     );
-                    let maker_amount = maker_amount_2_decimals(size.clone(), effective_price.clone());
+                    let maker_amount =
+                        maker_amount_2_decimals(size.clone(), effective_price.clone());
                     if size >= min_order_size && size > Decimal::ZERO {
                         let order_type = OrderType::Fak;
                         let params = LimitOrderParams {
@@ -707,10 +864,14 @@ pub async fn run() -> Result<()> {
                                 round_to_tick(state.config.take_profit_price)
                             };
                             // TP/SL size must be > 0 or API rejects; use at least 0.0001, never exceed filled, and cap at total share size from .env (MM_SIZE_SHARES)
-                            let pct_tp = Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
-                            let pct_sl = Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
+                            let pct_tp =
+                                Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
+                            let pct_sl =
+                                Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
                             let max_sell = state.config.size_shares.min(filled.clone());
-                            let tp_size = (filled.clone() * pct_tp).max(dec!(0.0001)).min(max_sell.clone());
+                            let tp_size = (filled.clone() * pct_tp)
+                                .max(dec!(0.0001))
+                                .min(max_sell.clone());
                             let sl_size = (filled.clone() * pct_sl).max(dec!(0.0001)).min(max_sell);
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.to_string(),

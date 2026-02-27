@@ -1,6 +1,9 @@
 //! CLOB client: place/cancel orders. Dry-run implementation logs only; live uses EIP-712 signing + HMAC L2.
 
-use crate::signing::{parse_token_id, build_poly_hmac, sign_order, EXCHANGE_ADDRESS_POLYGON, NEG_RISK_EXCHANGE_POLYGON};
+use crate::signing::{
+    build_poly_hmac, parse_token_id, sign_order, EXCHANGE_ADDRESS_POLYGON,
+    NEG_RISK_EXCHANGE_POLYGON,
+};
 use crate::types::SellOrderTimeInForce;
 use anyhow::{Context, Result};
 use ethers::signers::{LocalWallet, Signer};
@@ -10,6 +13,9 @@ use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::{info, warn};
+
+const CONDITIONAL_BASE_DECIMALS: u32 = 6;
+const CONDITIONAL_BASE_FACTOR: Decimal = dec!(1000000);
 
 /// Order type for placement.
 #[derive(Debug, Clone, Copy)]
@@ -191,7 +197,9 @@ impl LiveClob {
             .parse()
             .unwrap_or(137);
         let funder_str = std::env::var("FUNDER_ADDRESS").unwrap_or_else(|_| {
-            format!("{:?}", wallet.address()).trim_matches('"').to_string()
+            format!("{:?}", wallet.address())
+                .trim_matches('"')
+                .to_string()
         });
         let funder = funder_str
             .trim()
@@ -236,8 +244,10 @@ impl LiveClob {
         };
         let maker = (maker_human * six).trunc();
         let taker = (taker_human * six).trunc();
-        let maker_u = ethers::types::U256::from_dec_str(&maker.to_string()).context("maker amount")?;
-        let taker_u = ethers::types::U256::from_dec_str(&taker.to_string()).context("taker amount")?;
+        let maker_u =
+            ethers::types::U256::from_dec_str(&maker.to_string()).context("maker amount")?;
+        let taker_u =
+            ethers::types::U256::from_dec_str(&taker.to_string()).context("taker amount")?;
         Ok((maker_u, taker_u))
     }
 
@@ -260,15 +270,11 @@ impl LiveClob {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let sig = build_poly_hmac(
-            &self.api_secret,
-            timestamp,
-            "POST",
-            path,
-            Some(&body_str),
-        )?;
+        let sig = build_poly_hmac(&self.api_secret, timestamp, "POST", path, Some(&body_str))?;
         let url = format!("{}{}", self.clob_host, path);
-        let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
+        let signer_addr = format!("{:?}", self.wallet.address())
+            .trim_matches('"')
+            .to_string();
         let res = self
             .client
             .post(&url)
@@ -283,9 +289,16 @@ impl LiveClob {
             .await?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-        let success = json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-        let order_id = json.get("orderID").and_then(|v| v.as_str()).map(String::from);
+        let json: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let success = json
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let order_id = json
+            .get("orderID")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let error_msg = json
             .get("errorMsg")
             .and_then(|v| v.as_str())
@@ -295,20 +308,22 @@ impl LiveClob {
             return Ok(PlaceOrderResult {
                 order_id,
                 success: false,
-                error_msg: Some(format!("HTTP {}: {}", status, text.chars().take(200).collect::<String>())),
+                error_msg: Some(format!(
+                    "HTTP {}: {}",
+                    status,
+                    text.chars().take(200).collect::<String>()
+                )),
                 filled_size: None,
                 http_status: Some(status.as_u16()),
             });
         }
         // Parse filled size from API: takingAmount is in 6 decimals (string or number). For BUY = shares filled; for SELL = (size*price) so size = takingAmount/1e6/price.
-        let taker_6dec_opt = json
-            .get("takingAmount")
-            .and_then(|v| {
-                v.as_str()
-                    .and_then(|s| Decimal::from_str(s).ok())
-                    .or_else(|| v.as_i64().map(|n| Decimal::from(n)))
-                    .or_else(|| v.as_u64().map(|n| Decimal::from(n)))
-            });
+        let taker_6dec_opt = json.get("takingAmount").and_then(|v| {
+            v.as_str()
+                .and_then(|s| Decimal::from_str(s).ok())
+                .or_else(|| v.as_i64().map(|n| Decimal::from(n)))
+                .or_else(|| v.as_u64().map(|n| Decimal::from(n)))
+        });
         let filled_size = taker_6dec_opt.map(|taker_6dec| {
             let human = taker_6dec / dec!(1000000);
             match (side, price) {
@@ -341,7 +356,9 @@ impl LiveClob {
             self.signature_type
         );
         let url = format!("{}{}", self.clob_host, path_with_query);
-        let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
+        let signer_addr = format!("{:?}", self.wallet.address())
+            .trim_matches('"')
+            .to_string();
         let res = self
             .client
             .get(&url)
@@ -355,12 +372,17 @@ impl LiveClob {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("balance-allowance HTTP {}: {}", status, text.chars().take(200).collect::<String>());
+            anyhow::bail!(
+                "balance-allowance HTTP {}: {}",
+                status,
+                text.chars().take(200).collect::<String>()
+            );
         }
         Ok(text)
     }
 
-    /// Parse balance from balance-allowance JSON. Tries "balance" as string or number.
+    /// Parse balance from balance-allowance JSON and normalize to shares.
+    /// Conditional balances are returned in base units (1e6).
     fn parse_balance_from_response(text: &str) -> Option<Decimal> {
         let json: serde_json::Value = serde_json::from_str(text).ok()?;
         let balance = json.get("balance")?;
@@ -370,7 +392,16 @@ impl LiveClob {
             .or_else(|| balance.as_f64().map(|f| f.to_string()))
             .or_else(|| balance.as_i64().map(|i| i.to_string()))
             .or_else(|| balance.as_u64().map(|u| u.to_string()))?;
-        Decimal::from_str(s.trim()).ok().filter(|d| *d >= Decimal::ZERO)
+        let raw = Decimal::from_str(s.trim())
+            .ok()
+            .filter(|d| *d >= Decimal::ZERO)?;
+        let shares = if CONDITIONAL_BASE_DECIMALS == 6 {
+            raw / CONDITIONAL_BASE_FACTOR
+        } else {
+            let divisor = Decimal::from(10u64.pow(CONDITIONAL_BASE_DECIMALS));
+            raw / divisor
+        };
+        Some(shares)
     }
 }
 
@@ -454,10 +485,7 @@ impl ClobClient for LiveClob {
             .post_order(order_type_str, &order_json, params.side, Some(params.price))
             .await?;
         if result.success {
-            info!(
-                "[LiveClob] order placed order_id={:?}",
-                result.order_id
-            );
+            info!("[LiveClob] order placed order_id={:?}", result.order_id);
         } else if let Some(ref msg) = result.error_msg {
             info!("[LiveClob] order failed: {}", msg);
         }
@@ -472,15 +500,11 @@ impl ClobClient for LiveClob {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let sig = build_poly_hmac(
-            &self.api_secret,
-            timestamp,
-            "DELETE",
-            path,
-            Some(&body_str),
-        )?;
+        let sig = build_poly_hmac(&self.api_secret, timestamp, "DELETE", path, Some(&body_str))?;
         let url = format!("{}{}", self.clob_host, path);
-        let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
+        let signer_addr = format!("{:?}", self.wallet.address())
+            .trim_matches('"')
+            .to_string();
         let res = self
             .client
             .request(reqwest::Method::DELETE, &url)
@@ -494,7 +518,8 @@ impl ClobClient for LiveClob {
             .send()
             .await?;
         let text = res.text().await.unwrap_or_default();
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let json: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         let canceled: Vec<String> = json
             .get("canceled")
             .and_then(|v| v.as_array())
@@ -514,10 +539,17 @@ impl ClobClient for LiveClob {
             })
             .unwrap_or_default();
         if !canceled.is_empty() {
-            info!("[LiveClob] canceled {} open order(s) for token to free balance", canceled.len());
+            info!(
+                "[LiveClob] canceled {} open order(s) for token to free balance",
+                canceled.len()
+            );
         }
         if !not_canceled.is_empty() {
-            warn!("[LiveClob] {} order(s) could not be canceled (balance may stay locked): {:?}", not_canceled.len(), not_canceled);
+            warn!(
+                "[LiveClob] {} order(s) could not be canceled (balance may stay locked): {:?}",
+                not_canceled.len(),
+                not_canceled
+            );
         }
         Ok(CancelOrdersResult {
             canceled,

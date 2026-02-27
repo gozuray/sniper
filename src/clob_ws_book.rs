@@ -115,19 +115,13 @@ pub struct ClobWsBook {
 impl ClobWsBook {
     /// Connect to the CLOB WebSocket, subscribe to the two token IDs, and start the receive + ping loop.
     /// Uses [DEFAULT_WS_MARKET_URL] if `ws_url` is empty.
-    pub async fn connect(
-        ws_url: &str,
-        token_id_up: &str,
-        token_id_down: &str,
-    ) -> Result<Self> {
+    pub async fn connect(ws_url: &str, token_id_up: &str, token_id_down: &str) -> Result<Self> {
         let url = if ws_url.is_empty() {
             DEFAULT_WS_MARKET_URL
         } else {
             ws_url
         };
-        let (ws_stream, _) = connect_async(url)
-            .await
-            .context("CLOB WebSocket connect")?;
+        let (ws_stream, _) = connect_async(url).await.context("CLOB WebSocket connect")?;
 
         let (mut write, mut read) = ws_stream.split();
         let state: Arc<RwLock<TopOfBook>> = Arc::new(RwLock::new(TopOfBook::default()));
@@ -169,16 +163,15 @@ impl ClobWsBook {
             }
         });
 
-        Ok(Self {
-            state,
-            _join: join,
-        })
+        Ok(Self { state, _join: join })
     }
 
     /// Build WebSocket URL from REST CLOB host (e.g. https://clob.polymarket.com -> wss://ws-subscriptions-clob.polymarket.com/ws/market).
     pub fn ws_url_from_rest_host(rest_host: &str) -> String {
         let rest = rest_host.trim_end_matches('/');
-        if rest.starts_with("https://clob.polymarket.com") || rest.starts_with("http://clob.polymarket.com") {
+        if rest.starts_with("https://clob.polymarket.com")
+            || rest.starts_with("http://clob.polymarket.com")
+        {
             DEFAULT_WS_MARKET_URL.to_string()
         } else if rest.contains("clob.polymarket.com") {
             DEFAULT_WS_MARKET_URL.to_string()
@@ -194,7 +187,10 @@ impl ClobWsBook {
         token_id_down: &str,
     ) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(text).context("parse JSON")?;
-        let event_type = value.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+        let event_type = value
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match event_type {
             "book" => {
@@ -210,7 +206,8 @@ impl ClobWsBook {
                 }
             }
             "best_bid_ask" => {
-                let msg: WsBestBidAskMessage = serde_json::from_str(text).context("parse best_bid_ask")?;
+                let msg: WsBestBidAskMessage =
+                    serde_json::from_str(text).context("parse best_bid_ask")?;
                 let best_bid = msg.best_bid.as_deref().and_then(parse_decimal);
                 let best_ask = msg.best_ask.as_deref().and_then(parse_decimal);
                 let mut book = state.write().await;
@@ -223,7 +220,9 @@ impl ClobWsBook {
                         up.best_ask = best_ask;
                     }
                 } else if msg.asset_id == *token_id_down {
-                    let down = book.token_id_down.get_or_insert_with(TopOfBookSide::default);
+                    let down = book
+                        .token_id_down
+                        .get_or_insert_with(TopOfBookSide::default);
                     if best_bid.is_some() {
                         down.best_bid = best_bid;
                     }
@@ -233,8 +232,11 @@ impl ClobWsBook {
                 }
             }
             "price_change" => {
-                let msg: WsPriceChangeMessage = serde_json::from_str(text).context("parse price_change")?;
-                let Some(ref changes) = msg.price_changes else { return Ok(()) };
+                let msg: WsPriceChangeMessage =
+                    serde_json::from_str(text).context("parse price_change")?;
+                let Some(ref changes) = msg.price_changes else {
+                    return Ok(());
+                };
                 let mut book = state.write().await;
                 for c in changes.iter() {
                     let best_bid = c.best_bid.as_deref().and_then(parse_decimal);
@@ -248,7 +250,9 @@ impl ClobWsBook {
                             up.best_ask = best_ask;
                         }
                     } else if c.asset_id == *token_id_down {
-                        let down = book.token_id_down.get_or_insert_with(TopOfBookSide::default);
+                        let down = book
+                            .token_id_down
+                            .get_or_insert_with(TopOfBookSide::default);
                         if best_bid.is_some() {
                             down.best_bid = best_bid;
                         }

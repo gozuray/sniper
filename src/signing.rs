@@ -155,7 +155,13 @@ pub fn build_poly_hmac(
         format!("{}{}{}", timestamp, method, request_path)
     };
     let secret_bytes = base64::engine::general_purpose::STANDARD
-        .decode(secret_b64.replace('-', "+").replace('_', "/").trim().as_bytes())
+        .decode(
+            secret_b64
+                .replace('-', "+")
+                .replace('_', "/")
+                .trim()
+                .as_bytes(),
+        )
         .context("SECRET base64 decode")?;
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = HmacSha256::new_from_slice(&secret_bytes).context("HMAC key")?;

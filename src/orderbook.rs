@@ -7,7 +7,11 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 
 /// Fetch order book for one token (no auth required).
-pub async fn fetch_order_book(client: &Client, clob_host: &str, token_id: &str) -> Result<OrderBookRaw> {
+pub async fn fetch_order_book(
+    client: &Client,
+    clob_host: &str,
+    token_id: &str,
+) -> Result<OrderBookRaw> {
     let base = clob_host.trim_end_matches('/');
     let url = format!("{}/book?token_id={}", base, urlencoding::encode(token_id));
     let res = client
@@ -18,7 +22,11 @@ pub async fn fetch_order_book(client: &Client, clob_host: &str, token_id: &str) 
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        anyhow::bail!("CLOB {}: {}", status, text.chars().take(200).collect::<String>());
+        anyhow::bail!(
+            "CLOB {}: {}",
+            status,
+            text.chars().take(200).collect::<String>()
+        );
     }
     let raw: OrderBookRaw = res.json().await?;
     Ok(raw)
