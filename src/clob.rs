@@ -440,7 +440,7 @@ impl ClobClient for LiveClob {
                     .collect()
             })
             .unwrap_or_default();
-        let not_canceled = json
+        let not_canceled: std::collections::HashMap<String, String> = json
             .get("not_canceled")
             .and_then(|v| v.as_object())
             .map(|obj| {

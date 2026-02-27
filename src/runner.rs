@@ -408,9 +408,12 @@ pub async fn run() -> Result<()> {
                                         filled = true;
                                         break;
                                     }
-                                    // Do NOT treat balance/allowance as position closed: keep retrying at best bid until sold
+                                    // Balance/allowance error means shares may still be locked in an open order.
+                                    // Re-cancel then wait before the next attempt so the CLOB can free them.
                                     if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error, will retry next attempt/tick", attempt + 1);
+                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error, re-cancelling orders to free locked balance", attempt + 1);
+                                        let _ = clob.cancel_orders_for_token(&sl.token_id).await;
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
                                         continue;
                                     }
                                     if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
@@ -525,9 +528,12 @@ pub async fn run() -> Result<()> {
                                             filled = true;
                                             break;
                                         }
-                                        // Do NOT treat balance/allowance as position closed: keep retrying at best bid until sold
+                                        // Balance/allowance error means shares may still be locked in an open order.
+                                        // Re-cancel then wait before the next attempt so the CLOB can free them.
                                         if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error, will retry next attempt/tick", attempt + 1);
+                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error, re-cancelling orders to free locked balance", attempt + 1);
+                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                            tokio::time::sleep(Duration::from_millis(500)).await;
                                             continue;
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
