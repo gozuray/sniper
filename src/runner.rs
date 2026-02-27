@@ -31,6 +31,8 @@ const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
+/// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
+const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -100,7 +102,11 @@ fn floor_to_decimals(x: Decimal, decimals: u32) -> Decimal {
 
 fn effective_sell_size(position_size: Decimal, available: Option<Decimal>) -> Decimal {
     let capped = available
-        .map(|a| position_size.min(a))
+        .map(|a| {
+            // Leave 1 base unit headroom so encoded amount never exceeds balance after rounding
+            let safe = (a - BALANCE_BUFFER_SHARES).max(Decimal::ZERO);
+            position_size.min(safe)
+        })
         .unwrap_or(position_size);
     floor_to_decimals(capped, SELL_SIZE_DECIMALS)
 }
