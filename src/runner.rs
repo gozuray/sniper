@@ -430,8 +430,9 @@ pub async fn run() -> Result<()> {
                             .await?;
                         if result.success {
                             info!(
-                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
-                                fmt_price(Some(&price)),
+                                "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
+                                fmt_decimal_2(&sl.entry_price),
+                                fmt_decimal_2(&price),
                                 state.trades_this_interval,
                                 MAX_TRADES_PER_INTERVAL
                             );
@@ -544,8 +545,9 @@ pub async fn run() -> Result<()> {
                                         .await?;
                                     if result_retry.success {
                                         info!(
-                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
-                                            fmt_price(Some(&price_retry)),
+                                            "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
+                                            fmt_decimal_2(&sl.entry_price),
+                                            fmt_decimal_2(&price_retry),
                                             attempt,
                                             state.trades_this_interval,
                                             MAX_TRADES_PER_INTERVAL
@@ -659,9 +661,11 @@ pub async fn run() -> Result<()> {
                                 )
                                 .await?;
                             if result.success {
+                                let buy_price = state.last_buy_order.as_ref().map(|o| fmt_decimal_2(&o.price)).unwrap_or_else(|| "-".to_string());
                                 info!(
-                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit) — position closed (trades this interval: {}/{})",
-                                    fmt_price(Some(&price)),
+                                    "[IntervalSniper]  SELL  TP   precio_compra={}  precio_venta={}   (take profit) — position closed (trades this interval: {}/{})",
+                                    buy_price,
+                                    fmt_decimal_2(&price),
                                     state.trades_this_interval,
                                     MAX_TRADES_PER_INTERVAL
                                 );
@@ -774,9 +778,11 @@ pub async fn run() -> Result<()> {
                                             )
                                             .await?;
                                         if result_retry.success {
+                                            let buy_price_tp = state.last_buy_order.as_ref().map(|o| fmt_decimal_2(&o.price)).unwrap_or_else(|| "-".to_string());
                                             info!(
-                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {}) — position closed (trades this interval: {}/{})",
-                                                fmt_price(Some(&price_retry)),
+                                                "[IntervalSniper]  SELL  TP   precio_compra={}  precio_venta={}   (attempt {}) — position closed (trades this interval: {}/{})",
+                                                buy_price_tp,
+                                                fmt_decimal_2(&price_retry),
                                                 attempt,
                                                 state.trades_this_interval,
                                                 MAX_TRADES_PER_INTERVAL
@@ -947,7 +953,7 @@ pub async fn run() -> Result<()> {
                                 EntrySide::Down => "Down",
                             };
                             info!(
-                                "[IntervalSniper]  BUY   {}  @ {}   size={}   TP size={} ({}%)   SL size={} ({}%)",
+                                "[IntervalSniper]  BUY   {}  precio_compra={}   size={}   TP size={} ({}%)   SL size={} ({}%)",
                                 side_str,
                                 fmt_decimal_2(&entry_price),
                                 fmt_decimal_2(&state.last_buy_order.as_ref().unwrap().size),
