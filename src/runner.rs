@@ -21,10 +21,11 @@ const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 /// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
-/// Delay between FAK retries when no match (ms). Kept low for near-instant retries.
-const FAK_RETRY_DELAY_MS: u64 = 30;
+/// Delay between FAK retries when no match (ms). Minimal for maximum retry speed during the interval.
+const FAK_RETRY_DELAY_MS: u64 = 10;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
-const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
+const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[50, 100, 200];
+/// Retries continue until order fills or market interval ends (close_time_unix); no fixed attempt cap.
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
@@ -479,11 +480,18 @@ pub async fn run() -> Result<()> {
                                 } else {
                                     info!("[IntervalSniper] stop loss no match, retrying FAK at latest bid until liquidated");
                                 }
-                                let mut filled = false;
+                                let mut _filled = false;
                                 let mut canceled_once_for_balance = false;
                                 let mut attempt: u32 = 0;
                                 loop {
                                     attempt += 1;
+                                    if now_unix() >= market.close_time_unix {
+                                        warn!(
+                                            "[IntervalSniper] SL retry abort: interval ended (close_time={}); returning to main loop (position may remain open)",
+                                            market.close_time_unix
+                                        );
+                                        break;
+                                    }
                                     let delay_ms = if is_balance_error {
                                         BALANCE_RETRY_BACKOFF_MS
                                             .get((attempt as usize).saturating_sub(1))
@@ -563,7 +571,7 @@ pub async fn run() -> Result<()> {
                                             crate::types::SellOrderTimeInForce::Fak,
                                         )
                                         .await?;
-                                    if result_retry.success {
+                                        if result_retry.success {
                                         info!(
                                             "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
                                             fmt_decimal_2(&sl.entry_price),
@@ -579,7 +587,7 @@ pub async fn run() -> Result<()> {
                                         state.pending_stop_loss = None;
                                         state.last_buy_order = None;
                                         state.total_shares_this_interval = Decimal::ZERO;
-                                        filled = true;
+                                        _filled = true;
                                         break;
                                     }
                                     // Balance/allowance: we already canceled once; just backoff and retry with position.size (no re-cancel).
@@ -730,11 +738,18 @@ pub async fn run() -> Result<()> {
                                     } else {
                                         info!("[IntervalSniper] take profit no match, retrying FAK at latest bid until liquidated");
                                     }
-                                    let mut filled = false;
+                                let mut _filled = false;
                                     let mut canceled_once_for_balance = false;
                                     let mut attempt: u32 = 0;
                                     loop {
                                         attempt += 1;
+                                        if now_unix() >= market.close_time_unix {
+                                            warn!(
+                                                "[IntervalSniper] TP retry abort: interval ended (close_time={}); returning to main loop (position may remain open)",
+                                                market.close_time_unix
+                                            );
+                                            break;
+                                        }
                                         let delay_ms = if is_balance_error {
                                             BALANCE_RETRY_BACKOFF_MS
                                                 .get((attempt as usize).saturating_sub(1))
@@ -834,7 +849,7 @@ pub async fn run() -> Result<()> {
                                             state.pending_stop_loss = None;
                                             state.last_buy_order = None;
                                             state.total_shares_this_interval = Decimal::ZERO;
-                                            filled = true;
+                                            _filled = true;
                                             break;
                                         }
                                         if is_position_closed_error(
