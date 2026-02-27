@@ -6,8 +6,8 @@ Same logic as the TypeScript Interval Sniper in `src/bot/marketMaker/`: **buy on
 
 - **Market**: BTC or SOL 5-minute Up/Down (Polymarket). Slug: `btc-updown-5m-{interval_start_unix}` or `sol-updown-5m-{interval_start_unix}`.
 - **Entry**: Choose the side (Up or Down) with the **higher best ask** that is inside `[min_buy_price, max_buy_price]` and has enough liquidity. Place a single buy per interval (FAK cross-spread by default).
-- **Take profit**: After a fill, if `enable_auto_sell` is set, sell when `best_bid >= target_price` (target = entry × (1 + profit%) or 0.99 if `auto_sell_at_max_price`).
-- **Stop loss**: If `enable_stop_loss` is set, sell when `best_bid <= trigger_price` (trigger = entry × (1 - stop_loss%)).
+- **Take profit**: After a fill, if `enable_auto_sell` is set, sell when `best_bid >= take_profit_price` (fixed price from config, or 0.99 if `auto_sell_at_max_price`).
+- **Stop loss**: If `enable_stop_loss` is set, sell when `best_bid <= stop_loss_price` (fixed price from config).
 
 No UI; run as a standalone binary.
 
@@ -23,7 +23,7 @@ Copy `.env.example` to `.env` and set at least:
 
 - **Gamma**: `POLYMARKET_REST_BASE` (e.g. `https://gamma-api.polymarket.com`)
 - **CLOB** (for order book; required for live orders): `POLYMARKET_CLOB_HOST` (e.g. `https://clob.polymarket.com`)
-- **Interval Sniper**: `MM_DRY_RUN=true` (recommended first), `MM_SIZE_SHARES`, `MM_MIN_BUY_PRICE`, `MM_MAX_BUY_PRICE`, `MM_ENABLE_AUTO_SELL`, `MM_AUTO_SELL_PROFIT_PERCENT`, `MM_ENABLE_STOP_LOSS`, `MM_STOP_LOSS_PERCENT`, etc.
+- **Interval Sniper**: `MM_DRY_RUN=true` (recommended first), `MM_SIZE_SHARES`, `MM_MIN_BUY_PRICE`, `MM_MAX_BUY_PRICE`, `MM_ENABLE_AUTO_SELL`, `MM_TAKE_PROFIT_PRICE`, `MM_ENABLE_STOP_LOSS`, `MM_STOP_LOSS_PRICE`, etc.
 
 Then:
 
@@ -50,9 +50,9 @@ Compatible with the TypeScript bot `MM_*` and `INTERVAL_SNIPER_*` names:
 | `MM_MIN_SECONDS_AFTER_MARKET_OPEN` | No buy in first N seconds | `0` |
 | `MM_DRY_RUN` | If true, no real orders | `true` |
 | `MM_ENABLE_AUTO_SELL` | Enable take profit | `true` |
-| `MM_AUTO_SELL_PROFIT_PERCENT` | TP % above entry | `5` |
+| `MM_TAKE_PROFIT_PRICE` | TP: sell when best_bid ≥ this (0–1) | `0.97` |
 | `MM_ENABLE_STOP_LOSS` | Enable stop loss | `true` |
-| `MM_STOP_LOSS_PERCENT` | SL % below entry | `7` |
+| `MM_STOP_LOSS_PRICE` | SL: sell when best_bid ≤ this (0–1) | `0.90` |
 | `MM_LOOP_MS` | Loop interval (ms) | `100` |
 
 CLOB/Gamma (same as main polybot): `POLYMARKET_CLOB_HOST` (or `POLYMARKET_CLOB_URL`), `POLYMARKET_REST_BASE`. For **live orders** set `MM_DRY_RUN=false` and:

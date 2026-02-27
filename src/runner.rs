@@ -113,6 +113,17 @@ fn fmt_secs(n: u64) -> String {
     format!("{:02}", n)
 }
 
+/// True if the API error indicates the position is already closed (e.g. already sold or no balance).
+/// In that case we stop trying to place TP/SL and do not retry.
+fn is_position_closed_error(msg: Option<&str>) -> bool {
+    msg.map_or(false, |m| {
+        let lower = m.to_lowercase();
+        lower.contains("not enough balance")
+            || lower.contains("allowance")
+            || lower.contains("insufficient balance")
+    })
+}
+
 /// Choose entry side: Up or Down with higher best ask in [min_buy_price, max_buy_price], with min liquidity.
 fn choose_side(
     config: &Config,
@@ -327,10 +338,15 @@ pub async fn run() -> Result<()> {
                             .await?;
                         if result.success {
                             info!(
-                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss)",
+                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, waiting next interval",
                                 fmt_price(Some(&price))
                             );
                             state.stop_loss_placed = true;
+                            state.auto_sell_placed = true; // TP no longer needed, position closed
+                        } else if is_position_closed_error(result.error_msg.as_deref()) {
+                            info!("[IntervalSniper] stop loss: position already closed (no balance/allowance), stopping");
+                            state.stop_loss_placed = true;
+                            state.auto_sell_placed = true; // don't try TP either
                         } else {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                 m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
@@ -371,12 +387,19 @@ pub async fn run() -> Result<()> {
                                         .await?;
                                     if result_retry.success {
                                         info!(
-                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {})",
+                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, waiting next interval",
                                             fmt_price(Some(&price_retry)),
                                             attempt + 1
                                         );
                                         state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true; // TP no longer needed
                                         filled = true;
+                                        break;
+                                    }
+                                    if is_position_closed_error(result_retry.error_msg.as_deref()) {
+                                        info!("[IntervalSniper] stop loss: position already closed (no balance/allowance), stopping");
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
                                         break;
                                     }
                                     if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
@@ -421,10 +444,15 @@ pub async fn run() -> Result<()> {
                                 .await?;
                             if result.success {
                                 info!(
-                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit)",
+                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit) — position closed, waiting next interval",
                                     fmt_price(Some(&price))
                                 );
                                 state.auto_sell_placed = true;
+                                state.stop_loss_placed = true; // SL no longer needed, position closed
+                            } else if is_position_closed_error(result.error_msg.as_deref()) {
+                                info!("[IntervalSniper] take profit: position already closed (no balance/allowance), stopping");
+                                state.auto_sell_placed = true;
+                                state.stop_loss_placed = true; // don't try SL either
                             } else {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                     m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
@@ -465,12 +493,19 @@ pub async fn run() -> Result<()> {
                                             .await?;
                                         if result_retry.success {
                                             info!(
-                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {})",
+                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {}) — position closed, waiting next interval",
                                                 fmt_price(Some(&price_retry)),
                                                 attempt + 1
                                             );
                                             state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true; // SL no longer needed
                                             filled = true;
+                                            break;
+                                        }
+                                        if is_position_closed_error(result_retry.error_msg.as_deref()) {
+                                            info!("[IntervalSniper] take profit: position already closed (no balance/allowance), stopping");
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
                                             break;
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
@@ -558,10 +593,7 @@ pub async fn run() -> Result<()> {
                             let target_price = if state.config.auto_sell_at_max_price {
                                 dec!(0.99)
                             } else {
-                                round_to_tick(
-                                    (entry_price * (Decimal::ONE + state.config.auto_sell_profit_percent / dec!(100)))
-                                        .min(Decimal::ONE),
-                                )
+                                round_to_tick(state.config.take_profit_price)
                             };
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.to_string(),
@@ -569,9 +601,7 @@ pub async fn run() -> Result<()> {
                                 size: filled.clone() * Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100),
                                 placed_at_ms: now_ms_u,
                             });
-                            let trigger_price = round_to_tick(
-                                entry_price * (Decimal::ONE - state.config.stop_loss_percent / dec!(100)),
-                            );
+                            let trigger_price = round_to_tick(state.config.stop_loss_price);
                             state.pending_stop_loss = Some(PendingStopLoss {
                                 token_id: token_id.to_string(),
                                 entry_price: entry_price.clone(),

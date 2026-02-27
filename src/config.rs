@@ -102,12 +102,11 @@ pub fn load_config() -> Result<Config> {
 
     let loop_ms = env_u64("MM_LOOP_MS", 100).clamp(1, 500);
     let cooldown_ms = env_u64("MM_COOLDOWN_MS", 2000).min(60000);
-    let auto_sell_pct = env_decimal("MM_AUTO_SELL_PROFIT_PERCENT", "5");
-    let auto_sell_pct = auto_sell_pct
-        .max(Decimal::from_str("0.1").unwrap_or(Decimal::ZERO))
-        .min(Decimal::from(100));
-    let stop_loss_pct = env_decimal("MM_STOP_LOSS_PERCENT", "7");
-    let stop_loss_pct = stop_loss_pct.max(Decimal::ONE).min(Decimal::from(50));
+    // Take profit / stop loss: fixed prices (0..=1). Sell when best_bid >= take_profit_price (TP) or best_bid <= stop_loss_price (SL).
+    let tp_default = env("TAKE_PROFIT", "0.97");
+    let sl_default = env("STOP_LOSS", "0.90");
+    let take_profit_price = normalize_price(env_decimal("MM_TAKE_PROFIT_PRICE", &tp_default));
+    let stop_loss_price = normalize_price(env_decimal("MM_STOP_LOSS_PRICE", &sl_default));
     let take_profit_margin = env_decimal("MM_TAKE_PROFIT_PRICE_MARGIN", "0.01");
     let take_profit_margin = take_profit_margin
         .max(Decimal::ZERO)
@@ -127,12 +126,12 @@ pub fn load_config() -> Result<Config> {
         dry_run: env_bool("MM_DRY_RUN", true),
         order_strategy,
         enable_auto_sell: env_bool("MM_ENABLE_AUTO_SELL", true),
-        auto_sell_profit_percent: auto_sell_pct,
+        take_profit_price,
         auto_sell_at_max_price: env_bool("MM_AUTO_SELL_AT_MAX_PRICE", false),
         auto_sell_quantity_percent: env_u32("MM_AUTO_SELL_QUANTITY_PERCENT", 100).clamp(1, 100) as u8,
         take_profit_time_in_force: take_profit_tif,
         enable_stop_loss: env_bool("MM_ENABLE_STOP_LOSS", true),
-        stop_loss_percent: stop_loss_pct,
+        stop_loss_price,
         stop_loss_quantity_percent: env_u32("MM_STOP_LOSS_QUANTITY_PERCENT", 100).clamp(1, 100) as u8,
         stop_loss_time_in_force: stop_loss_tif,
         loop_ms,

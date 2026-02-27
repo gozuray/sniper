@@ -57,12 +57,14 @@ pub struct Config {
     pub dry_run: bool,
     pub order_strategy: OrderStrategy,
     pub enable_auto_sell: bool,
-    pub auto_sell_profit_percent: Decimal,
+    /// Fixed price: sell when best_bid >= this (take profit).
+    pub take_profit_price: Decimal,
     pub auto_sell_at_max_price: bool,
     pub auto_sell_quantity_percent: u8,
     pub take_profit_time_in_force: SellOrderTimeInForce,
     pub enable_stop_loss: bool,
-    pub stop_loss_percent: Decimal,
+    /// Fixed price: sell when best_bid <= this (stop loss).
+    pub stop_loss_price: Decimal,
     pub stop_loss_quantity_percent: u8,
     pub stop_loss_time_in_force: SellOrderTimeInForce,
     pub loop_ms: u64,
