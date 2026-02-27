@@ -20,6 +20,10 @@ const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 /// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
+/// Delay between FAK retries when no match (ms).
+const FAK_RETRY_DELAY_MS: u64 = 50;
+/// Max FAK retries to liquidate position (total ~2s at 50ms).
+const FAK_MAX_RETRIES: u32 = 40;
 
 struct RunnerState {
     config: Config,
@@ -248,7 +252,7 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Stop loss: if pending and best_bid <= trigger_price -> sell
+        // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled)
         if state.config.enable_stop_loss {
             if let Some(ref sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
@@ -262,22 +266,73 @@ pub async fn run() -> Result<()> {
                             .place_sell_order(
                                 &sl.token_id,
                                 price,
-                                size,
+                                size.clone(),
                                 state.config.stop_loss_time_in_force,
                             )
                             .await?;
                         if result.success {
                             info!("[IntervalSniper] stop loss executed @ {}", fmt_price(Some(&price)));
                             state.stop_loss_placed = true;
-                        } else if let Some(msg) = result.error_msg {
-                            warn!("[IntervalSniper] stop loss failed: {}", msg);
+                        } else {
+                            let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
+                                m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
+                            });
+                            if is_no_match {
+                                info!("[IntervalSniper] stop loss no match, retrying FAK at latest bid until liquidated");
+                                let mut filled = false;
+                                for attempt in 0..FAK_MAX_RETRIES {
+                                    tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
+                                    let top_retry = match fetch_top_of_book(
+                                        &http,
+                                        &clob_host,
+                                        &market.token_id_up,
+                                        &market.token_id_down,
+                                    )
+                                    .await
+                                    {
+                                        Ok(t) => t,
+                                        Err(_) => continue,
+                                    };
+                                    let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
+                                    let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                    if bid <= Decimal::ZERO {
+                                        continue;
+                                    }
+                                    let price_retry = round_to_tick(bid);
+                                    let result_retry = clob
+                                        .place_sell_order(
+                                            &sl.token_id,
+                                            price_retry,
+                                            size.clone(),
+                                            crate::types::SellOrderTimeInForce::Fak,
+                                        )
+                                        .await?;
+                                    if result_retry.success {
+                                        info!("[IntervalSniper] stop loss executed @ {} (attempt {})", fmt_price(Some(&price_retry)), attempt + 1);
+                                        state.stop_loss_placed = true;
+                                        filled = true;
+                                        break;
+                                    }
+                                    if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
+                                        if let Some(msg) = result_retry.error_msg {
+                                            warn!("[IntervalSniper] stop loss failed: {}", msg);
+                                        }
+                                        break;
+                                    }
+                                }
+                                if !filled {
+                                    warn!("[IntervalSniper] stop loss FAK retries exhausted, will retry next tick");
+                                }
+                            } else if let Some(msg) = result.error_msg {
+                                warn!("[IntervalSniper] stop loss failed: {}", msg);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Take profit: if pending and best_bid >= target_price -> sell
+        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest bid until filled)
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
@@ -294,15 +349,66 @@ pub async fn run() -> Result<()> {
                                 .place_sell_order(
                                     &tp.token_id,
                                     price,
-                                    size,
+                                    size.clone(),
                                     state.config.take_profit_time_in_force,
                                 )
                                 .await?;
                             if result.success {
                                 info!("[IntervalSniper] take profit executed @ {}", fmt_price(Some(&price)));
                                 state.auto_sell_placed = true;
-                            } else if let Some(msg) = result.error_msg {
-                                warn!("[IntervalSniper] take profit failed: {}", msg);
+                            } else {
+                                let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
+                                    m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
+                                });
+                                if is_no_match {
+                                    info!("[IntervalSniper] take profit no match, retrying FAK at latest bid until liquidated");
+                                    let mut filled = false;
+                                    for attempt in 0..FAK_MAX_RETRIES {
+                                        tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
+                                        let top_retry = match fetch_top_of_book(
+                                            &http,
+                                            &clob_host,
+                                            &market.token_id_up,
+                                            &market.token_id_down,
+                                        )
+                                        .await
+                                        {
+                                            Ok(t) => t,
+                                            Err(_) => continue,
+                                        };
+                                        let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
+                                        let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                        if bid < target {
+                                            continue;
+                                        }
+                                        let price_retry = round_to_tick(bid.min(target + state.config.take_profit_price_margin));
+                                        let result_retry = clob
+                                            .place_sell_order(
+                                                &tp.token_id,
+                                                price_retry,
+                                                size.clone(),
+                                                crate::types::SellOrderTimeInForce::Fak,
+                                            )
+                                            .await?;
+                                        if result_retry.success {
+                                            info!("[IntervalSniper] take profit executed @ {} (attempt {})", fmt_price(Some(&price_retry)), attempt + 1);
+                                            state.auto_sell_placed = true;
+                                            filled = true;
+                                            break;
+                                        }
+                                        if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
+                                            if let Some(msg) = result_retry.error_msg {
+                                                warn!("[IntervalSniper] take profit failed: {}", msg);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    if !filled {
+                                        warn!("[IntervalSniper] take profit FAK retries exhausted, will retry next tick");
+                                    }
+                                } else if let Some(msg) = result.error_msg {
+                                    warn!("[IntervalSniper] take profit failed: {}", msg);
+                                }
                             }
                         }
                     }
