@@ -145,7 +145,14 @@ pub async fn run() -> Result<()> {
                     state.auto_sell_placed = false;
                     state.stop_loss_placed = false;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
-                    info!("[IntervalSniper] interval switch -> {}", market.slug);
+                    let up_id = market.token_id_up.trim();
+                    let down_id = market.token_id_down.trim();
+                    info!(
+                        "[IntervalSniper] interval switch -> {} (Up token={}... Down token={}...)",
+                        market.slug,
+                        if up_id.len() > 12 { &up_id[..12] } else { up_id },
+                        if down_id.len() > 12 { &down_id[..12] } else { down_id }
+                    );
                 }
                 Err(e) => {
                     warn!("[IntervalSniper] fetch market failed: {}", e);

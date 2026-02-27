@@ -91,42 +91,47 @@ fn parse_token_ids(m: &GammaMarket) -> Result<(String, String)> {
     let mut token_id_up = String::new();
     let mut token_id_down = String::new();
 
-    if let Some(ref clob_ids) = m.clob_token_ids {
-        let trimmed = clob_ids.trim();
-        let parts: Vec<&str> = if trimmed.starts_with('[') {
-            serde_json::from_str(trimmed).unwrap_or_else(|_| vec![])
-        } else {
-            trimmed.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
-        };
-        if parts.len() >= 2 {
-            token_id_up = parts[0].to_string();
-            token_id_down = parts[1].to_string();
+    // Prefer tokens with outcome labels (Up/Down, Yes/No) so we don't rely on array order.
+    if let Some(ref tokens) = m.tokens {
+        if tokens.len() >= 2 {
+            for t in tokens {
+                let id = t.token_id.as_deref().unwrap_or("").trim().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let outcome = t.outcome.as_deref().unwrap_or("").to_lowercase();
+                if outcome == "up" || outcome == "yes" {
+                    token_id_up = id;
+                } else if outcome == "down" || outcome == "no" {
+                    token_id_down = id;
+                }
+            }
+            if token_id_up.is_empty() || token_id_down.is_empty() {
+                token_id_up.clear();
+                token_id_down.clear();
+            }
         }
     }
 
+    // Fallback: use clob_token_ids order (documented as [Yes, No] = [Up, Down]).
     if token_id_up.is_empty() || token_id_down.is_empty() {
-        if let Some(ref tokens) = m.tokens {
-            if tokens.len() >= 2 {
-                for t in tokens {
-                    let id = t.token_id.as_deref().unwrap_or("").to_string();
-                    let outcome = t.outcome.as_deref().unwrap_or("").to_lowercase();
-                    if outcome == "up" || outcome == "yes" {
-                        token_id_up = id;
-                    } else if outcome == "down" || outcome == "no" {
-                        token_id_down = id;
-                    }
-                }
-                if token_id_up.is_empty() && token_id_down.is_empty() {
-                    token_id_up = tokens[0].token_id.as_deref().unwrap_or("").to_string();
-                    token_id_down = tokens[1].token_id.as_deref().unwrap_or("").to_string();
-                }
+        if let Some(ref clob_ids) = m.clob_token_ids {
+            let trimmed = clob_ids.trim();
+            let parts: Vec<&str> = if trimmed.starts_with('[') {
+                serde_json::from_str(trimmed).unwrap_or_else(|_| vec![])
+            } else {
+                trimmed.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+            };
+            if parts.len() >= 2 {
+                token_id_up = parts[0].to_string();
+                token_id_down = parts[1].to_string();
             }
         }
     }
 
     if token_id_up.is_empty() || token_id_down.is_empty() {
         anyhow::bail!(
-            "Market could not resolve Up/Down token IDs (clobTokenIds={:?})",
+            "Market could not resolve Up/Down token IDs (clobTokenIds={:?}, tokens with outcome?)",
             m.clob_token_ids
         );
     }

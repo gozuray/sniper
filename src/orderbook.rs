@@ -34,25 +34,38 @@ fn parse_level_price_size(price: &str, size: &str) -> Option<(Decimal, Decimal)>
     Some((p, s))
 }
 
-/// Build TopOfBookSide from raw order book (best bid = first bid, best ask = first ask).
+/// Build TopOfBookSide from raw order book.
+/// Best bid = highest bid price; best ask = lowest ask price (robust to API sort order).
 fn raw_to_side(raw: &OrderBookRaw) -> TopOfBookSide {
     let mut side = TopOfBookSide::default();
 
     if let Some(ref bids) = raw.bids {
-        if let Some(b) = bids.first() {
+        let mut best_bid_price: Option<Decimal> = None;
+        let mut best_bid_size: Option<Decimal> = None;
+        for b in bids.iter() {
             if let Some((p, s)) = parse_level_price_size(&b.price, &b.size) {
-                side.best_bid = Some(p);
-                side.best_bid_size = Some(s);
+                if best_bid_price.map(|bp| p > bp).unwrap_or(true) {
+                    best_bid_price = Some(p);
+                    best_bid_size = Some(s);
+                }
             }
         }
+        side.best_bid = best_bid_price;
+        side.best_bid_size = best_bid_size;
     }
     if let Some(ref asks) = raw.asks {
-        if let Some(a) = asks.first() {
+        let mut best_ask_price: Option<Decimal> = None;
+        let mut best_ask_size: Option<Decimal> = None;
+        for a in asks.iter() {
             if let Some((p, s)) = parse_level_price_size(&a.price, &a.size) {
-                side.best_ask = Some(p);
-                side.best_ask_size = Some(s);
+                if best_ask_price.map(|ap| p < ap).unwrap_or(true) {
+                    best_ask_price = Some(p);
+                    best_ask_size = Some(s);
+                }
             }
         }
+        side.best_ask = best_ask_price;
+        side.best_ask_size = best_ask_size;
     }
     side
 }
