@@ -337,7 +337,12 @@ pub async fn run() -> Result<()> {
                         // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                         tokio::time::sleep(Duration::from_millis(350)).await;
                         let price = round_to_tick(best_bid);
-                        let size = size_4_decimals(sl.size.clone());
+                        let position_size_real = sl.size.clone();
+                        let available = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                        let sell_size = available
+                            .map(|a| position_size_real.min(a))
+                            .unwrap_or(position_size_real);
+                        let size = size_4_decimals(sell_size);
                         let result = clob
                             .place_sell_order(
                                 &sl.token_id,
@@ -395,12 +400,18 @@ pub async fn run() -> Result<()> {
                                     if bid <= Decimal::ZERO {
                                         continue;
                                     }
+                                    let position_size_real = sl.size.clone();
+                                    let available = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                    let sell_size_retry = available
+                                        .map(|a| position_size_real.min(a))
+                                        .unwrap_or(position_size_real);
+                                    let size_retry = size_4_decimals(sell_size_retry);
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
                                         .place_sell_order(
                                             &sl.token_id,
                                             price_retry,
-                                            size.clone(),
+                                            size_retry.clone(),
                                             crate::types::SellOrderTimeInForce::Fak,
                                         )
                                         .await?;
@@ -427,7 +438,7 @@ pub async fn run() -> Result<()> {
                                         let ba = clob.get_balance_allowance(&sl.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
                                         info!(
                                             "[IntervalSniper] SL retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                            sl.token_id, size, ba
+                                            sl.token_id, size_retry, ba
                                         );
                                     }
                                     if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
@@ -449,7 +460,7 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest bid until filled)
+        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid from real-time book until filled)
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
@@ -470,8 +481,13 @@ pub async fn run() -> Result<()> {
                             }
                             // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                             tokio::time::sleep(Duration::from_millis(350)).await;
+                            let position_size_real = tp.size.clone();
+                            let available = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                            let sell_size = available
+                                .map(|a| position_size_real.min(a))
+                                .unwrap_or(position_size_real);
                             let price = round_to_tick(best_bid.min(target + state.config.take_profit_price_margin));
-                            let size = size_4_decimals(tp.size.clone());
+                            let size = size_4_decimals(sell_size);
                             let result = clob
                                 .place_sell_order(
                                     &tp.token_id,
@@ -525,16 +541,23 @@ pub async fn run() -> Result<()> {
                                             }
                                         };
                                         let side_retry = if is_up { &top_retry.token_id_up } else { &top_retry.token_id_down };
+                                        // Real-time book: for SELL FAK we use best_bid (executable price; best_ask would be passive).
                                         let bid = side_retry.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                                         if bid < target {
                                             continue;
                                         }
+                                        let position_size_real = tp.size.clone();
+                                        let available = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                                        let sell_size_retry = available
+                                            .map(|a| position_size_real.min(a))
+                                            .unwrap_or(position_size_real);
+                                        let size_retry = size_4_decimals(sell_size_retry);
                                         let price_retry = round_to_tick(bid.min(target + state.config.take_profit_price_margin));
                                         let result_retry = clob
                                             .place_sell_order(
                                                 &tp.token_id,
                                                 price_retry,
-                                                size.clone(),
+                                                size_retry.clone(),
                                                 crate::types::SellOrderTimeInForce::Fak,
                                             )
                                             .await?;
@@ -561,7 +584,7 @@ pub async fn run() -> Result<()> {
                                             let ba = clob.get_balance_allowance(&tp.token_id).await.unwrap_or_else(|e| format!("error: {}", e));
                                             info!(
                                                 "[IntervalSniper] TP retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                                tp.token_id, size, ba
+                                                tp.token_id, size_retry, ba
                                             );
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {

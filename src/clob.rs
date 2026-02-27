@@ -78,6 +78,12 @@ pub trait ClobClient: Send + Sync {
         Ok("(not available)".to_string())
     }
 
+    /// Available balance for token (from balance-allowance endpoint). Returns None on error or parse failure.
+    /// Used to compute sell_size = min(position_size_real, available) for TP/SL.
+    async fn get_available_balance(&self, _token_id: &str) -> Result<Option<Decimal>> {
+        Ok(None)
+    }
+
     async fn place_sell_order(
         &self,
         token_id: &str,
@@ -320,19 +326,21 @@ impl LiveClob {
         })
     }
 
-    /// GET /balance-allowance with HMAC auth (path includes query string).
+    /// GET /balance-allowance with HMAC auth. L2 HMAC is over path only (no query), per py-clob-client.
     async fn get_balance_allowance_inner(&self, token_id: &str) -> Result<String> {
-        let path = format!(
-            "/balance-allowance?asset_type=CONDITIONAL&token_id={}&signature_type={}",
-            urlencoding::encode(token_id),
-            self.signature_type
-        );
+        let path_for_sig = "/balance-allowance";
         let timestamp = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let sig = build_poly_hmac(&self.api_secret, timestamp, "GET", &path, None)?;
-        let url = format!("{}{}", self.clob_host, path);
+        let sig = build_poly_hmac(&self.api_secret, timestamp, "GET", path_for_sig, None)?;
+        let path_with_query = format!(
+            "{}?asset_type=CONDITIONAL&token_id={}&signature_type={}",
+            path_for_sig,
+            urlencoding::encode(token_id),
+            self.signature_type
+        );
+        let url = format!("{}{}", self.clob_host, path_with_query);
         let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
         let res = self
             .client
@@ -350,6 +358,19 @@ impl LiveClob {
             anyhow::bail!("balance-allowance HTTP {}: {}", status, text.chars().take(200).collect::<String>());
         }
         Ok(text)
+    }
+
+    /// Parse balance from balance-allowance JSON. Tries "balance" as string or number.
+    fn parse_balance_from_response(text: &str) -> Option<Decimal> {
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        let balance = json.get("balance")?;
+        let s = balance
+            .as_str()
+            .map(String::from)
+            .or_else(|| balance.as_f64().map(|f| f.to_string()))
+            .or_else(|| balance.as_i64().map(|i| i.to_string()))
+            .or_else(|| balance.as_u64().map(|u| u.to_string()))?;
+        Decimal::from_str(s.trim()).ok().filter(|d| *d >= Decimal::ZERO)
     }
 }
 
@@ -506,6 +527,11 @@ impl ClobClient for LiveClob {
 
     async fn get_balance_allowance(&self, token_id: &str) -> Result<String> {
         self.get_balance_allowance_inner(token_id).await
+    }
+
+    async fn get_available_balance(&self, token_id: &str) -> Result<Option<Decimal>> {
+        let text = self.get_balance_allowance_inner(token_id).await.ok();
+        Ok(text.as_deref().and_then(Self::parse_balance_from_response))
     }
 }
 
