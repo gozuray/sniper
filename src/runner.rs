@@ -343,16 +343,18 @@ pub async fn run() -> Result<()> {
                             );
                             state.stop_loss_placed = true;
                             state.auto_sell_placed = true; // TP no longer needed, position closed
-                        } else if is_position_closed_error(result.error_msg.as_deref()) {
-                            info!("[IntervalSniper] stop loss: position already closed (no balance/allowance), stopping");
-                            state.stop_loss_placed = true;
-                            state.auto_sell_placed = true; // don't try TP either
                         } else {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                 m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
                             });
-                            if is_no_match {
-                                info!("[IntervalSniper] stop loss no match, retrying FAK at latest bid until liquidated");
+                            // On balance/allowance error do NOT assume position closed: retry at best bid until sold (SL semantics)
+                            let is_balance_error = is_position_closed_error(result.error_msg.as_deref());
+                            if is_no_match || is_balance_error {
+                                if is_balance_error {
+                                    info!("[IntervalSniper] stop loss: balance/allowance error, retrying at best bid until sold");
+                                } else {
+                                    info!("[IntervalSniper] stop loss no match, retrying FAK at latest bid until liquidated");
+                                }
                                 let mut filled = false;
                                 for attempt in 0..FAK_MAX_RETRIES {
                                     tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
@@ -396,11 +398,10 @@ pub async fn run() -> Result<()> {
                                         filled = true;
                                         break;
                                     }
+                                    // Do NOT treat balance/allowance as position closed: keep retrying at best bid until sold
                                     if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                        info!("[IntervalSniper] stop loss: position already closed (no balance/allowance), stopping");
-                                        state.stop_loss_placed = true;
-                                        state.auto_sell_placed = true;
-                                        break;
+                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error, will retry next attempt/tick", attempt + 1);
+                                        continue;
                                     }
                                     if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
                                         if let Some(msg) = result_retry.error_msg {
@@ -553,12 +554,18 @@ pub async fn run() -> Result<()> {
                         EntrySide::Up => &market.token_id_up,
                         EntrySide::Down => &market.token_id_down,
                     };
+                    // Enforce price within [min_buy_price, max_buy_price]: we cross the spread (best_ask + 1 tick)
+                    // but never go below min nor above max (avoids buying at 0.89 when min is 0.92).
                     let effective_price = round_to_tick(
-                        (best_ask + TICK_SIZE).min(state.config.max_buy_price),
+                        (best_ask + TICK_SIZE)
+                            .max(state.config.min_buy_price)
+                            .min(state.config.max_buy_price),
                     );
                     let shares_left = state.config.size_shares - state.total_shares_this_interval;
+                    // Cap at shares_left so we never order more than configured size (e.g. exactly 7 shares).
+                    // Round to 2 decimals so we never send 7.24000001 when user wants 7.
                     let size = size_4_decimals(
-                        shares_left.min(size_available).max(min_order_size),
+                        shares_left.min(size_available).max(min_order_size).round_dp(2),
                     );
                     let maker_amount = maker_amount_2_decimals(size.clone(), effective_price.clone());
                     if size >= min_order_size && size > Decimal::ZERO {

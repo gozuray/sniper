@@ -117,7 +117,7 @@ pub fn load_config() -> Result<Config> {
         market_slug: market_slug.clone(),
         gamma_base_url: env("POLYMARKET_REST_BASE", "https://gamma-api.polymarket.com"),
         seconds_before_close: env_u32("MM_SECONDS_BEFORE_CLOSE", DEFAULT_SECONDS_BEFORE_CLOSE),
-        size_shares: env_decimal("MM_SIZE_SHARES", DEFAULT_SIZE_SHARES),
+        size_shares: env_decimal("MM_SIZE_SHARES", DEFAULT_SIZE_SHARES).round_dp(2),
         min_buy_price: normalize_price(env_decimal("MM_MIN_BUY_PRICE", DEFAULT_MIN_BUY_PRICE)),
         max_buy_price: normalize_price(env_decimal("MM_MAX_BUY_PRICE", DEFAULT_MAX_BUY_PRICE)),
         allow_buy_up: env_bool("MM_ALLOW_BUY_UP", true),
