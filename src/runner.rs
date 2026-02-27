@@ -18,6 +18,8 @@ use tracing::{info, warn};
 
 const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
+/// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
+const LOG_BOOK_EVERY_TICKS: u64 = 10;
 
 struct RunnerState {
     config: Config,
@@ -61,6 +63,10 @@ fn maker_amount_2_decimals(size: Decimal, price: Decimal) -> Decimal {
 
 fn size_4_decimals(size: Decimal) -> Decimal {
     size.round_dp(4)
+}
+
+fn fmt_price(p: Option<&Decimal>) -> String {
+    p.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
 /// Choose entry side: Up or Down with higher best ask in [min_buy_price, max_buy_price], with min liquidity.
@@ -169,13 +175,50 @@ pub async fn run() -> Result<()> {
         {
             Ok(t) => t,
             Err(e) => {
-                if tick_count % 20 == 0 {
-                    warn!("[IntervalSniper] order book fetch failed: {}", e);
-                }
+                warn!("[IntervalSniper] order book fetch failed: {}", e);
                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                 continue;
             }
         };
+
+        // Periodic log: order book scan (real-time visibility)
+        if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
+            let up = top.token_id_up.as_ref();
+            let down = top.token_id_down.as_ref();
+            info!(
+                "[IntervalSniper] order book Up bid={} ask={} | Down bid={} ask={} | secs_to_close={}",
+                fmt_price(up.and_then(|s| s.best_bid.as_ref())),
+                fmt_price(up.and_then(|s| s.best_ask.as_ref())),
+                fmt_price(down.and_then(|s| s.best_bid.as_ref())),
+                fmt_price(down.and_then(|s| s.best_ask.as_ref())),
+                secs_to_close
+            );
+            // When position open, log TP/SL monitoring so user sees we're checking for fills
+            if let Some(ref tp) = state.pending_auto_sell {
+                if !state.auto_sell_placed {
+                    let is_up = tp.token_id == market.token_id_up;
+                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
+                    let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                    info!(
+                        "[IntervalSniper] position open: TP target={} best_bid={} (sell when bid >= target)",
+                        tp.target_price,
+                        best_bid
+                    );
+                }
+            }
+            if let Some(ref sl) = state.pending_stop_loss {
+                if !state.stop_loss_placed {
+                    let is_up = sl.token_id == market.token_id_up;
+                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
+                    let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                    info!(
+                        "[IntervalSniper] position open: SL trigger={} best_bid={} (sell when bid <= trigger)",
+                        sl.trigger_price,
+                        best_bid
+                    );
+                }
+            }
+        }
 
         // Stop loss: if pending and best_bid <= trigger_price -> sell
         if state.config.enable_stop_loss {
@@ -333,9 +376,7 @@ pub async fn run() -> Result<()> {
                                 size
                             );
                         } else if let Some(msg) = result.error_msg {
-                            if tick_count % 50 == 0 {
-                                warn!("[IntervalSniper] buy failed: {}", msg);
-                            }
+                            warn!("[IntervalSniper] buy failed: {}", msg);
                         }
                     }
                 }
