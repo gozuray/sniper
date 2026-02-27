@@ -47,12 +47,17 @@ fn top_has_book_data(top: &TopOfBook) -> bool {
     up_ok || down_ok
 }
 
+/// Maximum number of trades (buy + sell) allowed per interval; after stop loss we allow re-entry once.
+const MAX_TRADES_PER_INTERVAL: u32 = 2;
+
 struct RunnerState {
     config: Config,
     market: Option<ResolvedMarket>,
     /// WebSocket order book when connected; None = use REST only.
     ws_book: Option<ClobWsBook>,
     ordered_this_interval: bool,
+    /// Number of buys executed this interval (max MAX_TRADES_PER_INTERVAL); re-entry after SL counts as second trade.
+    trades_this_interval: u32,
     total_shares_this_interval: Decimal,
     last_buy_order: Option<LastBuyOrder>,
     pending_auto_sell: Option<PendingAutoSell>,
@@ -184,6 +189,7 @@ pub async fn run() -> Result<()> {
         ws_book: None,
         config: config.clone(),
         ordered_this_interval: false,
+        trades_this_interval: 0,
         total_shares_this_interval: Decimal::ZERO,
         last_buy_order: None,
         pending_auto_sell: None,
@@ -242,6 +248,7 @@ pub async fn run() -> Result<()> {
                     }
                     state.market = Some(market.clone());
                     state.ordered_this_interval = false;
+                    state.trades_this_interval = 0;
                     state.total_shares_this_interval = Decimal::ZERO;
                     state.last_buy_order = None;
                     state.pending_auto_sell = None;
@@ -419,11 +426,18 @@ pub async fn run() -> Result<()> {
                             .await?;
                         if result.success {
                             info!(
-                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, waiting next interval",
-                                fmt_price(Some(&price))
+                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
+                                fmt_price(Some(&price)),
+                                state.trades_this_interval,
+                                MAX_TRADES_PER_INTERVAL
                             );
                             state.stop_loss_placed = true;
-                            state.auto_sell_placed = true; // TP no longer needed, position closed
+                            state.auto_sell_placed = true;
+                            // Clear position state so we can re-enter at target price (max 2 trades per interval).
+                            state.pending_auto_sell = None;
+                            state.pending_stop_loss = None;
+                            state.last_buy_order = None;
+                            state.total_shares_this_interval = Decimal::ZERO; // re-entry can use full size again
                         } else {
                             if result.http_status == Some(400) {
                                 let ba = clob
@@ -525,12 +539,18 @@ pub async fn run() -> Result<()> {
                                         .await?;
                                     if result_retry.success {
                                         info!(
-                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, waiting next interval",
+                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
                                             fmt_price(Some(&price_retry)),
-                                            attempt
+                                            attempt,
+                                            state.trades_this_interval,
+                                            MAX_TRADES_PER_INTERVAL
                                         );
                                         state.stop_loss_placed = true;
-                                        state.auto_sell_placed = true; // TP no longer needed
+                                        state.auto_sell_placed = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
                                         filled = true;
                                         break;
                                     }
@@ -634,11 +654,17 @@ pub async fn run() -> Result<()> {
                                 .await?;
                             if result.success {
                                 info!(
-                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit) — position closed, waiting next interval",
-                                    fmt_price(Some(&price))
+                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit) — position closed (trades this interval: {}/{})",
+                                    fmt_price(Some(&price)),
+                                    state.trades_this_interval,
+                                    MAX_TRADES_PER_INTERVAL
                                 );
                                 state.auto_sell_placed = true;
-                                state.stop_loss_placed = true; // SL no longer needed, position closed
+                                state.stop_loss_placed = true;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
                             } else {
                                 if result.http_status == Some(400) {
                                     let ba = clob
@@ -742,12 +768,18 @@ pub async fn run() -> Result<()> {
                                             .await?;
                                         if result_retry.success {
                                             info!(
-                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {}) — position closed, waiting next interval",
+                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {}) — position closed (trades this interval: {}/{})",
                                                 fmt_price(Some(&price_retry)),
-                                                attempt
+                                                attempt,
+                                                state.trades_this_interval,
+                                                MAX_TRADES_PER_INTERVAL
                                             );
                                             state.auto_sell_placed = true;
-                                            state.stop_loss_placed = true; // SL no longer needed
+                                            state.stop_loss_placed = true;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
                                             filled = true;
                                             break;
                                         }
@@ -786,8 +818,9 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Buy path: one order per interval, in window, side with higher best ask in range
-        if !state.ordered_this_interval {
+        // Buy path: up to MAX_TRADES_PER_INTERVAL per interval; after SL/TP we allow re-entry when price is in range
+        let no_open_position = state.pending_auto_sell.is_none() && state.pending_stop_loss.is_none();
+        if no_open_position && state.trades_this_interval < MAX_TRADES_PER_INTERVAL {
             let in_window = state.config.no_window_all_intervals
                 || secs_to_close <= state.config.seconds_before_close as u64;
             let sec_since_start = 300u64.saturating_sub(secs_to_close);
@@ -850,6 +883,7 @@ pub async fn run() -> Result<()> {
                                 .unwrap_or(size.clone());
                             let filled = filled.min(size.clone());
                             state.ordered_this_interval = true;
+                            state.trades_this_interval += 1;
                             state.total_shares_this_interval += filled.clone();
                             let entry_price = effective_price;
                             let entry_side = side;
