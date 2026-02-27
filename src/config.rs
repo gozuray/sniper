@@ -1,135 +1,149 @@
-use anyhow::{Context, Result};
+//! Config from environment (MM_* / INTERVAL_SNIPER_*).
+
+use crate::types::{Config, OrderStrategy, SellOrderTimeInForce};
+use anyhow::Result;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-use std::time::Duration;
+use std::str::FromStr;
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// Set by TOKEN_ID, or resolved from Gamma when auto_btc5m is true.
-    pub token_id: String,
-    /// When true, ignore TOKEN_ID and resolve token from Gamma each 5-min window.
-    pub auto_btc5m: bool,
-    /// For auto_btc5m: true = trade "Up" (first token), false = "Down" (second token).
-    pub outcome_up: bool,
-    /// When true (OUTCOME=both or TRADE_BOTH_SIDES=1), scan and execute on both Up and Down when price is in range.
-    pub trade_both_sides: bool,
-    pub buy_min: Decimal,
-    pub buy_max: Decimal,
-    pub take_profit_trigger: Decimal,
-    pub stop_loss_trigger: Decimal,
-    pub order_size: Decimal,
-    pub max_position: Decimal,
-    pub dedupe_ttl: Duration,
-    pub stale_threshold: Duration,
-    pub clob_url: String,
-    /// Seconds to wait after interval start (or after interval switch) before allowing buy. Default 3.
-    pub min_delay_after_interval_start_sec: u64,
-    /// Minimum time (ms) the buy order must stay on the book before we allow cancel/replace. Gives the order time to fill before we cancel it. Default 2000.
-    pub buy_order_min_age_ms: u64,
-    /// Max frequency (ms) for syncing position from resting buy order via get_order. Lower = faster fill detection, more REST calls. Default 200. Set lower (e.g. 100) for HFT.
-    pub order_sync_interval_ms: u64,
+const BTC_5MIN_INTERVAL_SEC: u64 = 300;
+const DEFAULT_SECONDS_BEFORE_CLOSE: u32 = 20;
+const DEFAULT_SIZE_USD: &str = "5";
+const DEFAULT_MIN_BUY_PRICE: &str = "0.9";
+const DEFAULT_MAX_BUY_PRICE: &str = "0.95";
+
+fn env(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-impl Config {
-    pub fn from_env() -> Result<Self> {
-        let auto_btc5m = std::env::var("AUTO_BTC5M")
-            .map(|v| {
-                let low = v.to_lowercase();
-                low == "1" || low == "true" || low == "yes"
-            })
-            .unwrap_or(false);
-
-        let token_id = if auto_btc5m {
-            std::env::var("TOKEN_ID").unwrap_or_default()
-        } else {
-            std::env::var("TOKEN_ID").context("TOKEN_ID is required (or set AUTO_BTC5M=1)")?
-        };
-
-        let outcome_up = std::env::var("OUTCOME")
-            .map(|v| {
-                let low = v.to_lowercase();
-                low != "down" && low != "no"
-            })
-            .unwrap_or(true);
-
-        let trade_both_sides = std::env::var("OUTCOME")
-            .map(|v| v.to_lowercase() == "both")
-            .unwrap_or(false)
-            || std::env::var("TRADE_BOTH_SIDES")
-                .map(|v| {
-                    let low = v.to_lowercase();
-                    low == "1" || low == "true" || low == "yes"
-                })
-                .unwrap_or(false);
-
-        let order_size = parse_env_decimal("ORDER_SIZE", dec!(100))?;
-        let max_position = parse_env_decimal("MAX_POSITION", dec!(500))?;
-        let buy_min = normalize_price_to_zero_one(parse_env_decimal("BUY_MIN", dec!(0.93))?);
-        let buy_max = normalize_price_to_zero_one(parse_env_decimal("BUY_MAX", dec!(0.95))?);
-        let take_profit_trigger = normalize_price_to_zero_one(parse_env_decimal("TAKE_PROFIT", dec!(0.97))?);
-        let stop_loss_trigger = normalize_price_to_zero_one(parse_env_decimal("STOP_LOSS", dec!(0.90))?);
-
-        let dedupe_ttl_ms: u64 = std::env::var("DEDUPE_TTL_MS")
-            .unwrap_or_else(|_| "50".into())
-            .parse()
-            .context("Invalid DEDUPE_TTL_MS")?;
-
-        let stale_ms: u64 = std::env::var("STALE_THRESHOLD_MS")
-            .unwrap_or_else(|_| "200".into())
-            .parse()
-            .context("Invalid STALE_THRESHOLD_MS")?;
-
-        let clob_url = std::env::var("POLYMARKET_CLOB_URL")
-            .unwrap_or_else(|_| "https://clob.polymarket.com".into());
-
-        let min_delay_after_interval_start_sec: u64 = std::env::var("MIN_DELAY_AFTER_INTERVAL_START_SEC")
-            .unwrap_or_else(|_| "3".into())
-            .parse()
-            .unwrap_or(3);
-
-        let buy_order_min_age_ms: u64 = std::env::var("BUY_ORDER_MIN_AGE_MS")
-            .unwrap_or_else(|_| "2000".into())
-            .parse()
-            .unwrap_or(2000);
-
-        let order_sync_interval_ms: u64 = std::env::var("ORDER_SYNC_INTERVAL_MS")
-            .unwrap_or_else(|_| "200".into())
-            .parse()
-            .unwrap_or(200);
-
-        Ok(Self {
-            token_id,
-            auto_btc5m,
-            outcome_up,
-            trade_both_sides,
-            buy_min,
-            buy_max,
-            take_profit_trigger,
-            stop_loss_trigger,
-            order_size,
-            max_position,
-            dedupe_ttl: Duration::from_millis(dedupe_ttl_ms),
-            stale_threshold: Duration::from_millis(stale_ms),
-            clob_url,
-            min_delay_after_interval_start_sec,
-            buy_order_min_age_ms,
-            order_sync_interval_ms,
-        })
-    }
+fn env_decimal(key: &str, default: &str) -> Decimal {
+    Decimal::from_str(env(key, default).as_str()).unwrap_or_else(|_| Decimal::from_str(default).unwrap())
 }
 
-fn parse_env_decimal(key: &str, default: Decimal) -> Result<Decimal> {
-    match std::env::var(key) {
-        Ok(val) => val.parse().with_context(|| format!("Invalid {key}")),
-        Err(_) => Ok(default),
-    }
+fn env_u32(key: &str, default: u32) -> u32 {
+    env(key, &default.to_string()).parse().unwrap_or(default)
 }
 
-/// Normalize price to [0, 1]. If value > 1, treat as cents (e.g. 95 -> 0.95). Matches polybot normalizePriceToZeroOne.
-fn normalize_price_to_zero_one(v: Decimal) -> Decimal {
-    if v > dec!(1) {
-        (v / dec!(100)).min(dec!(1)).max(Decimal::ZERO)
+fn env_u64(key: &str, default: u64) -> u64 {
+    env(key, &default.to_string()).parse().unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    let v = env(key, if default { "true" } else { "false" });
+    v.to_lowercase() == "true" || v == "1"
+}
+
+/// Normalize price to 0..=1 (Polymarket probabilities). Values > 1 treated as cents (90 -> 0.9).
+fn normalize_price(v: Decimal) -> Decimal {
+    if v > Decimal::ONE {
+        (v / Decimal::from(100)).min(Decimal::ONE).max(Decimal::ZERO)
     } else {
-        v.min(dec!(1)).max(Decimal::ZERO)
+        v.min(Decimal::ONE).max(Decimal::ZERO)
     }
+}
+
+/// Current 5min interval start (unix). Polymarket slug uses interval start.
+pub fn current_5min_interval_start_unix() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    (now / BTC_5MIN_INTERVAL_SEC) * BTC_5MIN_INTERVAL_SEC
+}
+
+/// Current 5min interval end (close time).
+pub fn current_5min_interval_end_unix() -> u64 {
+    current_5min_interval_start_unix() + BTC_5MIN_INTERVAL_SEC
+}
+
+/// Slug prefix for asset.
+pub fn slug_prefix(asset: crate::types::IntervalMarketAsset) -> &'static str {
+    match asset {
+        crate::types::IntervalMarketAsset::Btc5m => "btc-updown-5m",
+        crate::types::IntervalMarketAsset::Sol5m => "sol-updown-5m",
+    }
+}
+
+/// Current 5min slug for asset (interval that is open now).
+pub fn current_5min_slug(asset: crate::types::IntervalMarketAsset) -> String {
+    format!("{}-{}", slug_prefix(asset), current_5min_interval_start_unix())
+}
+
+/// Load config from environment.
+pub fn load_config() -> Result<Config> {
+    let interval_market = crate::types::IntervalMarketAsset::from_str(
+        env("INTERVAL_SNIPER_MARKET", "btc_5m").as_str(),
+    );
+    let interval_market = interval_market.unwrap(); // FromStr Err is Infallible
+    let env_slug = env("MM_MARKET_SLUG", "");
+    let use_dynamic_slug = env_slug.is_empty() || env_slug == "btc-up-or-down-5-min";
+    let market_slug = if use_dynamic_slug {
+        current_5min_slug(interval_market)
+    } else {
+        env_slug
+    };
+
+    let order_strategy = match env("MM_ORDER_STRATEGY", "fak_cross_spread").to_lowercase().as_str() {
+        "gtc_resting" => OrderStrategy::GtcResting,
+        "fok_same_price" => OrderStrategy::FokSamePrice,
+        "fak_same_price" => OrderStrategy::FakSamePrice,
+        "cross_spread" => OrderStrategy::CrossSpread,
+        "fok_cross_spread" => OrderStrategy::FokCrossSpread,
+        "fak_cross_spread" => OrderStrategy::FakCrossSpread,
+        "market_fok" => OrderStrategy::MarketFok,
+        _ => OrderStrategy::FakCrossSpread,
+    };
+
+    let take_profit_tif = match env("MM_TAKE_PROFIT_TIME_IN_FORCE", "FAK").to_uppercase().as_str() {
+        "FOK" => SellOrderTimeInForce::Fok,
+        "FAK" => SellOrderTimeInForce::Fak,
+        _ => SellOrderTimeInForce::Gtc,
+    };
+    let stop_loss_tif = match env("MM_STOP_LOSS_TIME_IN_FORCE", "FAK").to_uppercase().as_str() {
+        "FOK" => SellOrderTimeInForce::Fok,
+        "FAK" => SellOrderTimeInForce::Fak,
+        _ => SellOrderTimeInForce::Gtc,
+    };
+
+    let loop_ms = env_u64("MM_LOOP_MS", 100).clamp(1, 500);
+    let cooldown_ms = env_u64("MM_COOLDOWN_MS", 2000).min(60000);
+    let auto_sell_pct = env_decimal("MM_AUTO_SELL_PROFIT_PERCENT", "5");
+    let auto_sell_pct = auto_sell_pct
+        .max(Decimal::from_str("0.1").unwrap_or(Decimal::ZERO))
+        .min(Decimal::from(100));
+    let stop_loss_pct = env_decimal("MM_STOP_LOSS_PERCENT", "7");
+    let stop_loss_pct = stop_loss_pct.max(Decimal::ONE).min(Decimal::from(50));
+    let take_profit_margin = env_decimal("MM_TAKE_PROFIT_PRICE_MARGIN", "0.01");
+    let take_profit_margin = take_profit_margin
+        .max(Decimal::ZERO)
+        .min(Decimal::from_str("0.05").unwrap_or(take_profit_margin));
+
+    Ok(Config {
+        interval_market,
+        market_slug: market_slug.clone(),
+        gamma_base_url: env("POLYMARKET_REST_BASE", "https://gamma-api.polymarket.com"),
+        seconds_before_close: env_u32("MM_SECONDS_BEFORE_CLOSE", DEFAULT_SECONDS_BEFORE_CLOSE),
+        size_usd: env_decimal("MM_SIZE_USD", DEFAULT_SIZE_USD),
+        min_buy_price: normalize_price(env_decimal("MM_MIN_BUY_PRICE", DEFAULT_MIN_BUY_PRICE)),
+        max_buy_price: normalize_price(env_decimal("MM_MAX_BUY_PRICE", DEFAULT_MAX_BUY_PRICE)),
+        allow_buy_up: env_bool("MM_ALLOW_BUY_UP", true),
+        allow_buy_down: env_bool("MM_ALLOW_BUY_DOWN", true),
+        min_btc_price_diff_usd: env_decimal("MM_MIN_BTC_PRICE_DIFF_USD", "0"),
+        dry_run: env_bool("MM_DRY_RUN", true),
+        order_strategy,
+        enable_auto_sell: env_bool("MM_ENABLE_AUTO_SELL", true),
+        auto_sell_profit_percent: auto_sell_pct,
+        auto_sell_at_max_price: env_bool("MM_AUTO_SELL_AT_MAX_PRICE", false),
+        auto_sell_quantity_percent: env_u32("MM_AUTO_SELL_QUANTITY_PERCENT", 100).clamp(1, 100) as u8,
+        take_profit_time_in_force: take_profit_tif,
+        enable_stop_loss: env_bool("MM_ENABLE_STOP_LOSS", true),
+        stop_loss_percent: stop_loss_pct,
+        stop_loss_quantity_percent: env_u32("MM_STOP_LOSS_QUANTITY_PERCENT", 100).clamp(1, 100) as u8,
+        stop_loss_time_in_force: stop_loss_tif,
+        loop_ms,
+        cooldown_between_orders_ms: cooldown_ms,
+        no_window_all_intervals: env_bool("MM_NO_WINDOW_ALL_INTERVALS", true),
+        min_seconds_after_market_open: env_u32("MM_MIN_SECONDS_AFTER_MARKET_OPEN", 0).min(300),
+        min_seconds_after_buy_before_auto_sell: env_u32("MM_MIN_SECONDS_AFTER_BUY_BEFORE_AUTO_SELL", 0).min(30),
+        take_profit_price_margin: take_profit_margin,
+    })
 }

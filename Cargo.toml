@@ -1,25 +1,28 @@
 [package]
 name = "sniper"
 version = "0.1.0"
-edition = "2024"
-
-[[bin]]
-name = "check_balance"
-path = "src/bin/check_balance.rs"
+edition = "2021"
+description = "Interval Sniper bot for Polymarket BTC/SOL 5m — buy in range, sell on TP/SL"
 
 [dependencies]
-polymarket-client-sdk = { version = "0.4", features = ["clob", "ws"] }
 tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-dotenvy = "0.15"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rust_decimal = "1"
-rust_decimal_macros = "1"
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-futures = "0.3"
-ruint = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rustls = { version = "0.23", features = ["aws_lc_rs"] }
-chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal_macros = "1"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+urlencoding = "2"
+async-trait = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# ethers = { version = "2", features = ["abigen", "ws"] }  # optional for EIP-712 live orders
+
+[[bin]]
+name = "sniper"
+path = "src/main.rs"

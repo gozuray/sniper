@@ -1,0 +1,347 @@
+//! Main loop: interval switch, top-of-book, buy in range, TP/SL.
+
+#[allow(unused_imports)]
+use crate::clob::{ClobClient, LimitOrderParams, OrderSide, OrderType};
+use crate::config::{current_5min_slug, load_config};
+use crate::market::fetch_market_by_slug;
+use crate::orderbook::fetch_top_of_book;
+use crate::types::{
+    Config, EntrySide, LastBuyOrder, PendingAutoSell, PendingStopLoss, ResolvedMarket, TopOfBook,
+};
+use anyhow::Result;
+use reqwest::Client;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
+use tracing::{info, warn};
+
+const TICK_SIZE: Decimal = dec!(0.01);
+const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
+
+struct RunnerState {
+    config: Config,
+    market: Option<ResolvedMarket>,
+    ordered_this_interval: bool,
+    total_spent_this_interval: Decimal,
+    last_buy_order: Option<LastBuyOrder>,
+    pending_auto_sell: Option<PendingAutoSell>,
+    pending_stop_loss: Option<PendingStopLoss>,
+    auto_sell_placed: bool,
+    stop_loss_placed: bool,
+    interval_switch_wall_time_ms: Option<u64>,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn seconds_to_close(now_unix: u64, close_time_unix: u64) -> u64 {
+    close_time_unix.saturating_sub(now_unix)
+}
+
+fn round_to_tick(price: Decimal) -> Decimal {
+    let ticks = (price / TICK_SIZE).round();
+    (ticks * TICK_SIZE).round_dp(2)
+}
+
+fn maker_amount_2_decimals(size: Decimal, price: Decimal) -> Decimal {
+    (size * price).round_dp(2)
+}
+
+fn size_4_decimals(size: Decimal) -> Decimal {
+    size.round_dp(4)
+}
+
+/// Choose entry side: Up or Down with higher best ask in [min_buy_price, max_buy_price], with min liquidity.
+fn choose_side(
+    config: &Config,
+    book: &TopOfBook,
+    min_order_size: Decimal,
+) -> Option<(EntrySide, Decimal, Decimal)> {
+    let up = book.token_id_up.as_ref()?;
+    let down = book.token_id_down.as_ref()?;
+    let up_ask = config.allow_buy_up.then(|| up.best_ask).flatten()?;
+    let down_ask = config.allow_buy_down.then(|| down.best_ask).flatten()?;
+    let up_size = up.best_ask_size.unwrap_or(Decimal::ZERO);
+    let down_size = down.best_ask_size.unwrap_or(Decimal::ZERO);
+
+    let in_range = |p: Decimal| p >= config.min_buy_price && p <= config.max_buy_price;
+
+    let mut candidates: Vec<(EntrySide, Decimal, Decimal)> = Vec::new();
+    if in_range(up_ask) && up_size >= min_order_size {
+        candidates.push((EntrySide::Up, up_ask, up_size));
+    }
+    if in_range(down_ask) && down_size >= min_order_size {
+        candidates.push((EntrySide::Down, down_ask, down_size));
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // higher price first
+    candidates.into_iter().next()
+}
+
+pub async fn run() -> Result<()> {
+    let config = load_config()?;
+    let clob_host = std::env::var("POLYMARKET_CLOB_HOST").unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+    let http = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let clob = Arc::new(crate::clob::create_clob_client(config.dry_run)?);
+
+    let mut state = RunnerState {
+        market: None,
+        config: config.clone(),
+        ordered_this_interval: false,
+        total_spent_this_interval: Decimal::ZERO,
+        last_buy_order: None,
+        pending_auto_sell: None,
+        pending_stop_loss: None,
+        auto_sell_placed: false,
+        stop_loss_placed: false,
+        interval_switch_wall_time_ms: None,
+    };
+
+    info!("[IntervalSniper] started dry_run={} slug={}", config.dry_run, config.market_slug);
+
+    let loop_ms = config.loop_ms;
+    let mut tick_count: u64 = 0;
+
+    loop {
+        tick_count += 1;
+        let now_u = now_unix();
+        let now_ms_u = now_ms();
+
+        // Refresh market if needed (interval switch)
+        let current_slug = current_5min_slug(config.interval_market);
+        let need_new_market = state.market.is_none()
+            || state.market.as_ref().map(|m| now_u >= m.close_time_unix).unwrap_or(true)
+            || state.market.as_ref().map(|m| current_slug != m.slug).unwrap_or(true);
+
+        if need_new_market {
+            match fetch_market_by_slug(&http, &config.gamma_base_url, &current_slug).await {
+                Ok(market) => {
+                    state.market = Some(market.clone());
+                    state.ordered_this_interval = false;
+                    state.total_spent_this_interval = Decimal::ZERO;
+                    state.last_buy_order = None;
+                    state.pending_auto_sell = None;
+                    state.pending_stop_loss = None;
+                    state.auto_sell_placed = false;
+                    state.stop_loss_placed = false;
+                    state.interval_switch_wall_time_ms = Some(now_ms_u);
+                    info!("[IntervalSniper] interval switch -> {}", market.slug);
+                }
+                Err(e) => {
+                    warn!("[IntervalSniper] fetch market failed: {}", e);
+                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                    continue;
+                }
+            }
+        }
+
+        let market = match &state.market {
+            Some(m) => m,
+            None => {
+                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                continue;
+            }
+        };
+
+        let secs_to_close = seconds_to_close(now_u, market.close_time_unix);
+
+        // Fetch top of book
+        let top = match fetch_top_of_book(
+            &http,
+            &clob_host,
+            &market.token_id_up,
+            &market.token_id_down,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                if tick_count % 20 == 0 {
+                    warn!("[IntervalSniper] order book fetch failed: {}", e);
+                }
+                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                continue;
+            }
+        };
+
+        // Stop loss: if pending and best_bid <= trigger_price -> sell
+        if state.config.enable_stop_loss {
+            if let Some(ref sl) = state.pending_stop_loss {
+                if !state.stop_loss_placed {
+                    let is_up = sl.token_id == market.token_id_up;
+                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
+                    let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                    if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
+                        let price = round_to_tick(best_bid);
+                        let size = size_4_decimals(sl.size.clone());
+                        let result = clob
+                            .place_sell_order(
+                                &sl.token_id,
+                                price,
+                                size,
+                                state.config.stop_loss_time_in_force,
+                            )
+                            .await?;
+                        if result.success {
+                            info!("[IntervalSniper] stop loss executed @ {}", price);
+                            state.stop_loss_placed = true;
+                        } else if let Some(msg) = result.error_msg {
+                            warn!("[IntervalSniper] stop loss failed: {}", msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Take profit: if pending and best_bid >= target_price -> sell
+        if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
+            if let Some(ref tp) = state.pending_auto_sell {
+                if !state.auto_sell_placed {
+                    let elapsed_sec = (now_ms_u - tp.placed_at_ms) / 1000;
+                    if elapsed_sec >= state.config.min_seconds_after_buy_before_auto_sell as u64 {
+                        let is_up = tp.token_id == market.token_id_up;
+                        let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
+                        let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                        let target = tp.target_price - state.config.take_profit_price_margin;
+                        if best_bid >= target {
+                            let price = round_to_tick(best_bid.min(target + state.config.take_profit_price_margin));
+                            let size = size_4_decimals(tp.size.clone());
+                            let result = clob
+                                .place_sell_order(
+                                    &tp.token_id,
+                                    price,
+                                    size,
+                                    state.config.take_profit_time_in_force,
+                                )
+                                .await?;
+                            if result.success {
+                                info!("[IntervalSniper] take profit executed @ {}", price);
+                                state.auto_sell_placed = true;
+                            } else if let Some(msg) = result.error_msg {
+                                warn!("[IntervalSniper] take profit failed: {}", msg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Buy path: one order per interval, in window, side with higher best ask in range
+        if !state.ordered_this_interval {
+            let in_window = state.config.no_window_all_intervals
+                || secs_to_close <= state.config.seconds_before_close as u64;
+            let sec_since_start = 300u64.saturating_sub(secs_to_close);
+            let min_after_open = state.config.min_seconds_after_market_open.max(3);
+            let can_buy_after_open = sec_since_start >= min_after_open as u64;
+            if let Some(switch_ms) = state.interval_switch_wall_time_ms {
+                let elapsed_ms = now_ms_u.saturating_sub(switch_ms);
+                if elapsed_ms < (min_after_open as u64) * 1000 {
+                    // Skip first N seconds after interval switch
+                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                    continue;
+                }
+            }
+
+            if in_window && can_buy_after_open {
+                let min_order_size = CLOB_DEFAULT_MIN_ORDER_SIZE;
+                if let Some((side, best_ask, size_available)) =
+                    choose_side(&state.config, &top, min_order_size)
+                {
+                    let token_id = match side {
+                        EntrySide::Up => &market.token_id_up,
+                        EntrySide::Down => &market.token_id_down,
+                    };
+                    let effective_price = round_to_tick(
+                        (best_ask + TICK_SIZE).min(state.config.max_buy_price),
+                    );
+                    let budget_left = state.config.size_usd - state.total_spent_this_interval;
+                    let size_by_budget = budget_left / effective_price;
+                    let size = size_4_decimals(
+                        size_by_budget.min(size_available).max(min_order_size),
+                    );
+                    let maker_amount = maker_amount_2_decimals(size.clone(), effective_price.clone());
+                    if maker_amount >= Decimal::from(1) && size >= min_order_size {
+                        let order_type = OrderType::Fak;
+                        let params = LimitOrderParams {
+                            token_id: token_id.to_string(),
+                            side: OrderSide::Buy,
+                            price: effective_price.clone(),
+                            size: size.clone(),
+                            expiration_unix: Some(market.close_time_unix),
+                            post_only: false,
+                            fee_rate_bps: None,
+                        };
+                        let result = clob.place_limit_order(params, order_type).await?;
+                        if result.success {
+                            state.ordered_this_interval = true;
+                            state.total_spent_this_interval += maker_amount;
+                            let entry_price = effective_price;
+                            let entry_side = side;
+                            state.last_buy_order = Some(LastBuyOrder {
+                                token_id: token_id.to_string(),
+                                side: entry_side,
+                                size: size.clone(),
+                                price: entry_price.clone(),
+                                timestamp_ms: now_ms_u,
+                            });
+                            let target_price = if state.config.auto_sell_at_max_price {
+                                dec!(0.99)
+                            } else {
+                                round_to_tick(
+                                    (entry_price * (Decimal::ONE + state.config.auto_sell_profit_percent / dec!(100)))
+                                        .min(Decimal::ONE),
+                                )
+                            };
+                            state.pending_auto_sell = Some(PendingAutoSell {
+                                token_id: token_id.to_string(),
+                                target_price,
+                                size: size.clone() * Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100),
+                                placed_at_ms: now_ms_u,
+                            });
+                            let trigger_price = round_to_tick(
+                                entry_price * (Decimal::ONE - state.config.stop_loss_percent / dec!(100)),
+                            );
+                            state.pending_stop_loss = Some(PendingStopLoss {
+                                token_id: token_id.to_string(),
+                                entry_price: entry_price.clone(),
+                                size: size * Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100),
+                                trigger_price,
+                                placed_at_ms: now_ms_u,
+                            });
+                            state.auto_sell_placed = false;
+                            state.stop_loss_placed = false;
+                            info!(
+                                "[IntervalSniper] buy {} @ {} size={}",
+                                match entry_side {
+                                    EntrySide::Up => "Up",
+                                    EntrySide::Down => "Down",
+                                },
+                                entry_price,
+                                size
+                            );
+                        } else if let Some(msg) = result.error_msg {
+                            if tick_count % 50 == 0 {
+                                warn!("[IntervalSniper] buy failed: {}", msg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+    }
+}
