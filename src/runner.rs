@@ -625,7 +625,7 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid until filled).
+        // Take profit: when best_bid >= trigger, sell. GTC: trigger = TP (order only then → no balance locked for SL), limit at entry price. FAK: trigger = TP−margin, cross at best_bid.
         // Always use position.token_id (the token we bought); sell_size = min(position.size, available).
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
             if let Some(ref tp) = state.pending_auto_sell {
@@ -643,8 +643,14 @@ pub async fn run() -> Result<()> {
                             .as_ref()
                             .and_then(|s| s.best_bid)
                             .unwrap_or(Decimal::ZERO);
+                        // GTC: only trigger when best_bid >= TP (no order before that → no balance locked for SL).
+                        // FAK/FOK: trigger when best_bid >= target (TP - margin).
                         let target = tp.target_price - state.config.take_profit_price_margin;
-                        if best_bid >= target {
+                        let trigger_price = match state.config.take_profit_time_in_force {
+                            crate::types::SellOrderTimeInForce::Gtc => tp.target_price,
+                            _ => target,
+                        };
+                        if best_bid >= trigger_price {
                             // Cancel any open orders for this token so balance is not locked (e.g. by a GTC SL order).
                             match clob.cancel_orders_for_token(&tp.token_id).await {
                                 Err(e) => warn!("[IntervalSniper] cancel orders before TP failed: {} (continuing with sell)", e),
@@ -683,9 +689,18 @@ pub async fn run() -> Result<()> {
                                     }
                                 }
                             };
-                            // SELL FAK must cross: use best_bid so order matches; avoid posting above bid.
+                            // GTC: limit at entry (buy) price so it fills automatically when bid already at TP.
+                            // FAK: cross at best_bid. FOK: at most target + margin.
                             let price = match state.config.take_profit_time_in_force {
                                 crate::types::SellOrderTimeInForce::Fak => round_to_tick(best_bid),
+                                crate::types::SellOrderTimeInForce::Gtc => {
+                                    let entry = state
+                                        .last_buy_order
+                                        .as_ref()
+                                        .map(|o| o.price)
+                                        .unwrap_or(best_bid);
+                                    round_to_tick(entry)
+                                }
                                 _ => round_to_tick(
                                     best_bid.min(target + state.config.take_profit_price_margin),
                                 ),
@@ -789,7 +804,7 @@ pub async fn run() -> Result<()> {
                                             .as_ref()
                                             .and_then(|s| s.best_bid)
                                             .unwrap_or(Decimal::ZERO);
-                                        if bid < target {
+                                        if bid < trigger_price {
                                             continue;
                                         }
                                         let position_size_real = tp.size.clone();
