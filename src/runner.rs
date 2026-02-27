@@ -25,7 +25,7 @@ struct RunnerState {
     config: Config,
     market: Option<ResolvedMarket>,
     ordered_this_interval: bool,
-    total_spent_this_interval: Decimal,
+    total_shares_this_interval: Decimal,
     last_buy_order: Option<LastBuyOrder>,
     pending_auto_sell: Option<PendingAutoSell>,
     pending_stop_loss: Option<PendingStopLoss>,
@@ -66,7 +66,29 @@ fn size_4_decimals(size: Decimal) -> Decimal {
 }
 
 fn fmt_price(p: Option<&Decimal>) -> String {
-    p.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
+    p.map(fmt_decimal_2).unwrap_or_else(|| "-".to_string())
+}
+
+/// Format a decimal with exactly 2 decimal places (e.g. 0.4 → "0.40", 10.5 → "10.50").
+fn fmt_decimal_2(d: &Decimal) -> String {
+    let r = d.round_dp(2);
+    let s = r.to_string();
+    if let Some((int_part, frac_part)) = s.split_once('.') {
+        let frac = if frac_part.len() > 2 {
+            &frac_part[..2]
+        } else {
+            frac_part
+        };
+        let frac_padded = format!("{:0<2}", frac);
+        format!("{}.{}", int_part, frac_padded)
+    } else {
+        format!("{}.00", s)
+    }
+}
+
+/// Format seconds for log: at least 2 digits with leading zero (e.g. 9 → "09", 209 → "209").
+fn fmt_secs(n: u64) -> String {
+    format!("{:02}", n)
 }
 
 /// Choose entry side: Up or Down with higher best ask in [min_buy_price, max_buy_price], with min liquidity.
@@ -107,7 +129,7 @@ pub async fn run() -> Result<()> {
         market: None,
         config: config.clone(),
         ordered_this_interval: false,
-        total_spent_this_interval: Decimal::ZERO,
+        total_shares_this_interval: Decimal::ZERO,
         last_buy_order: None,
         pending_auto_sell: None,
         pending_stop_loss: None,
@@ -138,7 +160,7 @@ pub async fn run() -> Result<()> {
                 Ok(market) => {
                     state.market = Some(market.clone());
                     state.ordered_this_interval = false;
-                    state.total_spent_this_interval = Decimal::ZERO;
+                    state.total_shares_this_interval = Decimal::ZERO;
                     state.last_buy_order = None;
                     state.pending_auto_sell = None;
                     state.pending_stop_loss = None;
@@ -199,18 +221,17 @@ pub async fn run() -> Result<()> {
                 fmt_price(up.and_then(|s| s.best_ask.as_ref())),
                 fmt_price(down.and_then(|s| s.best_bid.as_ref())),
                 fmt_price(down.and_then(|s| s.best_ask.as_ref())),
-                secs_to_close
+                fmt_secs(secs_to_close)
             );
             // When position open, log TP/SL monitoring so user sees we're checking for fills
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
                     let is_up = tp.token_id == market.token_id_up;
                     let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
-                    let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                     info!(
                         "[IntervalSniper] position open: TP target={} best_bid={} (sell when bid >= target)",
-                        tp.target_price,
-                        best_bid
+                        fmt_price(Some(&tp.target_price)),
+                        fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
                     );
                 }
             }
@@ -218,11 +239,10 @@ pub async fn run() -> Result<()> {
                 if !state.stop_loss_placed {
                     let is_up = sl.token_id == market.token_id_up;
                     let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
-                    let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                     info!(
                         "[IntervalSniper] position open: SL trigger={} best_bid={} (sell when bid <= trigger)",
-                        sl.trigger_price,
-                        best_bid
+                        fmt_price(Some(&sl.trigger_price)),
+                        fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
                     );
                 }
             }
@@ -247,7 +267,7 @@ pub async fn run() -> Result<()> {
                             )
                             .await?;
                         if result.success {
-                            info!("[IntervalSniper] stop loss executed @ {}", price);
+                            info!("[IntervalSniper] stop loss executed @ {}", fmt_price(Some(&price)));
                             state.stop_loss_placed = true;
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper] stop loss failed: {}", msg);
@@ -279,7 +299,7 @@ pub async fn run() -> Result<()> {
                                 )
                                 .await?;
                             if result.success {
-                                info!("[IntervalSniper] take profit executed @ {}", price);
+                                info!("[IntervalSniper] take profit executed @ {}", fmt_price(Some(&price)));
                                 state.auto_sell_placed = true;
                             } else if let Some(msg) = result.error_msg {
                                 warn!("[IntervalSniper] take profit failed: {}", msg);
@@ -318,27 +338,26 @@ pub async fn run() -> Result<()> {
                     let effective_price = round_to_tick(
                         (best_ask + TICK_SIZE).min(state.config.max_buy_price),
                     );
-                    let budget_left = state.config.size_usd - state.total_spent_this_interval;
-                    let size_by_budget = budget_left / effective_price;
+                    let shares_left = state.config.size_shares - state.total_shares_this_interval;
                     let size = size_4_decimals(
-                        size_by_budget.min(size_available).max(min_order_size),
+                        shares_left.min(size_available).max(min_order_size),
                     );
                     let maker_amount = maker_amount_2_decimals(size.clone(), effective_price.clone());
-                    if maker_amount >= Decimal::from(1) && size >= min_order_size {
+                    if size >= min_order_size && size > Decimal::ZERO {
                         let order_type = OrderType::Fak;
                         let params = LimitOrderParams {
                             token_id: token_id.to_string(),
                             side: OrderSide::Buy,
                             price: effective_price.clone(),
                             size: size.clone(),
-                            expiration_unix: Some(market.close_time_unix),
+                            expiration_unix: None,
                             post_only: false,
                             fee_rate_bps: None,
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
                             state.ordered_this_interval = true;
-                            state.total_spent_this_interval += maker_amount;
+                            state.total_shares_this_interval += size.clone();
                             let entry_price = effective_price;
                             let entry_side = side;
                             state.last_buy_order = Some(LastBuyOrder {
@@ -380,8 +399,8 @@ pub async fn run() -> Result<()> {
                                     EntrySide::Up => "Up",
                                     EntrySide::Down => "Down",
                                 },
-                                entry_price,
-                                size
+                                fmt_decimal_2(&entry_price),
+                                fmt_decimal_2(&size)
                             );
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper] buy failed: {}", msg);

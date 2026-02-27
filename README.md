@@ -23,7 +23,7 @@ Copy `.env.example` to `.env` and set at least:
 
 - **Gamma**: `POLYMARKET_REST_BASE` (e.g. `https://gamma-api.polymarket.com`)
 - **CLOB** (for order book; required for live orders): `POLYMARKET_CLOB_HOST` (e.g. `https://clob.polymarket.com`)
-- **Interval Sniper**: `MM_DRY_RUN=true` (recommended first), `MM_SIZE_USD`, `MM_MIN_BUY_PRICE`, `MM_MAX_BUY_PRICE`, `MM_ENABLE_AUTO_SELL`, `MM_AUTO_SELL_PROFIT_PERCENT`, `MM_ENABLE_STOP_LOSS`, `MM_STOP_LOSS_PERCENT`, etc.
+- **Interval Sniper**: `MM_DRY_RUN=true` (recommended first), `MM_SIZE_SHARES`, `MM_MIN_BUY_PRICE`, `MM_MAX_BUY_PRICE`, `MM_ENABLE_AUTO_SELL`, `MM_AUTO_SELL_PROFIT_PERCENT`, `MM_ENABLE_STOP_LOSS`, `MM_STOP_LOSS_PERCENT`, etc.
 
 Then:
 
@@ -41,7 +41,7 @@ Compatible with the TypeScript bot `MM_*` and `INTERVAL_SNIPER_*` names:
 |----------|-------------|---------|
 | `INTERVAL_SNIPER_MARKET` | `btc_5m` or `sol_5m` | `btc_5m` |
 | `MM_MARKET_SLUG` | Override slug (empty = current 5m) | (dynamic) |
-| `MM_SIZE_USD` | Max USD per interval | `5` |
+| `MM_SIZE_SHARES` | Max shares to buy per interval | `5` |
 | `MM_MIN_BUY_PRICE` | Min ask price to buy (0–1) | `0.9` |
 | `MM_MAX_BUY_PRICE` | Max ask price to buy (0–1) | `0.95` |
 | `MM_ALLOW_BUY_UP` / `MM_ALLOW_BUY_DOWN` | Allow buying Up/Down | `true` |

@@ -48,7 +48,7 @@ pub struct Config {
     pub market_slug: String,
     pub gamma_base_url: String,
     pub seconds_before_close: u32,
-    pub size_usd: Decimal,
+    pub size_shares: Decimal,
     pub min_buy_price: Decimal,
     pub max_buy_price: Decimal,
     pub allow_buy_up: bool,

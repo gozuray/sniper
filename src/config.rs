@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 const BTC_5MIN_INTERVAL_SEC: u64 = 300;
 const DEFAULT_SECONDS_BEFORE_CLOSE: u32 = 20;
-const DEFAULT_SIZE_USD: &str = "5";
+const DEFAULT_SIZE_SHARES: &str = "5";
 const DEFAULT_MIN_BUY_PRICE: &str = "0.9";
 const DEFAULT_MAX_BUY_PRICE: &str = "0.95";
 
@@ -118,7 +118,7 @@ pub fn load_config() -> Result<Config> {
         market_slug: market_slug.clone(),
         gamma_base_url: env("POLYMARKET_REST_BASE", "https://gamma-api.polymarket.com"),
         seconds_before_close: env_u32("MM_SECONDS_BEFORE_CLOSE", DEFAULT_SECONDS_BEFORE_CLOSE),
-        size_usd: env_decimal("MM_SIZE_USD", DEFAULT_SIZE_USD),
+        size_shares: env_decimal("MM_SIZE_SHARES", DEFAULT_SIZE_SHARES),
         min_buy_price: normalize_price(env_decimal("MM_MIN_BUY_PRICE", DEFAULT_MIN_BUY_PRICE)),
         max_buy_price: normalize_price(env_decimal("MM_MAX_BUY_PRICE", DEFAULT_MAX_BUY_PRICE)),
         allow_buy_up: env_bool("MM_ALLOW_BUY_UP", true),
