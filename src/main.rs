@@ -6,6 +6,7 @@ mod config;
 mod market;
 mod orderbook;
 mod runner;
+mod signing;
 mod types;
 
 #[tokio::main]

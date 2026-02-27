@@ -55,11 +55,18 @@ Compatible with the TypeScript bot `MM_*` and `INTERVAL_SNIPER_*` names:
 | `MM_STOP_LOSS_PERCENT` | SL % below entry | `7` |
 | `MM_LOOP_MS` | Loop interval (ms) | `100` |
 
-CLOB/Gamma (same as main polybot): `POLYMARKET_CLOB_HOST`, `POLYMARKET_REST_BASE`, and for live orders: `PRIVATE_KEY`, `API_KEY`, `SECRET`, `PASSPHRASE`, `POLYMARKET_CHAIN_ID`.
+CLOB/Gamma (same as main polybot): `POLYMARKET_CLOB_HOST` (or `POLYMARKET_CLOB_URL`), `POLYMARKET_REST_BASE`. For **live orders** set `MM_DRY_RUN=false` and:
+
+- `PRIVATE_KEY` or `POLYMARKET_PRIVATE_KEY` — wallet private key (hex, with or without `0x`)
+- `API_KEY`, `SECRET`, `PASSPHRASE` — CLOB API credentials (from Polymarket L1 derive)
+- `POLYMARKET_CHAIN_ID` — e.g. `137` (Polygon)
+- `FUNDER_ADDRESS` — address that holds funds (proxy/Safe); defaults to signer if unset
+- `SIGNATURE_TYPE` — `0` EOA, `1` POLY_PROXY, `2` GNOSIS_SAFE (default `2`)
+- `MM_NEG_RISK` — `true` for multi-outcome (neg-risk) markets; default `false` for BTC/SOL 5m
 
 ## Live orders
 
-**Live order placement is not implemented in this Rust binary** (EIP-712 signing for the CLOB is required). Use **`MM_DRY_RUN=true`** to run the same logic in simulation, or use the **TypeScript Interval Sniper** (Next.js app) for real orders.
+**Live order placement is implemented** in this Rust binary: EIP-712 order signing and HMAC L2 auth for the Polymarket CLOB. Set `MM_DRY_RUN=false` and configure `PRIVATE_KEY` (or `POLYMARKET_PRIVATE_KEY`), `API_KEY`, `SECRET`, `PASSPHRASE`, and optionally `FUNDER_ADDRESS` and `SIGNATURE_TYPE`. Use **`MM_DRY_RUN=true`** to run in simulation without sending real orders.
 
 ## Reference
 

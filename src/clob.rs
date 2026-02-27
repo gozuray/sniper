@@ -1,9 +1,14 @@
-//! CLOB client: place/cancel orders. Dry-run implementation logs only; live requires EIP-712 signing.
+//! CLOB client: place/cancel orders. Dry-run implementation logs only; live uses EIP-712 signing + HMAC L2.
 
+use crate::signing::{parse_token_id, build_poly_hmac, sign_order, EXCHANGE_ADDRESS_POLYGON, NEG_RISK_EXCHANGE_POLYGON};
 use crate::types::SellOrderTimeInForce;
 use anyhow::{Context, Result};
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::H160;
 use rust_decimal::Decimal;
-use std::time::Duration;
+use rust_decimal_macros::dec;
+use std::str::FromStr;
+use std::time::{Duration, UNIX_EPOCH};
 use tracing::info;
 
 /// Order type for placement.
@@ -115,41 +120,155 @@ impl ClobClient for DryRunClob {
     }
 }
 
-/// Live CLOB client (HMAC auth + EIP-712 signing). Placeholder: returns error for now.
-/// To enable live orders: implement EIP-712 order signing (see Polymarket docs) and POST /order.
+/// Live CLOB client: EIP-712 order signing + HMAC L2 auth.
 pub struct LiveClob {
-    _clob_host: String,
-    _private_key: String,
-    _api_key: String,
-    _api_secret: String,
-    _api_passphrase: String,
+    clob_host: String,
+    wallet: LocalWallet,
+    api_key: String,
+    api_secret: String,
+    api_passphrase: String,
     chain_id: u64,
-    _client: reqwest::Client,
+    funder: H160,
+    signature_type: u8,
+    neg_risk: bool,
+    client: reqwest::Client,
 }
 
 impl LiveClob {
     pub fn from_env() -> Result<Self> {
         let clob_host = std::env::var("POLYMARKET_CLOB_HOST")
+            .or_else(|_| std::env::var("POLYMARKET_CLOB_URL"))
             .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
-        let private_key = std::env::var("PRIVATE_KEY").context("PRIVATE_KEY required for live CLOB")?;
+        let pk = std::env::var("PRIVATE_KEY")
+            .or_else(|_| std::env::var("POLYMARKET_PRIVATE_KEY"))
+            .context("PRIVATE_KEY or POLYMARKET_PRIVATE_KEY required for live CLOB")?;
+        let wallet = pk
+            .trim()
+            .strip_prefix("0x")
+            .unwrap_or(pk.trim())
+            .parse::<LocalWallet>()
+            .context("Invalid PRIVATE_KEY")?;
         let api_key = std::env::var("API_KEY").context("API_KEY required")?;
-        let api_secret = std::env::var("SECRET").or_else(|_| std::env::var("API_SECRET")).context("SECRET or API_SECRET required")?;
-        let api_passphrase = std::env::var("PASSPHRASE").or_else(|_| std::env::var("API_PASSPHRASE")).context("PASSPHRASE required")?;
+        let api_secret = std::env::var("SECRET")
+            .or_else(|_| std::env::var("API_SECRET"))
+            .context("SECRET or API_SECRET required")?;
+        let api_passphrase = std::env::var("PASSPHRASE")
+            .or_else(|_| std::env::var("API_PASSPHRASE"))
+            .context("PASSPHRASE required")?;
         let chain_id: u64 = std::env::var("POLYMARKET_CHAIN_ID")
             .unwrap_or_else(|_| "137".to_string())
             .parse()
             .unwrap_or(137);
+        let funder_str = std::env::var("FUNDER_ADDRESS").unwrap_or_else(|_| {
+            format!("{:?}", wallet.address()).trim_matches('"').to_string()
+        });
+        let funder = funder_str
+            .trim()
+            .strip_prefix("0x")
+            .unwrap_or(funder_str.trim())
+            .parse::<H160>()
+            .context("Invalid FUNDER_ADDRESS")?;
+        let signature_type: u8 = std::env::var("SIGNATURE_TYPE")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse()
+            .unwrap_or(2);
+        let neg_risk = std::env::var("MM_NEG_RISK")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
         Ok(Self {
-            _clob_host: clob_host.trim_end_matches('/').to_string(),
-            _private_key: private_key,
-            _api_key: api_key,
-            _api_secret: api_secret,
-            _api_passphrase: api_passphrase,
+            clob_host: clob_host.trim_end_matches('/').to_string(),
+            wallet,
+            api_key,
+            api_secret,
+            api_passphrase,
             chain_id,
-            _client: client,
+            funder,
+            signature_type,
+            neg_risk,
+            client,
+        })
+    }
+
+    fn maker_taker_amounts_6dec(
+        &self,
+        side: OrderSide,
+        price: &Decimal,
+        size: &Decimal,
+    ) -> Result<(ethers::types::U256, ethers::types::U256)> {
+        let six = dec!(1000000);
+        let (maker_human, taker_human) = match side {
+            OrderSide::Buy => (size * price, *size),
+            OrderSide::Sell => (*size, size * price),
+        };
+        let maker = (maker_human * six).trunc();
+        let taker = (taker_human * six).trunc();
+        let maker_u = ethers::types::U256::from_dec_str(&maker.to_string()).context("maker amount")?;
+        let taker_u = ethers::types::U256::from_dec_str(&taker.to_string()).context("taker amount")?;
+        Ok((maker_u, taker_u))
+    }
+
+    async fn post_order(
+        &self,
+        order_type: &str,
+        order_json: &serde_json::Value,
+    ) -> Result<PlaceOrderResult> {
+        let path = "/order";
+        let body = serde_json::json!({
+            "order": order_json,
+            "owner": self.api_key,
+            "orderType": order_type,
+            "deferExec": false
+        });
+        let body_str = body.to_string();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = build_poly_hmac(
+            &self.api_secret,
+            timestamp,
+            "POST",
+            path,
+            Some(&body_str),
+        )?;
+        let url = format!("{}{}", self.clob_host, path);
+        let signer_addr = format!("{:?}", self.wallet.address()).trim_matches('"').to_string();
+        let res = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_ADDRESS", &signer_addr)
+            .header("POLY_SIGNATURE", &sig)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .body(body_str)
+            .send()
+            .await?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let success = json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        let order_id = json.get("orderID").and_then(|v| v.as_str()).map(String::from);
+        let error_msg = json
+            .get("errorMsg")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if !status.is_success() {
+            return Ok(PlaceOrderResult {
+                order_id,
+                success: false,
+                error_msg: Some(format!("HTTP {}: {}", status, text.chars().take(200).collect::<String>())),
+            });
+        }
+        Ok(PlaceOrderResult {
+            order_id,
+            success,
+            error_msg,
         })
     }
 }
@@ -159,23 +278,79 @@ impl ClobClient for LiveClob {
     async fn place_limit_order(
         &self,
         params: LimitOrderParams,
-        _order_type: OrderType,
+        order_type: OrderType,
     ) -> Result<PlaceOrderResult> {
-        let _ = (params, self.chain_id);
-        // EIP-712 signing and POST /order would go here. Polymarket expects:
-        // - Build order payload (maker, signer, taker, tokenId, price, size, side, expiration, nonce, feeRateBps, ...)
-        // - Sign with EIP-712 typed data (domain + order struct)
-        // - POST to {clob_host}/order with HMAC auth headers (API_KEY, SIGNATURE, TIMESTAMP, PASSPHRASE)
-        // For now return a clear error so users use dry_run or the TypeScript bot for live orders.
-        Ok(PlaceOrderResult {
-            order_id: None,
-            success: false,
-            error_msg: Some(
-                "Live order placement not implemented in Rust (EIP-712 signing required). \
-                 Use MM_DRY_RUN=true to run in simulation, or use the TypeScript Interval Sniper for live orders."
-                    .to_string(),
-            ),
-        })
+        let (maker_amount, taker_amount) =
+            self.maker_taker_amounts_6dec(params.side, &params.price, &params.size)?;
+        let token_id = parse_token_id(&params.token_id)?;
+        let signer_addr = format!("0x{:x}", self.wallet.address());
+        let taker = H160::from_str("0x0000000000000000000000000000000000000000").unwrap();
+        let expiration = params.expiration_unix.unwrap_or(0);
+        let nonce = 0u64;
+        let fee_rate_bps = params.fee_rate_bps.unwrap_or(0);
+        let side = match params.side {
+            OrderSide::Buy => 0u8,
+            OrderSide::Sell => 1u8,
+        };
+        let salt = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let exchange_addr = if self.neg_risk {
+            NEG_RISK_EXCHANGE_POLYGON
+        } else {
+            EXCHANGE_ADDRESS_POLYGON
+        };
+        let verifying = H160::from_str(exchange_addr).unwrap();
+        let signature = sign_order(
+            &self.wallet,
+            self.chain_id,
+            verifying,
+            salt,
+            self.funder,
+            self.wallet.address(),
+            taker,
+            token_id,
+            maker_amount,
+            taker_amount,
+            expiration,
+            nonce,
+            fee_rate_bps,
+            side,
+            self.signature_type,
+        )
+        .await?;
+        let order_json = serde_json::json!({
+            "maker": format!("0x{:x}", self.funder),
+            "signer": &signer_addr,
+            "taker": "0x0000000000000000000000000000000000000000",
+            "tokenId": params.token_id,
+            "makerAmount": maker_amount.to_string(),
+            "takerAmount": taker_amount.to_string(),
+            "side": if params.side == OrderSide::Buy { "BUY" } else { "SELL" },
+            "expiration": expiration.to_string(),
+            "nonce": nonce.to_string(),
+            "feeRateBps": fee_rate_bps.to_string(),
+            "signature": signature,
+            "salt": salt,
+            "signatureType": self.signature_type
+        });
+        let order_type_str = match order_type {
+            OrderType::Gtc => "GTC",
+            OrderType::Gtd => "GTD",
+            OrderType::Fok => "FOK",
+            OrderType::Fak => "FAK",
+        };
+        let result = self.post_order(order_type_str, &order_json).await?;
+        if result.success {
+            info!(
+                "[LiveClob] order placed order_id={:?}",
+                result.order_id
+            );
+        } else if let Some(ref msg) = result.error_msg {
+            info!("[LiveClob] order failed: {}", msg);
+        }
+        Ok(result)
     }
 }
 
