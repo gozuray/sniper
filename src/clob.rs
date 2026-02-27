@@ -26,6 +26,8 @@ pub struct PlaceOrderResult {
     pub order_id: Option<String>,
     pub success: bool,
     pub error_msg: Option<String>,
+    /// Filled size in shares (from API takingAmount when matched). Use this for TP/SL so we sell 100% of what was actually bought.
+    pub filled_size: Option<Decimal>,
 }
 
 /// Parameters for a limit order.
@@ -116,6 +118,7 @@ impl ClobClient for DryRunClob {
             order_id: Some("dry-run".to_string()),
             success: true,
             error_msg: None,
+            filled_size: Some(params.size),
         })
     }
 }
@@ -214,6 +217,8 @@ impl LiveClob {
         &self,
         order_type: &str,
         order_json: &serde_json::Value,
+        side: OrderSide,
+        price: Option<Decimal>,
     ) -> Result<PlaceOrderResult> {
         let path = "/order";
         let body = serde_json::json!({
@@ -263,12 +268,27 @@ impl LiveClob {
                 order_id,
                 success: false,
                 error_msg: Some(format!("HTTP {}: {}", status, text.chars().take(200).collect::<String>())),
+                filled_size: None,
             });
         }
+        // Parse filled size from API: takingAmount is in 6 decimals. For BUY = shares filled; for SELL = (size*price) so size = takingAmount/1e6/price.
+        let filled_size = json
+            .get("takingAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str(s).ok())
+            .map(|taker_6dec| {
+                let human = taker_6dec / dec!(1000000);
+                match (side, price) {
+                    (OrderSide::Buy, _) => human,
+                    (OrderSide::Sell, Some(p)) if !p.is_zero() => human / p,
+                    _ => human,
+                }
+            });
         Ok(PlaceOrderResult {
             order_id,
             success,
             error_msg,
+            filled_size,
         })
     }
 }
@@ -349,7 +369,9 @@ impl ClobClient for LiveClob {
             OrderType::Fok => "FOK",
             OrderType::Fak => "FAK",
         };
-        let result = self.post_order(order_type_str, &order_json).await?;
+        let result = self
+            .post_order(order_type_str, &order_json, params.side, Some(params.price))
+            .await?;
         if result.success {
             info!(
                 "[LiveClob] order placed order_id={:?}",

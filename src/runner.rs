@@ -288,7 +288,7 @@ pub async fn run() -> Result<()> {
                     let is_up = tp.token_id == market.token_id_up;
                     let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
                     info!(
-                        "[IntervalSniper] position open: TP target={} best_bid={} (sell when bid >= target)",
+                        "[IntervalSniper]  POS   TP   target={}  best_bid={}  (sell when bid >= target)",
                         fmt_price(Some(&tp.target_price)),
                         fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
                     );
@@ -299,7 +299,7 @@ pub async fn run() -> Result<()> {
                     let is_up = sl.token_id == market.token_id_up;
                     let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
                     info!(
-                        "[IntervalSniper] position open: SL trigger={} best_bid={} (sell when bid <= trigger)",
+                        "[IntervalSniper]  POS   SL   trigger={}  best_bid={}  (sell when bid <= trigger)",
                         fmt_price(Some(&sl.trigger_price)),
                         fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
                     );
@@ -326,7 +326,10 @@ pub async fn run() -> Result<()> {
                             )
                             .await?;
                         if result.success {
-                            info!("[IntervalSniper] stop loss executed @ {}", fmt_price(Some(&price)));
+                            info!(
+                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss)",
+                                fmt_price(Some(&price))
+                            );
                             state.stop_loss_placed = true;
                         } else {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
@@ -367,23 +370,27 @@ pub async fn run() -> Result<()> {
                                         )
                                         .await?;
                                     if result_retry.success {
-                                        info!("[IntervalSniper] stop loss executed @ {} (attempt {})", fmt_price(Some(&price_retry)), attempt + 1);
+                                        info!(
+                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {})",
+                                            fmt_price(Some(&price_retry)),
+                                            attempt + 1
+                                        );
                                         state.stop_loss_placed = true;
                                         filled = true;
                                         break;
                                     }
                                     if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
                                         if let Some(msg) = result_retry.error_msg {
-                                            warn!("[IntervalSniper] stop loss failed: {}", msg);
+                                warn!("[IntervalSniper]  FAIL  SL    {}", msg);
                                         }
                                         break;
                                     }
                                 }
                                 if !filled {
-                                    warn!("[IntervalSniper] stop loss FAK retries exhausted, will retry next tick");
+                                    warn!("[IntervalSniper]  WARN  SL    FAK retries exhausted, will retry next tick");
                                 }
                             } else if let Some(msg) = result.error_msg {
-                                warn!("[IntervalSniper] stop loss failed: {}", msg);
+                                    warn!("[IntervalSniper]  FAIL  SL    {}", msg);
                             }
                         }
                     }
@@ -413,7 +420,10 @@ pub async fn run() -> Result<()> {
                                 )
                                 .await?;
                             if result.success {
-                                info!("[IntervalSniper] take profit executed @ {}", fmt_price(Some(&price)));
+                                info!(
+                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit)",
+                                    fmt_price(Some(&price))
+                                );
                                 state.auto_sell_placed = true;
                             } else {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
@@ -454,23 +464,27 @@ pub async fn run() -> Result<()> {
                                             )
                                             .await?;
                                         if result_retry.success {
-                                            info!("[IntervalSniper] take profit executed @ {} (attempt {})", fmt_price(Some(&price_retry)), attempt + 1);
+                                            info!(
+                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {})",
+                                                fmt_price(Some(&price_retry)),
+                                                attempt + 1
+                                            );
                                             state.auto_sell_placed = true;
                                             filled = true;
                                             break;
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
                                             if let Some(msg) = result_retry.error_msg {
-                                                warn!("[IntervalSniper] take profit failed: {}", msg);
+                                                    warn!("[IntervalSniper]  FAIL  TP    {}", msg);
                                             }
                                             break;
                                         }
                                     }
                                     if !filled {
-                                        warn!("[IntervalSniper] take profit FAK retries exhausted, will retry next tick");
+                                        warn!("[IntervalSniper]  WARN  TP    FAK retries exhausted, will retry next tick");
                                     }
                                 } else if let Some(msg) = result.error_msg {
-                                    warn!("[IntervalSniper] take profit failed: {}", msg);
+                                        warn!("[IntervalSniper]  FAIL  TP    {}", msg);
                                 }
                             }
                         }
@@ -525,14 +539,19 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
+                            // Use actual filled size from API when available (FAK can fill more/less than requested)
+                            let filled = result
+                                .filled_size
+                                .filter(|s| *s > Decimal::ZERO)
+                                .unwrap_or(size.clone());
                             state.ordered_this_interval = true;
-                            state.total_shares_this_interval += size.clone();
+                            state.total_shares_this_interval += filled.clone();
                             let entry_price = effective_price;
                             let entry_side = side;
                             state.last_buy_order = Some(LastBuyOrder {
                                 token_id: token_id.to_string(),
                                 side: entry_side,
-                                size: size.clone(),
+                                size: filled.clone(),
                                 price: entry_price.clone(),
                                 timestamp_ms: now_ms_u,
                             });
@@ -547,7 +566,7 @@ pub async fn run() -> Result<()> {
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.to_string(),
                                 target_price,
-                                size: size.clone() * Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100),
+                                size: filled.clone() * Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100),
                                 placed_at_ms: now_ms_u,
                             });
                             let trigger_price = round_to_tick(
@@ -556,23 +575,24 @@ pub async fn run() -> Result<()> {
                             state.pending_stop_loss = Some(PendingStopLoss {
                                 token_id: token_id.to_string(),
                                 entry_price: entry_price.clone(),
-                                size: size * Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100),
+                                size: filled * Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100),
                                 trigger_price,
                                 placed_at_ms: now_ms_u,
                             });
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
+                            let side_str = match entry_side {
+                                EntrySide::Up => "Up  ",
+                                EntrySide::Down => "Down",
+                            };
                             info!(
-                                "[IntervalSniper] buy {} @ {} size={}",
-                                match entry_side {
-                                    EntrySide::Up => "Up",
-                                    EntrySide::Down => "Down",
-                                },
+                                "[IntervalSniper]  BUY   {}  @ {}   size={}",
+                                side_str,
                                 fmt_decimal_2(&entry_price),
-                                fmt_decimal_2(&size)
+                                fmt_decimal_2(&state.last_buy_order.as_ref().unwrap().size)
                             );
                         } else if let Some(msg) = result.error_msg {
-                            warn!("[IntervalSniper] buy failed: {}", msg);
+                            warn!("[IntervalSniper]  FAIL  BUY   {}", msg);
                         }
                     }
                 }
