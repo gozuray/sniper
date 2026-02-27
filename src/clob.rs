@@ -232,6 +232,7 @@ impl LiveClob {
     }
 
     /// API requires: sell orders — maker amount max 2 decimals, taker amount max 4 decimals.
+    /// For SELL we use floor for maker (shares) so we never round up and exceed balance (e.g. 4.9965 -> 4.99 not 5.00).
     fn maker_taker_amounts_6dec(
         &self,
         side: OrderSide,
@@ -241,8 +242,11 @@ impl LiveClob {
         let six = dec!(1000000);
         let (maker_human, taker_human) = match side {
             OrderSide::Buy => (size * price, *size),
-            // SELL: maker = size (shares) max 2 decimals, taker = size*price max 4 decimals
-            OrderSide::Sell => (size.round_dp(2), (size * price).round_dp(4)),
+            // SELL: maker = size (shares) max 2 decimals — floor so we never request more than balance
+            OrderSide::Sell => (
+                ((*size * dec!(100)).trunc() / dec!(100)),
+                (size * price).round_dp(4),
+            ),
         };
         let maker = (maker_human * six).trunc();
         let taker = (taker_human * six).trunc();
