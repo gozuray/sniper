@@ -450,16 +450,18 @@ pub async fn run() -> Result<()> {
                                 );
                                 state.auto_sell_placed = true;
                                 state.stop_loss_placed = true; // SL no longer needed, position closed
-                            } else if is_position_closed_error(result.error_msg.as_deref()) {
-                                info!("[IntervalSniper] take profit: position already closed (no balance/allowance), stopping");
-                                state.auto_sell_placed = true;
-                                state.stop_loss_placed = true; // don't try SL either
                             } else {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                     m.contains("no orders found to match") || m.contains("FAK") || m.contains("FOK")
                                 });
-                                if is_no_match {
-                                    info!("[IntervalSniper] take profit no match, retrying FAK at latest bid until liquidated");
+                                // On balance/allowance error do NOT assume position closed: retry at best bid (same as SL)
+                                let is_balance_error = is_position_closed_error(result.error_msg.as_deref());
+                                if is_no_match || is_balance_error {
+                                    if is_balance_error {
+                                        info!("[IntervalSniper] take profit: balance/allowance error, retrying at best bid until sold");
+                                    } else {
+                                        info!("[IntervalSniper] take profit no match, retrying FAK at latest bid until liquidated");
+                                    }
                                     let mut filled = false;
                                     for attempt in 0..FAK_MAX_RETRIES {
                                         tokio::time::sleep(Duration::from_millis(FAK_RETRY_DELAY_MS)).await;
@@ -503,11 +505,10 @@ pub async fn run() -> Result<()> {
                                             filled = true;
                                             break;
                                         }
+                                        // Do NOT treat balance/allowance as position closed: keep retrying at best bid until sold
                                         if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                            info!("[IntervalSniper] take profit: position already closed (no balance/allowance), stopping");
-                                            state.auto_sell_placed = true;
-                                            state.stop_loss_placed = true;
-                                            break;
+                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error, will retry next attempt/tick", attempt + 1);
+                                            continue;
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| !m.contains("no orders found to match")) {
                                             if let Some(msg) = result_retry.error_msg {
