@@ -25,7 +25,7 @@ const LOG_BOOK_EVERY_TICKS: u64 = 10;
 const FAK_RETRY_DELAY_MS: u64 = 30;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
-/// Sell size precision to avoid sending oversell due to rounding.
+/// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
@@ -899,16 +899,22 @@ pub async fn run() -> Result<()> {
                             } else {
                                 round_to_tick(state.config.take_profit_price)
                             };
-                            // TP/SL size must be > 0 or API rejects; use at least 0.0001, never exceed filled, and cap at total share size from .env (MM_SIZE_SHARES)
+                            // Use actual bought quantity (filled), adjusted to Polymarket sell size decimals (4).
+                            let base_sell_size = floor_to_decimals(
+                                filled.clone().min(state.config.size_shares),
+                                SELL_SIZE_DECIMALS,
+                            )
+                            .max(MIN_SELL_SIZE);
                             let pct_tp =
                                 Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
                             let pct_sl =
                                 Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
-                            let max_sell = state.config.size_shares.min(filled.clone());
-                            let tp_size = (filled.clone() * pct_tp)
-                                .max(dec!(0.0001))
-                                .min(max_sell.clone());
-                            let sl_size = (filled.clone() * pct_sl).max(dec!(0.0001)).min(max_sell);
+                            let tp_size = floor_to_decimals(base_sell_size * pct_tp, SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(base_sell_size);
+                            let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(base_sell_size);
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.to_string(),
                                 target_price,
@@ -930,10 +936,14 @@ pub async fn run() -> Result<()> {
                                 EntrySide::Down => "Down",
                             };
                             info!(
-                                "[IntervalSniper]  BUY   {}  @ {}   size={}",
+                                "[IntervalSniper]  BUY   {}  @ {}   size={}   TP size={} ({}%)   SL size={} ({}%)",
                                 side_str,
                                 fmt_decimal_2(&entry_price),
-                                fmt_decimal_2(&state.last_buy_order.as_ref().unwrap().size)
+                                fmt_decimal_2(&state.last_buy_order.as_ref().unwrap().size),
+                                fmt_decimal_2(&tp_size),
+                                state.config.auto_sell_quantity_percent,
+                                fmt_decimal_2(&sl_size),
+                                state.config.stop_loss_quantity_percent
                             );
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper]  FAIL  BUY   {}", msg);
