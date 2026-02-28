@@ -241,8 +241,12 @@ impl LiveClob {
         let six = dec!(1000000);
         let (maker_human, taker_human) = match side {
             OrderSide::Buy => (size * price, *size),
-            // SELL: maker = size (shares) max 2 decimals, taker = size*price max 4 decimals
-            OrderSide::Sell => (size.round_dp(2), (size * price).round_dp(4)),
+            // SELL: maker = size (shares) max 2 decimals; use floor so we never round up and exceed balance.
+            OrderSide::Sell => {
+                let factor = dec!(100);
+                let size_2d = ((size * factor).trunc()) / factor;
+                (size_2d, (size_2d * price).round_dp(4))
+            }
         };
         let maker = (maker_human * six).trunc();
         let taker = (taker_human * six).trunc();
