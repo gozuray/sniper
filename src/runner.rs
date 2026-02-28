@@ -1271,7 +1271,7 @@ pub async fn run() -> Result<()> {
             let in_window = state.config.no_window_all_intervals
                 || secs_to_close <= state.config.seconds_before_close as u64;
             let sec_since_start = 300u64.saturating_sub(secs_to_close);
-            let min_after_open = state.config.min_seconds_after_market_open.max(3);
+            let min_after_open = state.config.min_seconds_after_market_open;
             let can_buy_after_open = sec_since_start >= min_after_open as u64;
             if let Some(switch_ms) = state.interval_switch_wall_time_ms {
                 let elapsed_ms = now_ms_u.saturating_sub(switch_ms);
