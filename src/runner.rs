@@ -34,6 +34,10 @@ const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 const MIN_SELL_SIZE_MAKER: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
+/// Poll interval (ms) when waiting for CLOB balance to appear after buy.
+const BALANCE_CONFIRM_POLL_MS: u64 = 1000;
+/// Max time (s) to wait for balance confirmation before giving up.
+const BALANCE_CONFIRM_MAX_SECS: u32 = 60;
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -427,6 +431,14 @@ pub async fn run() -> Result<()> {
                                     "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
                                     available
                                 );
+                                info!(
+                                    "[IntervalSniper] SL token check — selling token_id={}   market Down={}   market Up={}   match_down={}   match_up={}",
+                                    sl.token_id,
+                                    market.token_id_down,
+                                    market.token_id_up,
+                                    sl.token_id == market.token_id_down,
+                                    sl.token_id == market.token_id_up
+                                );
                                 state.stop_loss_placed = true;
                                 state.auto_sell_placed = true;
                                 state.pending_auto_sell = None;
@@ -439,6 +451,13 @@ pub async fn run() -> Result<()> {
                             info!(
                                 "[IntervalSniper] SL balance 0/dust after cancel retries; attempting sell with position size {} (API may be stale)",
                                 fmt_decimal_2(&fallback_size)
+                            );
+                            info!(
+                                "[IntervalSniper] SL token check — selling token_id={}   market_slug={}   market Down={}   match_down={}",
+                                sl.token_id,
+                                market.slug,
+                                market.token_id_down,
+                                sl.token_id == market.token_id_down
                             );
                             available = Some(fallback_size.clone());
                         }
@@ -864,6 +883,13 @@ pub async fn run() -> Result<()> {
                             if balance_zero_or_dust(available.clone()) {
                                 info!(
                                     "[IntervalSniper] TP position already closed (balance 0 or dust), stopping — continue scanning book"
+                                );
+                                info!(
+                                    "[IntervalSniper] TP token check — selling token_id={}   market_slug={}   market Down={}   match_down={}",
+                                    tp.token_id,
+                                    market.slug,
+                                    market.token_id_down,
+                                    tp.token_id == market.token_id_down
                                 );
                                 state.auto_sell_placed = true;
                                 state.stop_loss_placed = true;
@@ -1381,6 +1407,45 @@ pub async fn run() -> Result<()> {
                                 fmt_decimal_2(&sl_size),
                                 state.config.stop_loss_quantity_percent
                             );
+                            info!(
+                                "[IntervalSniper]  BUY   token_id for TP/SL={}   market_slug={}",
+                                &state.pending_stop_loss.as_ref().unwrap().token_id,
+                                market.slug
+                            );
+                            // Spawn background task to poll CLOB balance every 1s and log when confirmed (with elapsed ms).
+                            if !state.config.dry_run {
+                                let clob_balance = Arc::clone(&clob);
+                                let token_id_balance = state.pending_stop_loss.as_ref().unwrap().token_id.clone();
+                                let filled_balance = filled.clone();
+                                let buy_ts_ms = now_ms_u;
+                                tokio::spawn(async move {
+                                    let mut attempt = 0u32;
+                                    let max_attempts = BALANCE_CONFIRM_MAX_SECS;
+                                    while attempt < max_attempts {
+                                        tokio::time::sleep(Duration::from_millis(BALANCE_CONFIRM_POLL_MS)).await;
+                                        attempt += 1;
+                                        if let Ok(Some(bal)) = clob_balance.get_available_balance(&token_id_balance).await {
+                                            // Consider confirmed when balance >= filled (with small tolerance for rounding).
+                                            let min_expected = (filled_balance - dec!(0.0001)).max(dec!(0));
+                                            if bal >= min_expected {
+                                                let elapsed_ms = now_ms().saturating_sub(buy_ts_ms);
+                                                info!(
+                                                    "\x1b[32m[BALANCE_CONFIRMED]\x1b[0m balance={} received in {} ms (poll every {} ms)",
+                                                    bal,
+                                                    elapsed_ms,
+                                                    BALANCE_CONFIRM_POLL_MS
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    warn!(
+                                        "[BALANCE_CONFIRMED] balance not seen after {} s for token_id={}",
+                                        max_attempts,
+                                        &token_id_balance[..token_id_balance.len().min(20)]
+                                    );
+                                });
+                            }
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper]  FAIL  BUY   {}", msg);
                         }
