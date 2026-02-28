@@ -29,6 +29,8 @@ const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
+/// Below this we consider position closed (dust); avoids spamming the API with tiny amounts the exchange rejects.
+const DUST_THRESHOLD: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 
@@ -150,6 +152,15 @@ fn is_position_closed_error(msg: Option<&str>) -> bool {
         lower.contains("not enough balance")
             || lower.contains("allowance")
             || lower.contains("insufficient balance")
+    })
+}
+
+/// True if the API error is "invalid amounts, maker and taker amount must be higher than 0".
+/// Balance is slow to update; treat as position closed to stop retry spam.
+fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
+    msg.map_or(false, |m| {
+        let lower = m.to_lowercase();
+        lower.contains("invalid amounts") || lower.contains("maker and taker amount")
     })
 }
 
@@ -421,6 +432,21 @@ pub async fn run() -> Result<()> {
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
                         }
+                        if size < DUST_THRESHOLD {
+                            info!(
+                                "[IntervalSniper] SL dust remaining ({}, below {}), considering position closed",
+                                size, DUST_THRESHOLD
+                            );
+                            state.stop_loss_placed = true;
+                            state.auto_sell_placed = true;
+                            state.re_entry_allowed_after_sl = true;
+                            state.pending_auto_sell = None;
+                            state.pending_stop_loss = None;
+                            state.last_buy_order = None;
+                            state.total_shares_this_interval = Decimal::ZERO;
+                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                            continue;
+                        }
                         let result = clob
                             .place_sell_order(
                                 &sl.token_id,
@@ -446,7 +472,7 @@ pub async fn run() -> Result<()> {
                                         .unwrap_or(Decimal::ZERO)
                                 }
                             };
-                            if remaining >= MIN_SELL_SIZE {
+                            if remaining >= DUST_THRESHOLD {
                                 info!(
                                     "[IntervalSniper] SL partial fill, remaining to sell: {} — will repeat until complete",
                                     remaining
@@ -480,6 +506,18 @@ pub async fn run() -> Result<()> {
                                     sl.token_id, size, ba
                                 );
                             }
+                            if is_invalid_amounts_error(result.error_msg.as_deref()) {
+                                info!(
+                                    "[IntervalSniper] SL: exchange rejected amount (dust/zero), considering position closed"
+                                );
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.re_entry_allowed_after_sl = true;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                            } else {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                 m.contains("no orders found to match")
                                     || m.contains("FAK")
@@ -559,6 +597,20 @@ pub async fn run() -> Result<()> {
                                         );
                                         break;
                                     }
+                                    if size_retry < DUST_THRESHOLD {
+                                        info!(
+                                            "[IntervalSniper] SL retry dust remaining ({}), considering position closed",
+                                            size_retry
+                                        );
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                        break;
+                                    }
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
                                         .place_sell_order(
@@ -585,7 +637,7 @@ pub async fn run() -> Result<()> {
                                                     .unwrap_or(Decimal::ZERO)
                                             }
                                         };
-                                        if remaining >= MIN_SELL_SIZE {
+                                        if remaining >= DUST_THRESHOLD {
                                             info!(
                                                 "[IntervalSniper] SL partial fill (attempt {}), remaining to sell: {} — continuing until complete",
                                                 attempt, remaining
@@ -630,14 +682,27 @@ pub async fn run() -> Result<()> {
                                         .as_deref()
                                         .map_or(true, |m| !m.contains("no orders found to match"))
                                     {
+                                        if is_invalid_amounts_error(result_retry.error_msg.as_deref()) {
+                                            info!(
+                                                "[IntervalSniper] SL retry: exchange rejected amount (dust/zero), considering position closed"
+                                            );
+                                            state.stop_loss_placed = true;
+                                            state.auto_sell_placed = true;
+                                            state.re_entry_allowed_after_sl = true;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                        }
                                         if let Some(msg) = result_retry.error_msg {
                                             warn!("[IntervalSniper]  FAIL  SL    {}", msg);
                                         }
                                         break;
                                     }
-                                }
-                            } else if let Some(msg) = result.error_msg {
+                                    }
+                                } else if let Some(msg) = result.error_msg {
                                 warn!("[IntervalSniper]  FAIL  SL    {}", msg);
+                            }
                             }
                         }
                     }
@@ -693,6 +758,21 @@ pub async fn run() -> Result<()> {
                                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                                 continue;
                             }
+                            if size < DUST_THRESHOLD {
+                                info!(
+                                    "[IntervalSniper] TP dust remaining ({}, below {}), considering position closed",
+                                    size, DUST_THRESHOLD
+                                );
+                                state.auto_sell_placed = true;
+                                state.stop_loss_placed = true;
+                                state.re_entry_allowed_after_sl = false;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                continue;
+                            }
                             // SELL FAK must cross: use best_bid so order matches; avoid posting above bid.
                             let price = match state.config.take_profit_time_in_force {
                                 crate::types::SellOrderTimeInForce::Fak => round_to_tick(best_bid),
@@ -733,6 +813,18 @@ pub async fn run() -> Result<()> {
                                         tp.token_id, size, ba
                                     );
                                 }
+                                if is_invalid_amounts_error(result.error_msg.as_deref()) {
+                                    info!(
+                                        "[IntervalSniper] TP: exchange rejected amount (dust/zero), considering position closed"
+                                    );
+                                    state.auto_sell_placed = true;
+                                    state.stop_loss_placed = true;
+                                    state.re_entry_allowed_after_sl = false;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                } else {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                     m.contains("no orders found to match")
                                         || m.contains("FAK")
@@ -814,6 +906,20 @@ pub async fn run() -> Result<()> {
                                             );
                                             break;
                                         }
+                                        if size_retry < DUST_THRESHOLD {
+                                            info!(
+                                                "[IntervalSniper] TP retry dust remaining ({}), considering position closed",
+                                                size_retry
+                                            );
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                            break;
+                                        }
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
                                             .place_sell_order(
@@ -860,6 +966,18 @@ pub async fn run() -> Result<()> {
                                         if result_retry.error_msg.as_deref().map_or(true, |m| {
                                             !m.contains("no orders found to match")
                                         }) {
+                                            if is_invalid_amounts_error(result_retry.error_msg.as_deref()) {
+                                                info!(
+                                                    "[IntervalSniper] TP retry: exchange rejected amount (dust/zero), considering position closed"
+                                                );
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                                state.re_entry_allowed_after_sl = false;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.last_buy_order = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
+                                            }
                                             if let Some(msg) = result_retry.error_msg {
                                                 warn!("[IntervalSniper]  FAIL  TP    {}", msg);
                                             }
@@ -869,8 +987,9 @@ pub async fn run() -> Result<()> {
                                 } else if let Some(msg) = result.error_msg {
                                     warn!("[IntervalSniper]  FAIL  TP    {}", msg);
                                 }
+                                }
+                                }
                             }
-                        }
                     }
                 }
             }
