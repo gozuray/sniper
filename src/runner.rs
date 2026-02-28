@@ -30,8 +30,6 @@ const SELL_SIZE_DECIMALS: u32 = 4;
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 /// CLOB sell maker amount is floor(size, 2 decimals). Size < 0.01 → maker 0 → API "invalid amounts".
 const MIN_SELL_SIZE_MAKER: Decimal = dec!(0.01);
-/// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
-const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Poll interval (ms) when waiting for CLOB balance to appear after buy.
 const BALANCE_CONFIRM_POLL_MS: u64 = 1000;
 /// Max time (s) to wait for balance confirmation before giving up.
@@ -110,17 +108,6 @@ fn floor_to_decimals(x: Decimal, decimals: u32) -> Decimal {
     ((x * factor).trunc()) / factor
 }
 
-fn effective_sell_size(position_size: Decimal, available: Option<Decimal>) -> Decimal {
-    let capped = available
-        .map(|a| {
-            // Leave 1 base unit headroom so encoded amount never exceeds balance after rounding
-            let safe = (a - BALANCE_BUFFER_SHARES).max(Decimal::ZERO);
-            position_size.min(safe)
-        })
-        .unwrap_or(position_size);
-    floor_to_decimals(capped, SELL_SIZE_DECIMALS)
-}
-
 fn fmt_price(p: Option<&Decimal>) -> String {
     p.map(fmt_decimal_2).unwrap_or_else(|| "-".to_string())
 }
@@ -166,13 +153,6 @@ fn is_dust_or_invalid_amounts_error(msg: Option<&str>) -> bool {
             || lower.contains("maker and taker")
             || lower.contains("must be higher than 0")
     })
-}
-
-/// True when available balance is 0 or below CLOB sell minimum (position already closed or dust).
-fn balance_zero_or_dust(available: Option<Decimal>) -> bool {
-    available
-        .map(|a| a < MIN_SELL_SIZE_MAKER)
-        .unwrap_or(false)
 }
 
 /// After a sell order: if filled_size is less than the size we tried to sell, return the remainder
@@ -469,13 +449,9 @@ pub async fn run() -> Result<()> {
                             }
                         } else {
                             if result.http_status == Some(400) {
-                                let ba = clob
-                                    .get_balance_allowance(&sl.token_id)
-                                    .await
-                                    .unwrap_or_else(|e| format!("error: {}", e));
                                 info!(
-                                    "[IntervalSniper] SL 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                    sl.token_id, size, ba
+                                    "[IntervalSniper] SL 400 — token_id={} intento_sell_size={} (reintentando con cantidad comprada)",
+                                    sl.token_id, size
                                 );
                             }
                             if is_dust_or_invalid_amounts_error(result.error_msg.as_deref()) {
@@ -495,15 +471,12 @@ pub async fn run() -> Result<()> {
                                     || m.contains("FAK")
                                     || m.contains("FOK")
                             });
-                            // On balance/allowance error: cancel open orders once, then retry with backoff (100→200→400 ms), selling position.size.
+                            // On balance/allowance error: cancel open orders once, then retry with backoff; sell only position.size (no API balance query).
                             let is_balance_error =
                                 is_position_closed_error(result.error_msg.as_deref());
-                            let available_after_sl_error = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                            // No parar por balance 0/dust: el saldo puede tardar; solo considerar cerrada cuando se confirme la venta (fill).
-                            if is_balance_error && balance_zero_or_dust(available_after_sl_error.clone()) {
+                            if is_balance_error {
                                 info!(
-                                    "[IntervalSniper] SL balance 0 o dust (available={:?}), puede ser retraso — reintentando hasta confirmar venta",
-                                    available_after_sl_error
+                                    "[IntervalSniper] SL balance/allowance error — reintentando venta con cantidad comprada hasta confirmar"
                                 );
                             }
                             if is_no_match || is_balance_error {
@@ -566,34 +539,17 @@ pub async fn run() -> Result<()> {
                                         continue;
                                     }
                                     let position_size_real = sl.size.clone();
-                                    let available = clob
-                                        .get_available_balance(&sl.token_id)
-                                        .await
-                                        .ok()
-                                        .flatten();
-                                    let size_retry = {
-                                        let from_api =
-                                            effective_sell_size(position_size_real.clone(), available.clone());
-                                        if from_api >= MIN_SELL_SIZE {
-                                            from_api
-                                        } else {
-                                            let fallback =
-                                                floor_to_decimals(position_size_real, SELL_SIZE_DECIMALS);
-                                            if fallback >= MIN_SELL_SIZE {
-                                                info!(
-                                                    "[IntervalSniper] SL retry using position size (API low/zero): attempt={} size={}",
-                                                    attempt, fallback
-                                                );
-                                                fallback
-                                            } else {
-                                                warn!(
-                                                    "[IntervalSniper] SL retry abort: token_id={} attempt={} available_shares={:?} position_size={} min_sell_size={}",
-                                                    sl.token_id, attempt, available, fallback, MIN_SELL_SIZE
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    };
+                                    // Siempre vender la cantidad comprada; no consultar CLOB/API por cantidad.
+                                    let size_retry = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
+                                        .max(MIN_SELL_SIZE)
+                                        .min(position_size_real);
+                                    if size_retry < MIN_SELL_SIZE {
+                                        warn!(
+                                            "[IntervalSniper] SL retry abort: position_size {} < min_sell_size (dust)",
+                                            fmt_decimal_2(&position_size_real)
+                                        );
+                                        break;
+                                    }
                                     if size_retry < MIN_SELL_SIZE_MAKER {
                                         info!(
                                             "[IntervalSniper] SL retry size {} < CLOB min (esperando saldo), backoff y reintento",
@@ -663,22 +619,13 @@ pub async fn run() -> Result<()> {
                                             }
                                             break;
                                         }
-                                    // Balance/allowance: we already canceled once; just backoff and retry with position.size (no re-cancel).
+                                    // Balance/allowance: we already canceled once; just backoff and retry with position.size (no API quantity query).
                                     if is_position_closed_error(result_retry.error_msg.as_deref()) {
-                                        let available_retry = clob
-                                            .get_available_balance(&sl.token_id)
-                                            .await
-                                            .ok()
-                                            .flatten();
-                                        if balance_zero_or_dust(available_retry.clone()) {
-                                            info!(
-                                                "[IntervalSniper] SL retry: balance 0 o dust (available={:?}), puede ser retraso — reintentando",
-                                                available_retry
-                                            );
-                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                            continue;
-                                        }
-                                        warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
+                                        info!(
+                                            "[IntervalSniper] SL retry attempt {}: balance/allowance error — reintentando con cantidad comprada",
+                                            attempt
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                         continue;
                                     }
                                     if is_dust_or_invalid_amounts_error(result_retry.error_msg.as_deref()) {
@@ -695,13 +642,9 @@ pub async fn run() -> Result<()> {
                                         break;
                                     }
                                     if result_retry.http_status == Some(400) {
-                                        let ba = clob
-                                            .get_balance_allowance(&sl.token_id)
-                                            .await
-                                            .unwrap_or_else(|e| format!("error: {}", e));
                                         info!(
-                                            "[IntervalSniper] SL retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                            sl.token_id, size_retry, ba
+                                            "[IntervalSniper] SL retry 400 — token_id={} intento_sell_size={} (reintentando con cantidad comprada)",
+                                            sl.token_id, size_retry
                                         );
                                     }
                                     if result_retry
@@ -845,13 +788,9 @@ pub async fn run() -> Result<()> {
                                 }
                             } else {
                                 if result.http_status == Some(400) {
-                                    let ba = clob
-                                        .get_balance_allowance(&tp.token_id)
-                                        .await
-                                        .unwrap_or_else(|e| format!("error: {}", e));
                                     info!(
-                                        "[IntervalSniper] TP 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                        tp.token_id, size, ba
+                                        "[IntervalSniper] TP 400 — token_id={} intento_sell_size={} (reintentando con cantidad comprada)",
+                                        tp.token_id, size
                                     );
                                 }
                                 if is_dust_or_invalid_amounts_error(result.error_msg.as_deref()) {
@@ -873,14 +812,9 @@ pub async fn run() -> Result<()> {
                                 });
                                 let is_balance_error =
                                     is_position_closed_error(result.error_msg.as_deref());
-                                // No parar por balance 0/dust: el saldo puede tardar; solo considerar cerrada cuando se confirme la venta (fill).
-                                if is_balance_error
-                                    && balance_zero_or_dust(
-                                        clob.get_available_balance(&tp.token_id).await.ok().flatten(),
-                                    )
-                                {
+                                if is_balance_error {
                                     info!(
-                                        "[IntervalSniper] TP balance 0 o dust, puede ser retraso — reintentando hasta confirmar venta"
+                                        "[IntervalSniper] TP balance/allowance error — reintentando venta con cantidad comprada hasta confirmar"
                                     );
                                 }
                                 if is_no_match || is_balance_error {
@@ -944,36 +878,17 @@ pub async fn run() -> Result<()> {
                                             continue;
                                         }
                                         let position_size_real = tp.size.clone();
-                                        let available = clob
-                                            .get_available_balance(&tp.token_id)
-                                            .await
-                                            .ok()
-                                            .flatten();
-                                        let size_retry = {
-                                            let from_api = effective_sell_size(
-                                                position_size_real.clone(),
-                                                available.clone(),
+                                        // Siempre vender la cantidad comprada; no consultar CLOB/API por cantidad.
+                                        let size_retry = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
+                                            .max(MIN_SELL_SIZE)
+                                            .min(position_size_real);
+                                        if size_retry < MIN_SELL_SIZE {
+                                            warn!(
+                                                "[IntervalSniper] TP retry abort: position_size {} < min_sell_size (dust)",
+                                                fmt_decimal_2(&position_size_real)
                                             );
-                                            if from_api >= MIN_SELL_SIZE {
-                                                from_api
-                                            } else {
-                                                let fallback =
-                                                    floor_to_decimals(position_size_real, SELL_SIZE_DECIMALS);
-                                                if fallback >= MIN_SELL_SIZE {
-                                                    info!(
-                                                        "[IntervalSniper] TP retry using position size (API low/zero): attempt={} size={}",
-                                                        attempt, fallback
-                                                    );
-                                                    fallback
-                                                } else {
-                                                    warn!(
-                                                        "[IntervalSniper] TP retry abort: token_id={} attempt={} available_shares={:?} position_size={} min_sell_size={}",
-                                                        tp.token_id, attempt, available, fallback, MIN_SELL_SIZE
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        };
+                                            break;
+                                        }
                                         if size_retry < MIN_SELL_SIZE_MAKER {
                                             info!(
                                                 "[IntervalSniper] TP retry size {} < CLOB min (esperando saldo), backoff y reintento",
@@ -1047,20 +962,11 @@ pub async fn run() -> Result<()> {
                                         if is_position_closed_error(
                                             result_retry.error_msg.as_deref(),
                                         ) {
-                                            let available_tp_retry = clob
-                                                .get_available_balance(&tp.token_id)
-                                                .await
-                                                .ok()
-                                                .flatten();
-                                            if balance_zero_or_dust(available_tp_retry.clone()) {
-                                                info!(
-                                                    "[IntervalSniper] TP retry: balance 0 o dust (available={:?}), puede ser retraso — reintentando",
-                                                    available_tp_retry
-                                                );
-                                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                                continue;
-                                            }
-                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
+                                            info!(
+                                                "[IntervalSniper] TP retry attempt {}: balance/allowance error — reintentando con cantidad comprada",
+                                                attempt
+                                            );
+                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                             continue;
                                         }
                                         if is_dust_or_invalid_amounts_error(result_retry.error_msg.as_deref()) {
@@ -1077,13 +983,9 @@ pub async fn run() -> Result<()> {
                                             break;
                                         }
                                         if result_retry.http_status == Some(400) {
-                                            let ba = clob
-                                                .get_balance_allowance(&tp.token_id)
-                                                .await
-                                                .unwrap_or_else(|e| format!("error: {}", e));
                                             info!(
-                                                "[IntervalSniper] TP retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                                tp.token_id, size_retry, ba
+                                                "[IntervalSniper] TP retry 400 — token_id={} intento_sell_size={} (reintentando con cantidad comprada)",
+                                                tp.token_id, size_retry
                                             );
                                         }
                                         if result_retry.error_msg.as_deref().map_or(true, |m| {
