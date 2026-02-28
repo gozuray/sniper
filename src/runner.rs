@@ -23,8 +23,6 @@ const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 const FAK_RETRY_DELAY_MS: u64 = 10;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[50, 100, 200];
-/// After cancel_orders_for_token, balance can take a moment to appear. Retry get_available_balance with these delays (ms) before assuming position closed.
-const BALANCE_AFTER_CANCEL_RETRY_MS: &[u64] = &[150, 200, 250, 350, 500, 700];
 /// Retries continue until order fills or market interval ends (close_time_unix); no fixed attempt cap.
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
@@ -376,7 +374,7 @@ pub async fn run() -> Result<()> {
         };
 
         // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled).
-        // Always use position.token_id (the token we bought), never derive from book; sell_size = min(position.size, available).
+        // Always use position.token_id; sell_size = fill size from buy (HFT: no balance API wait before first sell).
         if state.config.enable_stop_loss {
             if let Some(ref sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
@@ -405,90 +403,10 @@ pub async fn run() -> Result<()> {
                         // SELL FAK must cross: limit_price = best_bid (or best_bid - tick). Use best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
-                        let mut available = clob
-                            .get_available_balance(&sl.token_id)
-                            .await
-                            .ok()
-                            .flatten();
-                        for &delay_ms in BALANCE_AFTER_CANCEL_RETRY_MS {
-                            if !balance_zero_or_dust(available.clone()) {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                            available = clob
-                                .get_available_balance(&sl.token_id)
-                                .await
-                                .ok()
-                                .flatten();
-                        }
-                        if balance_zero_or_dust(available.clone()) {
-                            // Balance API may be stale after cancel. Try selling with position size before assuming closed.
-                            let fallback_size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
-                                .max(MIN_SELL_SIZE)
-                                .min(position_size_real.clone());
-                            if fallback_size < MIN_SELL_SIZE_MAKER {
-                                info!(
-                                    "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
-                                    available
-                                );
-                                info!(
-                                    "[IntervalSniper] SL token check — selling token_id={}   market Down={}   market Up={}   match_down={}   match_up={}",
-                                    sl.token_id,
-                                    market.token_id_down,
-                                    market.token_id_up,
-                                    sl.token_id == market.token_id_down,
-                                    sl.token_id == market.token_id_up
-                                );
-                                state.stop_loss_placed = true;
-                                state.auto_sell_placed = true;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.last_buy_order = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
-                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                continue;
-                            }
-                            info!(
-                                "[IntervalSniper] SL balance 0/dust after cancel retries; attempting sell with position size {} (API may be stale)",
-                                fmt_decimal_2(&fallback_size)
-                            );
-                            info!(
-                                "[IntervalSniper] SL token check — selling token_id={}   market_slug={}   market Down={}   match_down={}",
-                                sl.token_id,
-                                market.slug,
-                                market.token_id_down,
-                                sl.token_id == market.token_id_down
-                            );
-                            available = Some(fallback_size.clone());
-                        }
-                        let size = {
-                            if !balance_zero_or_dust(available.clone()) {
-                                let from_api = effective_sell_size(position_size_real.clone(), available.clone());
-                                if from_api >= MIN_SELL_SIZE {
-                                    from_api
-                                } else {
-                                    let fallback = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS);
-                                    if fallback >= MIN_SELL_SIZE {
-                                        info!(
-                                            "[IntervalSniper] SL using position size (API reported low/zero): size={}",
-                                            fmt_decimal_2(&fallback)
-                                        );
-                                        fallback
-                                    } else {
-                                        warn!(
-                                            "[IntervalSniper] SL skip: token_id={} available_shares={:?} position_size={} min_sell_size={}",
-                                            sl.token_id, available, fallback, MIN_SELL_SIZE
-                                        );
-                                        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
-                                    .max(MIN_SELL_SIZE)
-                                    .min(position_size_real.clone())
-                            }
-                        };
+                        // HFT: use fill size from buy first; don't wait for balance API (often stale after buy).
+                        let size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
+                            .max(MIN_SELL_SIZE)
+                            .min(position_size_real.clone());
                         if size < MIN_SELL_SIZE_MAKER {
                             info!(
                                 "[IntervalSniper]  SELL  SL   dust (size {} < CLOB min), position closed",
@@ -828,7 +746,7 @@ pub async fn run() -> Result<()> {
         }
 
         // Take profit: when best_bid >= trigger, sell. GTC: trigger = TP (order only then → no balance locked for SL), limit at entry price. FAK: trigger = TP−margin, cross at best_bid.
-        // Always use position.token_id (the token we bought); sell_size = min(position.size, available).
+        // Always use position.token_id; sell_size = fill size from buy (HFT: no balance API wait before first sell).
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
@@ -864,64 +782,10 @@ pub async fn run() -> Result<()> {
                             // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                             tokio::time::sleep(Duration::from_millis(350)).await;
                             let position_size_real = tp.size.clone();
-                            let mut available = clob
-                                .get_available_balance(&tp.token_id)
-                                .await
-                                .ok()
-                                .flatten();
-                            for &delay_ms in BALANCE_AFTER_CANCEL_RETRY_MS {
-                                if !balance_zero_or_dust(available.clone()) {
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                available = clob
-                                    .get_available_balance(&tp.token_id)
-                                    .await
-                                    .ok()
-                                    .flatten();
-                            }
-                            if balance_zero_or_dust(available.clone()) {
-                                info!(
-                                    "[IntervalSniper] TP position already closed (balance 0 or dust), stopping — continue scanning book"
-                                );
-                                info!(
-                                    "[IntervalSniper] TP token check — selling token_id={}   market_slug={}   market Down={}   match_down={}",
-                                    tp.token_id,
-                                    market.slug,
-                                    market.token_id_down,
-                                    tp.token_id == market.token_id_down
-                                );
-                                state.auto_sell_placed = true;
-                                state.stop_loss_placed = true;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.last_buy_order = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
-                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                continue;
-                            }
-                            let size = {
-                                let from_api = effective_sell_size(position_size_real.clone(), available.clone());
-                                if from_api >= MIN_SELL_SIZE {
-                                    from_api
-                                } else {
-                                    let fallback = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS);
-                                    if fallback >= MIN_SELL_SIZE {
-                                        info!(
-                                            "[IntervalSniper] TP using position size (API reported low/zero): size={}",
-                                            fallback
-                                        );
-                                        fallback
-                                    } else {
-                                        warn!(
-                                            "[IntervalSniper] TP skip: token_id={} available_shares={:?} position_size={} min_sell_size={}",
-                                            tp.token_id, available, fallback, MIN_SELL_SIZE
-                                        );
-                                        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                        continue;
-                                    }
-                                }
-                            };
+                            // HFT: use fill size from buy first; don't wait for balance API (often stale after buy).
+                            let size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(position_size_real.clone());
                             // CLOB maker = floor(size, 2 dec); size < 0.01 → API "invalid amounts". Treat as dust and close.
                             if size < MIN_SELL_SIZE_MAKER {
                                 info!(
