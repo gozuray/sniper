@@ -375,8 +375,9 @@ pub async fn run() -> Result<()> {
 
         // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled).
         // Always use position.token_id (the token we bought), never derive from book; sell_size = min(position.size, available).
+        // On partial fill: update pending size and repeat until position is fully closed.
         if state.config.enable_stop_loss {
-            if let Some(ref sl) = state.pending_stop_loss {
+            if let Some(ref mut sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
                     // Use book only for best_bid; token to sell is always position.token_id.
                     let is_up = sl.token_id == market.token_id_up;
@@ -429,6 +430,31 @@ pub async fn run() -> Result<()> {
                             )
                             .await?;
                         if result.success {
+                            // Check if sell was partial: repeat until position fully closed.
+                            let remaining = match result.filled_size {
+                                Some(filled) => {
+                                    let rem = sl.size - filled;
+                                    floor_to_decimals(rem.max(Decimal::ZERO), SELL_SIZE_DECIMALS)
+                                }
+                                None => {
+                                    tokio::time::sleep(Duration::from_millis(400)).await;
+                                    clob
+                                        .get_available_balance(&sl.token_id)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(Decimal::ZERO)
+                                }
+                            };
+                            if remaining >= MIN_SELL_SIZE {
+                                info!(
+                                    "[IntervalSniper] SL partial fill, remaining to sell: {} — will repeat until complete",
+                                    remaining
+                                );
+                                sl.size = remaining;
+                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                continue;
+                            }
                             info!(
                                 "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
                                 fmt_price(Some(&price)),
@@ -543,6 +569,30 @@ pub async fn run() -> Result<()> {
                                         )
                                         .await?;
                                     if result_retry.success {
+                                        // Partial fill: repeat until position fully closed.
+                                        let remaining = match result_retry.filled_size {
+                                            Some(filled) => {
+                                                let rem = size_retry - filled;
+                                                floor_to_decimals(rem.max(Decimal::ZERO), SELL_SIZE_DECIMALS)
+                                            }
+                                            None => {
+                                                tokio::time::sleep(Duration::from_millis(400)).await;
+                                                clob
+                                                    .get_available_balance(&sl.token_id)
+                                                    .await
+                                                    .ok()
+                                                    .flatten()
+                                                    .unwrap_or(Decimal::ZERO)
+                                            }
+                                        };
+                                        if remaining >= MIN_SELL_SIZE {
+                                            info!(
+                                                "[IntervalSniper] SL partial fill (attempt {}), remaining to sell: {} — continuing until complete",
+                                                attempt, remaining
+                                            );
+                                            sl.size = remaining;
+                                            continue;
+                                        }
                                         info!(
                                             "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
                                             fmt_price(Some(&price_retry)),
