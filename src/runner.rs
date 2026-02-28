@@ -23,6 +23,8 @@ const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 const FAK_RETRY_DELAY_MS: u64 = 10;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[50, 100, 200];
+/// Before treating "available 0" as "position closed", require this many balance-error retries (avoids giving up while buy is still settling).
+const MIN_BALANCE_ZERO_ATTEMPTS_BEFORE_CLOSED: u32 = 5;
 /// Retries continue until order fills or market interval ends (close_time_unix); no fixed attempt cap.
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
@@ -521,9 +523,11 @@ pub async fn run() -> Result<()> {
                                     let position_size_real = if is_balance_error {
                                         match clob.get_available_balance(&sl.token_id).await {
                                             Ok(Some(avail)) if avail < MIN_SELL_SIZE => {
+                                                if attempt >= MIN_BALANCE_ZERO_ATTEMPTS_BEFORE_CLOSED {
                                                 info!(
-                                                    "[IntervalSniper] SL balance/allowance: available {} < min (dust), position closed",
-                                                    fmt_decimal_2(&avail)
+                                                    "[IntervalSniper] SL balance/allowance: available {} < min (dust) after {} attempts, position closed",
+                                                    fmt_decimal_2(&avail),
+                                                    attempt
                                                 );
                                                 state.stop_loss_placed = true;
                                                 state.auto_sell_placed = true;
@@ -532,6 +536,15 @@ pub async fn run() -> Result<()> {
                                                 state.last_buy_order = None;
                                                 state.total_shares_this_interval = Decimal::ZERO;
                                                 break;
+                                                } else {
+                                                    info!(
+                                                        "[IntervalSniper] SL balance/allowance: available {} (attempt {}), retrying (wait for buy to settle)",
+                                                        fmt_decimal_2(&avail),
+                                                        attempt
+                                                    );
+                                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                                    continue;
+                                                }
                                             }
                                             Ok(Some(avail)) => {
                                                 let use_size = avail.min(sl.size.clone());
@@ -894,9 +907,11 @@ pub async fn run() -> Result<()> {
                                         let position_size_real = if is_balance_error {
                                             match clob.get_available_balance(&tp.token_id).await {
                                                 Ok(Some(avail)) if avail < MIN_SELL_SIZE => {
+                                                    if attempt >= MIN_BALANCE_ZERO_ATTEMPTS_BEFORE_CLOSED {
                                                     info!(
-                                                        "[IntervalSniper] TP balance/allowance: available {} < min (dust), position closed",
-                                                        fmt_decimal_2(&avail)
+                                                        "[IntervalSniper] TP balance/allowance: available {} < min (dust) after {} attempts, position closed",
+                                                        fmt_decimal_2(&avail),
+                                                        attempt
                                                     );
                                                     state.auto_sell_placed = true;
                                                     state.stop_loss_placed = true;
@@ -905,6 +920,15 @@ pub async fn run() -> Result<()> {
                                                     state.last_buy_order = None;
                                                     state.total_shares_this_interval = Decimal::ZERO;
                                                     break;
+                                                    } else {
+                                                        info!(
+                                                            "[IntervalSniper] TP balance/allowance: available {} (attempt {}), retrying (wait for buy to settle)",
+                                                            fmt_decimal_2(&avail),
+                                                            attempt
+                                                        );
+                                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                                        continue;
+                                                    }
                                                 }
                                                 Ok(Some(avail)) => {
                                                     let use_size = avail.min(tp.size.clone());
@@ -1137,12 +1161,13 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // TP/SL: usar filled_size real del exchange (Polymarket puede dar 5.05 si pediste 5).
+                            // TP/SL only when we have real fill >= MIN_SELL_SIZE. FAK can return success with filled_size 0
+                            // (order accepted but not matched yet); then we'd have 0 balance and TP/SL would fail.
                             let fill_size = result
                                 .filled_size
                                 .clone()
-                                .filter(|f| *f >= MIN_SELL_SIZE)
-                                .unwrap_or_else(|| size.clone());
+                                .filter(|f| *f >= MIN_SELL_SIZE);
+                            if let Some(ref fill_size) = fill_size {
                             state.ordered_this_interval = true;
                             state.trades_this_interval += 1;
                             state.total_shares_this_interval += fill_size.clone();
@@ -1168,7 +1193,7 @@ pub async fn run() -> Result<()> {
                                 Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
                             let tp_size = floor_to_decimals(base_sell_size * pct_tp, SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE)
-                                .min(base_sell_size);
+                                .min(base_sell_size.clone());
                             let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE)
                                 .min(base_sell_size);
@@ -1207,6 +1232,13 @@ pub async fn run() -> Result<()> {
                                 &state.pending_stop_loss.as_ref().unwrap().token_id,
                                 market.slug
                             );
+                            } else {
+                                // Order placed but no fill (or fill < min). Don't set TP/SL; next loop can retry buy if needed.
+                                info!(
+                                    "[IntervalSniper]  BUY   order placed but fill_size {:?} < min — not setting TP/SL (no position yet)",
+                                    result.filled_size
+                                );
+                            }
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper]  FAIL  BUY   {}", msg);
                         }
