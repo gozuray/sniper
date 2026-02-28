@@ -8,6 +8,7 @@ use crate::market::fetch_market_by_slug;
 use crate::orderbook::fetch_top_of_book;
 use crate::types::{
     Config, EntrySide, LastBuyOrder, PendingAutoSell, PendingStopLoss, ResolvedMarket, TopOfBook,
+    OrderStrategy,
 };
 use anyhow::Result;
 use reqwest::Client;
@@ -187,6 +188,33 @@ fn choose_side(
         candidates.push((EntrySide::Down, down_ask, down_size));
     }
     candidates.sort_by(|a, b| b.1.cmp(&a.1)); // higher price first
+    candidates.into_iter().next()
+}
+
+/// Choose entry side when triggering on best bid: side with best_bid in [min_buy_price, max_buy_price] and enough ask liquidity.
+/// Used for GTC limit entry: when best bid touches range, place limit at max_buy_price + 1 tick.
+fn choose_side_by_bid(
+    config: &Config,
+    book: &TopOfBook,
+    min_order_size: Decimal,
+) -> Option<(EntrySide, Decimal, Decimal)> {
+    let up = book.token_id_up.as_ref()?;
+    let down = book.token_id_down.as_ref()?;
+    let up_bid = config.allow_buy_up.then(|| up.best_bid).flatten()?;
+    let down_bid = config.allow_buy_down.then(|| down.best_bid).flatten()?;
+    let up_size = up.best_ask_size.unwrap_or(Decimal::ZERO);
+    let down_size = down.best_ask_size.unwrap_or(Decimal::ZERO);
+
+    let in_range = |p: Decimal| p >= config.min_buy_price && p <= config.max_buy_price;
+
+    let mut candidates: Vec<(EntrySide, Decimal, Decimal)> = Vec::new();
+    if in_range(up_bid) && up_size >= min_order_size {
+        candidates.push((EntrySide::Up, up_bid, up_size));
+    }
+    if in_range(down_bid) && down_size >= min_order_size {
+        candidates.push((EntrySide::Down, down_bid, down_size));
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // higher best_bid first
     candidates.into_iter().next()
 }
 
@@ -1041,21 +1069,33 @@ pub async fn run() -> Result<()> {
 
             if in_window && can_buy_after_open {
                 let min_order_size = CLOB_DEFAULT_MIN_ORDER_SIZE;
-                if let Some((side, best_ask, size_available)) =
-                    choose_side(&state.config, &top, min_order_size)
-                {
+                // GtcResting: trigger when best_bid touches range; place GTC limit at max_buy_price + 1 tick.
+                // Otherwise: trigger when best_ask in range; place FAK at best_ask + 1 tick (clamped to range).
+                let entry = match state.config.order_strategy {
+                    OrderStrategy::GtcResting => choose_side_by_bid(&state.config, &top, min_order_size)
+                        .map(|(side, _best_bid, size_available)| {
+                            let limit_price =
+                                round_to_tick(state.config.max_buy_price + TICK_SIZE);
+                            (side, size_available, OrderType::Gtc, limit_price)
+                        }),
+                    _ => choose_side(&state.config, &top, min_order_size).map(
+                        |(side, best_ask, size_available)| {
+                            let limit_price = round_to_tick(
+                                (best_ask + TICK_SIZE)
+                                    .max(state.config.min_buy_price)
+                                    .min(state.config.max_buy_price),
+                            )
+                            .max(best_ask);
+                            (side, size_available, OrderType::Fak, limit_price)
+                        },
+                    ),
+                };
+                if let Some((side, size_available, order_type, limit_price)) = entry {
                     let token_id = match side {
                         EntrySide::Up => &market.token_id_up,
                         EntrySide::Down => &market.token_id_down,
                     };
-                    // Enforce price within [min_buy_price, max_buy_price]: we cross the spread (best_ask + 1 tick)
-                    // but never go below min nor above max. FAK must cross: limit_price >= best_ask (or "no orders found").
-                    let effective_price = round_to_tick(
-                        (best_ask + TICK_SIZE)
-                            .max(state.config.min_buy_price)
-                            .min(state.config.max_buy_price),
-                    );
-                    let effective_price = effective_price.max(best_ask);
+                    let effective_price = limit_price;
                     let shares_left = state.config.size_shares - state.total_shares_this_interval;
                     // Cap at shares_left so we never order more than configured size (e.g. exactly 7 shares).
                     // Round to 2 decimals so we never send 7.24000001 when user wants 7.
@@ -1068,7 +1108,6 @@ pub async fn run() -> Result<()> {
                     let maker_amount =
                         maker_amount_2_decimals(size.clone(), effective_price.clone());
                     if size >= min_order_size && size > Decimal::ZERO {
-                        let order_type = OrderType::Fak;
                         let params = LimitOrderParams {
                             token_id: token_id.to_string(),
                             side: OrderSide::Buy,
@@ -1078,6 +1117,19 @@ pub async fn run() -> Result<()> {
                             post_only: false,
                             fee_rate_bps: None,
                         };
+                        let type_str = match order_type {
+                            OrderType::Gtc => "GTC limit",
+                            OrderType::Fak => "FAK",
+                            _ => "limit",
+                        };
+                        debug!(
+                            "[IntervalSniper] Placing {} buy size={} @ {} (range {}-{})",
+                            type_str,
+                            size,
+                            fmt_decimal_2(&effective_price),
+                            state.config.min_buy_price,
+                            state.config.max_buy_price
+                        );
                         let result = clob.place_limit_order(params, order_type).await?;
                         // Mark that we attempted a buy this interval (prevents second buy if first
                         // returned success=false but filled on exchange; re-entry only after SL).
