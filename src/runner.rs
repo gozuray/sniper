@@ -1292,13 +1292,12 @@ pub async fn run() -> Result<()> {
                             .min(state.config.max_buy_price),
                     );
                     let effective_price = effective_price.max(best_ask);
-                    let shares_left = state.config.size_shares - state.total_shares_this_interval;
+                    let shares_left = (state.config.size_shares - state.total_shares_this_interval).max(Decimal::ZERO);
                     // Cap at shares_left so we never order more than configured size (e.g. exactly 7 shares).
                     // Round to 2 decimals so we never send 7.24000001 when user wants 7.
                     let size = size_4_decimals(
                         shares_left
                             .min(size_available)
-                            .max(min_order_size)
                             .round_dp(2),
                     );
                     let maker_amount =
@@ -1316,12 +1315,12 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // Position must use actual filled_size from CLOB (FAK can be partial; TP/SL must sell only what we have).
+                            // Use actual filled size from CLOB as the position size (what we really received). TP/SL will sell this full amount.
                             let filled = result
                                 .filled_size
                                 .filter(|s| *s > Decimal::ZERO && *s >= size.clone() * dec!(0.01))
                                 .unwrap_or(size.clone());
-                            let filled = filled.min(size.clone());
+                            // No cap: register exactly what we received so we sell it all at TP/SL.
                             state.ordered_this_interval = true;
                             state.trades_this_interval += 1;
                             state.total_shares_this_interval += filled.clone();
@@ -1339,12 +1338,9 @@ pub async fn run() -> Result<()> {
                             } else {
                                 round_to_tick(state.config.take_profit_price)
                             };
-                            // Use actual bought quantity (filled), adjusted to Polymarket sell size decimals (4).
-                            let base_sell_size = floor_to_decimals(
-                                filled.clone().min(state.config.size_shares),
-                                SELL_SIZE_DECIMALS,
-                            )
-                            .max(MIN_SELL_SIZE);
+                            // Sell the full amount we received (no cap at config.size_shares).
+                            let base_sell_size = floor_to_decimals(filled.clone(), SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE);
                             let pct_tp =
                                 Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
                             let pct_sl =
