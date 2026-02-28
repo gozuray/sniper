@@ -156,6 +156,7 @@ fn is_position_closed_error(msg: Option<&str>) -> bool {
 
 /// After a sell order: if filled_size is less than the size we tried to sell, return the remainder
 /// to sell (floored to SELL_SIZE_DECIMALS). None means consider the position fully closed (full fill or dust).
+/// Caller must handle GTC + filled_size 0/None separately (order resting) before calling this.
 fn sell_remainder_after_fill(
     size_tried: &Decimal,
     filled_size: Option<Decimal>,
@@ -170,6 +171,12 @@ fn sell_remainder_after_fill(
     } else {
         Some(remainder)
     }
+}
+
+/// True when the sell order succeeded but filled 0 (e.g. GTC order accepted and resting). Caller must not place another order.
+fn gtc_order_placed_no_fill_yet(time_in_force: crate::types::SellOrderTimeInForce, filled_size: &Option<Decimal>) -> bool {
+    matches!(time_in_force, crate::types::SellOrderTimeInForce::Gtc)
+        && filled_size.as_ref().map(|f| f.is_zero()).unwrap_or(true)
 }
 
 /// Choose entry side: Up or Down with higher best ask in [min_buy_price, max_buy_price], with min liquidity.
@@ -458,36 +465,45 @@ pub async fn run() -> Result<()> {
                             )
                             .await?;
                         if result.success {
-                            match sell_remainder_after_fill(&size, result.filled_size.clone()) {
-                                None => {
-                                    info!(
-                                        "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
-                                        fmt_decimal_2(&sl.entry_price),
-                                        fmt_decimal_2(&price),
-                                        state.trades_this_interval,
-                                        MAX_TRADES_PER_INTERVAL
-                                    );
-                                    state.stop_loss_placed = true;
-                                    state.auto_sell_placed = true;
-                                    state.re_entry_allowed_after_sl = true;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
-                                }
-                                Some(remainder) => {
-                                    let filled = result.filled_size.unwrap_or(size.clone() - remainder.clone());
-                                    info!(
-                                        "[IntervalSniper]  SELL  SL   partial fill: sold {} at {} — remaining {} (will retry until 100%)",
-                                        fmt_decimal_2(&filled),
-                                        fmt_decimal_2(&price),
-                                        fmt_decimal_2(&remainder)
-                                    );
-                                    if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
-                                        (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
-                                    {
-                                        p_tp.size = remainder.clone();
-                                        p_sl.size = remainder;
+                            if gtc_order_placed_no_fill_yet(state.config.stop_loss_time_in_force, &result.filled_size) {
+                                info!(
+                                    "[IntervalSniper]  SELL  SL   GTC order placed at {} (waiting for fill, do not place again)",
+                                    fmt_decimal_2(&price)
+                                );
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                            } else {
+                                match sell_remainder_after_fill(&size, result.filled_size.clone()) {
+                                    None => {
+                                        info!(
+                                            "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
+                                            fmt_decimal_2(&sl.entry_price),
+                                            fmt_decimal_2(&price),
+                                            state.trades_this_interval,
+                                            MAX_TRADES_PER_INTERVAL
+                                        );
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                    }
+                                    Some(remainder) => {
+                                        let filled = result.filled_size.unwrap_or(size.clone() - remainder.clone());
+                                        info!(
+                                            "[IntervalSniper]  SELL  SL   partial fill: sold {} at {} — remaining {} (will retry until 100%)",
+                                            fmt_decimal_2(&filled),
+                                            fmt_decimal_2(&price),
+                                            fmt_decimal_2(&remainder)
+                                        );
+                                        if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
+                                            (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
+                                        {
+                                            p_tp.size = remainder.clone();
+                                            p_sl.size = remainder;
+                                        }
                                     }
                                 }
                             }
@@ -608,42 +624,52 @@ pub async fn run() -> Result<()> {
                                         )
                                         .await?;
                                         if result_retry.success {
-                                            match sell_remainder_after_fill(
-                                                &size_retry,
-                                                result_retry.filled_size.clone(),
-                                            ) {
-                                                None => {
-                                                    info!(
-                                                        "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
-                                                        fmt_decimal_2(&sl.entry_price),
-                                                        fmt_decimal_2(&price_retry),
-                                                        attempt,
-                                                        state.trades_this_interval,
-                                                        MAX_TRADES_PER_INTERVAL
-                                                    );
-                                                    state.stop_loss_placed = true;
-                                                    state.auto_sell_placed = true;
-                                                    state.re_entry_allowed_after_sl = true;
-                                                    state.pending_auto_sell = None;
-                                                    state.pending_stop_loss = None;
-                                                    state.last_buy_order = None;
-                                                    state.total_shares_this_interval = Decimal::ZERO;
-                                                    _filled = true;
-                                                }
-                                                Some(remainder) => {
-                                                    let filled = result_retry.filled_size.unwrap_or(size_retry.clone() - remainder.clone());
-                                                    info!(
-                                                        "[IntervalSniper]  SELL  SL   partial (attempt {}): sold {} at {} — remaining {} (will retry until 100%)",
-                                                        attempt,
-                                                        fmt_decimal_2(&filled),
-                                                        fmt_decimal_2(&price_retry),
-                                                        fmt_decimal_2(&remainder)
-                                                    );
-                                                    if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
-                                                        (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
-                                                    {
-                                                        p_tp.size = remainder.clone();
-                                                        p_sl.size = remainder;
+                                            if gtc_order_placed_no_fill_yet(state.config.stop_loss_time_in_force, &result_retry.filled_size) {
+                                                info!(
+                                                    "[IntervalSniper]  SELL  SL   GTC order placed at {} (attempt {}, waiting for fill)",
+                                                    fmt_decimal_2(&price_retry),
+                                                    attempt
+                                                );
+                                                state.stop_loss_placed = true;
+                                                state.auto_sell_placed = true;
+                                            } else {
+                                                match sell_remainder_after_fill(
+                                                    &size_retry,
+                                                    result_retry.filled_size.clone(),
+                                                ) {
+                                                    None => {
+                                                        info!(
+                                                            "[IntervalSniper]  SELL  SL   precio_compra={}  precio_venta={}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
+                                                            fmt_decimal_2(&sl.entry_price),
+                                                            fmt_decimal_2(&price_retry),
+                                                            attempt,
+                                                            state.trades_this_interval,
+                                                            MAX_TRADES_PER_INTERVAL
+                                                        );
+                                                        state.stop_loss_placed = true;
+                                                        state.auto_sell_placed = true;
+                                                        state.re_entry_allowed_after_sl = true;
+                                                        state.pending_auto_sell = None;
+                                                        state.pending_stop_loss = None;
+                                                        state.last_buy_order = None;
+                                                        state.total_shares_this_interval = Decimal::ZERO;
+                                                        _filled = true;
+                                                    }
+                                                    Some(remainder) => {
+                                                        let filled = result_retry.filled_size.unwrap_or(size_retry.clone() - remainder.clone());
+                                                        info!(
+                                                            "[IntervalSniper]  SELL  SL   partial (attempt {}): sold {} at {} — remaining {} (will retry until 100%)",
+                                                            attempt,
+                                                            fmt_decimal_2(&filled),
+                                                            fmt_decimal_2(&price_retry),
+                                                            fmt_decimal_2(&remainder)
+                                                        );
+                                                        if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
+                                                            (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
+                                                        {
+                                                            p_tp.size = remainder.clone();
+                                                            p_sl.size = remainder;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -773,37 +799,46 @@ pub async fn run() -> Result<()> {
                                 )
                                 .await?;
                             if result.success {
-                                match sell_remainder_after_fill(&size, result.filled_size.clone()) {
-                                    None => {
-                                        let buy_price = state.last_buy_order.as_ref().map(|o| fmt_decimal_2(&o.price)).unwrap_or_else(|| "-".to_string());
-                                        info!(
-                                            "[IntervalSniper]  SELL  TP   precio_compra={}  precio_venta={}   (take profit) — position closed (trades this interval: {}/{})",
-                                            buy_price,
-                                            fmt_decimal_2(&price),
-                                            state.trades_this_interval,
-                                            MAX_TRADES_PER_INTERVAL
-                                        );
-                                        state.auto_sell_placed = true;
-                                        state.stop_loss_placed = true;
-                                        state.re_entry_allowed_after_sl = false;
-                                        state.pending_auto_sell = None;
-                                        state.pending_stop_loss = None;
-                                        state.last_buy_order = None;
-                                        state.total_shares_this_interval = Decimal::ZERO;
-                                    }
-                                    Some(remainder) => {
-                                        let filled = result.filled_size.unwrap_or(size.clone() - remainder.clone());
-                                        info!(
-                                            "[IntervalSniper]  SELL  TP   partial fill: sold {} at {} — remaining {} (will retry until 100%)",
-                                            fmt_decimal_2(&filled),
-                                            fmt_decimal_2(&price),
-                                            fmt_decimal_2(&remainder)
-                                        );
-                                        if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
-                                            (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
-                                        {
-                                            p_tp.size = remainder.clone();
-                                            p_sl.size = remainder;
+                                if gtc_order_placed_no_fill_yet(state.config.take_profit_time_in_force, &result.filled_size) {
+                                    info!(
+                                        "[IntervalSniper]  SELL  TP   GTC order placed at {} (waiting for fill, do not place again)",
+                                        fmt_decimal_2(&price)
+                                    );
+                                    state.auto_sell_placed = true;
+                                    state.stop_loss_placed = true;
+                                } else {
+                                    match sell_remainder_after_fill(&size, result.filled_size.clone()) {
+                                        None => {
+                                            let buy_price = state.last_buy_order.as_ref().map(|o| fmt_decimal_2(&o.price)).unwrap_or_else(|| "-".to_string());
+                                            info!(
+                                                "[IntervalSniper]  SELL  TP   precio_compra={}  precio_venta={}   (take profit) — position closed (trades this interval: {}/{})",
+                                                buy_price,
+                                                fmt_decimal_2(&price),
+                                                state.trades_this_interval,
+                                                MAX_TRADES_PER_INTERVAL
+                                            );
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                        }
+                                        Some(remainder) => {
+                                            let filled = result.filled_size.unwrap_or(size.clone() - remainder.clone());
+                                            info!(
+                                                "[IntervalSniper]  SELL  TP   partial fill: sold {} at {} — remaining {} (will retry until 100%)",
+                                                fmt_decimal_2(&filled),
+                                                fmt_decimal_2(&price),
+                                                fmt_decimal_2(&remainder)
+                                            );
+                                            if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
+                                                (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
+                                            {
+                                                p_tp.size = remainder.clone();
+                                                p_sl.size = remainder;
+                                            }
                                         }
                                     }
                                 }
@@ -926,43 +961,53 @@ pub async fn run() -> Result<()> {
                                             )
                                             .await?;
                                         if result_retry.success {
-                                            match sell_remainder_after_fill(
-                                                &size_retry,
-                                                result_retry.filled_size.clone(),
-                                            ) {
-                                                None => {
-                                                    let buy_price_tp = state.last_buy_order.as_ref().map(|o| fmt_decimal_2(&o.price)).unwrap_or_else(|| "-".to_string());
-                                                    info!(
-                                                        "[IntervalSniper]  SELL  TP   precio_compra={}  precio_venta={}   (attempt {}) — position closed (trades this interval: {}/{})",
-                                                        buy_price_tp,
-                                                        fmt_decimal_2(&price_retry),
-                                                        attempt,
-                                                        state.trades_this_interval,
-                                                        MAX_TRADES_PER_INTERVAL
-                                                    );
-                                                    state.auto_sell_placed = true;
-                                                    state.stop_loss_placed = true;
-                                                    state.re_entry_allowed_after_sl = false;
-                                                    state.pending_auto_sell = None;
-                                                    state.pending_stop_loss = None;
-                                                    state.last_buy_order = None;
-                                                    state.total_shares_this_interval = Decimal::ZERO;
-                                                    _filled = true;
-                                                }
-                                                Some(remainder) => {
-                                                    let filled = result_retry.filled_size.unwrap_or(size_retry.clone() - remainder.clone());
-                                                    info!(
-                                                        "[IntervalSniper]  SELL  TP   partial (attempt {}): sold {} at {} — remaining {} (will retry until 100%)",
-                                                        attempt,
-                                                        fmt_decimal_2(&filled),
-                                                        fmt_decimal_2(&price_retry),
-                                                        fmt_decimal_2(&remainder)
-                                                    );
-                                                    if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
-                                                        (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
-                                                    {
-                                                        p_tp.size = remainder.clone();
-                                                        p_sl.size = remainder;
+                                            if gtc_order_placed_no_fill_yet(state.config.take_profit_time_in_force, &result_retry.filled_size) {
+                                                info!(
+                                                    "[IntervalSniper]  SELL  TP   GTC order placed at {} (attempt {}, waiting for fill)",
+                                                    fmt_decimal_2(&price_retry),
+                                                    attempt
+                                                );
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                            } else {
+                                                match sell_remainder_after_fill(
+                                                    &size_retry,
+                                                    result_retry.filled_size.clone(),
+                                                ) {
+                                                    None => {
+                                                        let buy_price_tp = state.last_buy_order.as_ref().map(|o| fmt_decimal_2(&o.price)).unwrap_or_else(|| "-".to_string());
+                                                        info!(
+                                                            "[IntervalSniper]  SELL  TP   precio_compra={}  precio_venta={}   (attempt {}) — position closed (trades this interval: {}/{})",
+                                                            buy_price_tp,
+                                                            fmt_decimal_2(&price_retry),
+                                                            attempt,
+                                                            state.trades_this_interval,
+                                                            MAX_TRADES_PER_INTERVAL
+                                                        );
+                                                        state.auto_sell_placed = true;
+                                                        state.stop_loss_placed = true;
+                                                        state.re_entry_allowed_after_sl = false;
+                                                        state.pending_auto_sell = None;
+                                                        state.pending_stop_loss = None;
+                                                        state.last_buy_order = None;
+                                                        state.total_shares_this_interval = Decimal::ZERO;
+                                                        _filled = true;
+                                                    }
+                                                    Some(remainder) => {
+                                                        let filled = result_retry.filled_size.unwrap_or(size_retry.clone() - remainder.clone());
+                                                        info!(
+                                                            "[IntervalSniper]  SELL  TP   partial (attempt {}): sold {} at {} — remaining {} (will retry until 100%)",
+                                                            attempt,
+                                                            fmt_decimal_2(&filled),
+                                                            fmt_decimal_2(&price_retry),
+                                                            fmt_decimal_2(&remainder)
+                                                        );
+                                                        if let (Some(ref mut p_tp), Some(ref mut p_sl)) =
+                                                            (state.pending_auto_sell.as_mut(), state.pending_stop_loss.as_mut())
+                                                        {
+                                                            p_tp.size = remainder.clone();
+                                                            p_sl.size = remainder;
+                                                        }
                                                     }
                                                 }
                                             }
