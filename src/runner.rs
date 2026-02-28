@@ -30,6 +30,8 @@ const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[50, 100, 200];
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
+/// CLOB sell maker amount is floor(size, 2 decimals). Size < 0.01 → maker 0 → API "invalid amounts".
+const MIN_SELL_SIZE_MAKER: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 
@@ -151,6 +153,16 @@ fn is_position_closed_error(msg: Option<&str>) -> bool {
         lower.contains("not enough balance")
             || lower.contains("allowance")
             || lower.contains("insufficient balance")
+    })
+}
+
+/// True if the API error indicates dust or invalid order size (maker/taker 0). Clear position and stop retrying.
+fn is_dust_or_invalid_amounts_error(msg: Option<&str>) -> bool {
+    msg.map_or(false, |m| {
+        let lower = m.to_lowercase();
+        lower.contains("invalid amounts")
+            || lower.contains("maker and taker")
+            || lower.contains("must be higher than 0")
     })
 }
 
@@ -456,6 +468,20 @@ pub async fn run() -> Result<()> {
                                 }
                             }
                         };
+                        if size < MIN_SELL_SIZE_MAKER {
+                            info!(
+                                "[IntervalSniper]  SELL  SL   dust (size {} < CLOB min), position closed",
+                                fmt_decimal_2(&size)
+                            );
+                            state.stop_loss_placed = true;
+                            state.auto_sell_placed = true;
+                            state.pending_auto_sell = None;
+                            state.pending_stop_loss = None;
+                            state.last_buy_order = None;
+                            state.total_shares_this_interval = Decimal::ZERO;
+                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                            continue;
+                        }
                         let result = clob
                             .place_sell_order(
                                 &sl.token_id,
@@ -518,6 +544,18 @@ pub async fn run() -> Result<()> {
                                     sl.token_id, size, ba
                                 );
                             }
+                            if is_dust_or_invalid_amounts_error(result.error_msg.as_deref()) {
+                                info!(
+                                    "[IntervalSniper] SL dust/invalid size (API rejected), position closed — remaining {}",
+                                    fmt_decimal_2(&size)
+                                );
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                            } else {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                 m.contains("no orders found to match")
                                     || m.contains("FAK")
@@ -614,6 +652,19 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                     };
+                                    if size_retry < MIN_SELL_SIZE_MAKER {
+                                        info!(
+                                            "[IntervalSniper] SL retry dust (size {} < CLOB min), position closed",
+                                            fmt_decimal_2(&size_retry)
+                                        );
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                        break;
+                                    }
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
                                         .place_sell_order(
@@ -680,6 +731,19 @@ pub async fn run() -> Result<()> {
                                         warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
                                         continue;
                                     }
+                                    if is_dust_or_invalid_amounts_error(result_retry.error_msg.as_deref()) {
+                                        info!(
+                                            "[IntervalSniper] SL retry dust/invalid size (API rejected), position closed — remaining {}",
+                                            fmt_decimal_2(&size_retry)
+                                        );
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                        break;
+                                    }
                                     if result_retry.http_status == Some(400) {
                                         let ba = clob
                                             .get_balance_allowance(&sl.token_id)
@@ -703,6 +767,7 @@ pub async fn run() -> Result<()> {
                                 }
                             } else if let Some(msg) = result.error_msg {
                                 warn!("[IntervalSniper]  FAIL  SL    {}", msg);
+                            }
                             }
                         }
                     }
@@ -774,6 +839,21 @@ pub async fn run() -> Result<()> {
                                     }
                                 }
                             };
+                            // CLOB maker = floor(size, 2 dec); size < 0.01 → API "invalid amounts". Treat as dust and close.
+                            if size < MIN_SELL_SIZE_MAKER {
+                                info!(
+                                    "[IntervalSniper]  SELL  TP   dust (size {} < CLOB min), position closed",
+                                    fmt_decimal_2(&size)
+                                );
+                                state.auto_sell_placed = true;
+                                state.stop_loss_placed = true;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                continue;
+                            }
                             // GTC: limit at entry (buy) price so it fills automatically when bid already at TP.
                             // FAK: cross at best_bid. FOK: at most target + margin.
                             let price = match state.config.take_profit_time_in_force {
@@ -853,6 +933,18 @@ pub async fn run() -> Result<()> {
                                         tp.token_id, size, ba
                                     );
                                 }
+                                if is_dust_or_invalid_amounts_error(result.error_msg.as_deref()) {
+                                    info!(
+                                        "[IntervalSniper] TP dust/invalid size (API rejected), position closed — remaining {}",
+                                        fmt_decimal_2(&size)
+                                    );
+                                    state.auto_sell_placed = true;
+                                    state.stop_loss_placed = true;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                } else {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
                                     m.contains("no orders found to match")
                                         || m.contains("FAK")
@@ -951,6 +1043,19 @@ pub async fn run() -> Result<()> {
                                                 }
                                             }
                                         };
+                                        if size_retry < MIN_SELL_SIZE_MAKER {
+                                            info!(
+                                                "[IntervalSniper] TP retry dust (size {} < CLOB min), position closed",
+                                                fmt_decimal_2(&size_retry)
+                                            );
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                            break;
+                                        }
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
                                             .place_sell_order(
@@ -1019,6 +1124,19 @@ pub async fn run() -> Result<()> {
                                             warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
                                             continue;
                                         }
+                                        if is_dust_or_invalid_amounts_error(result_retry.error_msg.as_deref()) {
+                                            info!(
+                                                "[IntervalSniper] TP retry dust/invalid size (API rejected), position closed — remaining {}",
+                                                fmt_decimal_2(&size_retry)
+                                            );
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                            break;
+                                        }
                                         if result_retry.http_status == Some(400) {
                                             let ba = clob
                                                 .get_balance_allowance(&tp.token_id)
@@ -1040,6 +1158,7 @@ pub async fn run() -> Result<()> {
                                     }
                                 } else if let Some(msg) = result.error_msg {
                                     warn!("[IntervalSniper]  FAIL  TP    {}", msg);
+                                }
                                 }
                             }
                         }
