@@ -1233,7 +1233,13 @@ pub async fn run() -> Result<()> {
                                 market.slug
                             );
                             } else {
-                                // Order placed but no fill (or fill < min). Don't set TP/SL; next loop can retry buy if needed.
+                                // Order placed but fill < min. Don't set TP/SL (position too small for CLOB sell min).
+                                // Still consume this interval's buy so we don't keep buying repeatedly and drain balance.
+                                state.ordered_this_interval = true;
+                                state.trades_this_interval += 1;
+                                if let Some(ref small_fill) = result.filled_size {
+                                    state.total_shares_this_interval += small_fill.clone();
+                                }
                                 info!(
                                     "[IntervalSniper]  BUY   order placed but fill_size {:?} < min — not setting TP/SL (no position yet)",
                                     result.filled_size
