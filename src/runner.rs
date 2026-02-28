@@ -537,6 +537,17 @@ pub async fn run() -> Result<()> {
                                 let mut attempt: u32 = 0;
                                 loop {
                                     attempt += 1;
+                                    // If interval changed (new 5-min market), stop retrying and let main loop switch market.
+                                    let now_check = now_unix();
+                                    if now_check >= market.close_time_unix
+                                        || current_5min_slug(config.interval_market) != market.slug
+                                    {
+                                        info!(
+                                            "[IntervalSniper] interval changed during SL retry (attempt {}), stopping retries and switching market",
+                                            attempt
+                                        );
+                                        break;
+                                    }
                                     let delay_ms = if is_balance_error {
                                         BALANCE_RETRY_BACKOFF_MS
                                             .get((attempt as usize).saturating_sub(1))
@@ -843,6 +854,17 @@ pub async fn run() -> Result<()> {
                                     let mut attempt: u32 = 0;
                                     loop {
                                         attempt += 1;
+                                        // If interval changed (new 5-min market), stop retrying and let main loop switch market.
+                                        let now_check = now_unix();
+                                        if now_check >= market.close_time_unix
+                                            || current_5min_slug(config.interval_market) != market.slug
+                                        {
+                                            info!(
+                                                "[IntervalSniper] interval changed during TP retry (attempt {}), stopping retries and switching market",
+                                                attempt
+                                            );
+                                            break;
+                                        }
                                         let delay_ms = if is_balance_error {
                                             BALANCE_RETRY_BACKOFF_MS
                                                 .get((attempt as usize).saturating_sub(1))
