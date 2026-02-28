@@ -19,8 +19,6 @@ use tracing::{info, warn};
 
 const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
-/// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
-const LOG_BOOK_EVERY_TICKS: u64 = 10;
 /// Delay between FAK retries when no match (ms). Minimal for maximum retry speed during the interval.
 const FAK_RETRY_DELAY_MS: u64 = 10;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
@@ -255,10 +253,8 @@ pub async fn run() -> Result<()> {
     );
 
     let loop_ms = config.loop_ms;
-    let mut tick_count: u64 = 0;
 
     loop {
-        tick_count += 1;
         let now_u = now_unix();
         let now_ms_u = now_ms();
 
@@ -374,51 +370,6 @@ pub async fn run() -> Result<()> {
                 }
             }
         };
-
-        // Periodic log: order book scan (real-time visibility)
-        if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
-            let up = top.token_id_up.as_ref();
-            let down = top.token_id_down.as_ref();
-            info!(
-                "[IntervalSniper] order book Up bid={} ask={} | Down bid={} ask={} | secs_to_close={}",
-                fmt_price(up.and_then(|s| s.best_bid.as_ref())),
-                fmt_price(up.and_then(|s| s.best_ask.as_ref())),
-                fmt_price(down.and_then(|s| s.best_bid.as_ref())),
-                fmt_price(down.and_then(|s| s.best_ask.as_ref())),
-                fmt_secs(secs_to_close)
-            );
-            // When position open, log TP/SL monitoring so user sees we're checking for fills
-            if let Some(ref tp) = state.pending_auto_sell {
-                if !state.auto_sell_placed {
-                    let is_up = tp.token_id == market.token_id_up;
-                    let side_book = if is_up {
-                        &top.token_id_up
-                    } else {
-                        &top.token_id_down
-                    };
-                    info!(
-                        "[IntervalSniper]  POS   TP   target={}  best_bid={}  (sell when bid >= target)",
-                        fmt_price(Some(&tp.target_price)),
-                        fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
-                    );
-                }
-            }
-            if let Some(ref sl) = state.pending_stop_loss {
-                if !state.stop_loss_placed {
-                    let is_up = sl.token_id == market.token_id_up;
-                    let side_book = if is_up {
-                        &top.token_id_up
-                    } else {
-                        &top.token_id_down
-                    };
-                    info!(
-                        "[IntervalSniper]  POS   SL   trigger={}  best_bid={}  (sell when bid <= trigger)",
-                        fmt_price(Some(&sl.trigger_price)),
-                        fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
-                    );
-                }
-            }
-        }
 
         // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled).
         // Always use position.token_id (the token we bought), never derive from book; sell_size = min(position.size, available).
