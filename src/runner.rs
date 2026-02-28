@@ -25,6 +25,8 @@ const LOG_BOOK_EVERY_TICKS: u64 = 10;
 const FAK_RETRY_DELAY_MS: u64 = 10;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[50, 100, 200];
+/// After cancel_orders_for_token, balance can take a moment to appear. Retry get_available_balance with these delays (ms) before assuming position closed.
+const BALANCE_AFTER_CANCEL_RETRY_MS: &[u64] = &[150, 200, 250];
 /// Retries continue until order fills or market interval ends (close_time_unix); no fixed attempt cap.
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
@@ -448,11 +450,22 @@ pub async fn run() -> Result<()> {
                         // SELL FAK must cross: limit_price = best_bid (or best_bid - tick). Use best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
-                        let available = clob
+                        let mut available = clob
                             .get_available_balance(&sl.token_id)
                             .await
                             .ok()
                             .flatten();
+                        for &delay_ms in BALANCE_AFTER_CANCEL_RETRY_MS {
+                            if !balance_zero_or_dust(available.clone()) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            available = clob
+                                .get_available_balance(&sl.token_id)
+                                .await
+                                .ok()
+                                .flatten();
+                        }
                         if balance_zero_or_dust(available.clone()) {
                             info!(
                                 "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — continue scanning book"
@@ -863,11 +876,22 @@ pub async fn run() -> Result<()> {
                             // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                             tokio::time::sleep(Duration::from_millis(350)).await;
                             let position_size_real = tp.size.clone();
-                            let available = clob
+                            let mut available = clob
                                 .get_available_balance(&tp.token_id)
                                 .await
                                 .ok()
                                 .flatten();
+                            for &delay_ms in BALANCE_AFTER_CANCEL_RETRY_MS {
+                                if !balance_zero_or_dust(available.clone()) {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                available = clob
+                                    .get_available_balance(&tp.token_id)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                            }
                             if balance_zero_or_dust(available.clone()) {
                                 info!(
                                     "[IntervalSniper] TP position already closed (balance 0 or dust), stopping — continue scanning book"
