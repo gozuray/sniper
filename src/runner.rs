@@ -1205,11 +1205,19 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // Use actual filled size from CLOB as the position size (what we really received). TP/SL will sell this full amount.
-                            let filled = result
-                                .filled_size
-                                .filter(|s| *s > Decimal::ZERO && *s >= size.clone() * dec!(0.01))
-                                .unwrap_or(size.clone());
+                            // FAK buy: only arm TP/SL when we actually got filled shares.
+                            // If filled_size is 0/None, the order was accepted but matched 0 and then canceled.
+                            let filled = match result.filled_size.clone().filter(|s| *s > Decimal::ZERO) {
+                                Some(f) => f,
+                                None => {
+                                    info!(
+                                        "[IntervalSniper]  BUY   FAK no fill (filled_size={:?}); not arming TP/SL",
+                                        result.filled_size
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                    continue;
+                                }
+                            };
                             // No cap: register exactly what we received so we sell it all at TP/SL.
                             state.ordered_this_interval = true;
                             state.trades_this_interval += 1;
