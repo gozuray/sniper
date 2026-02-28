@@ -517,6 +517,38 @@ pub async fn run() -> Result<()> {
                                         canceled_once_for_balance = true;
                                         tokio::time::sleep(Duration::from_millis(350)).await;
                                     }
+                                    // On balance error: use actual balance for this attempt (e.g. order filled 5.00 but we thought 5.05; or partial sell).
+                                    let position_size_real = if is_balance_error {
+                                        match clob.get_available_balance(&sl.token_id).await {
+                                            Ok(Some(avail)) if avail < MIN_SELL_SIZE => {
+                                                info!(
+                                                    "[IntervalSniper] SL balance/allowance: available {} < min (dust), position closed",
+                                                    fmt_decimal_2(&avail)
+                                                );
+                                                state.stop_loss_placed = true;
+                                                state.auto_sell_placed = true;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.last_buy_order = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
+                                                break;
+                                            }
+                                            Ok(Some(avail)) => {
+                                                let use_size = avail.min(sl.size.clone());
+                                                if avail < sl.size {
+                                                    info!(
+                                                        "[IntervalSniper] SL using available balance {} for this attempt (tracked was {})",
+                                                        fmt_decimal_2(&avail),
+                                                        fmt_decimal_2(&sl.size)
+                                                    );
+                                                }
+                                                use_size
+                                            }
+                                            _ => sl.size.clone(),
+                                        }
+                                    } else {
+                                        sl.size.clone()
+                                    };
                                     let top_retry = if let Some(ref ws) = state.ws_book {
                                         ws.get_top_of_book().await
                                     } else {
@@ -544,11 +576,10 @@ pub async fn run() -> Result<()> {
                                     if bid <= Decimal::ZERO {
                                         continue;
                                     }
-                                    let position_size_real = sl.size.clone();
-                                    // Siempre vender la cantidad comprada; no consultar CLOB/API por cantidad.
+                                    // position_size_real already set above (from sl.size or from available balance when balance error).
                                     let size_retry = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
                                         .max(MIN_SELL_SIZE)
-                                        .min(position_size_real);
+                                        .min(position_size_real.clone());
                                     if size_retry < MIN_SELL_SIZE {
                                         warn!(
                                             "[IntervalSniper] SL retry abort: position_size {} < min_sell_size (dust)",
@@ -859,6 +890,38 @@ pub async fn run() -> Result<()> {
                                             canceled_once_for_balance = true;
                                             tokio::time::sleep(Duration::from_millis(350)).await;
                                         }
+                                        // On balance error: use actual balance for this attempt (e.g. order filled but we thought more; or partial sell).
+                                        let position_size_real = if is_balance_error {
+                                            match clob.get_available_balance(&tp.token_id).await {
+                                                Ok(Some(avail)) if avail < MIN_SELL_SIZE => {
+                                                    info!(
+                                                        "[IntervalSniper] TP balance/allowance: available {} < min (dust), position closed",
+                                                        fmt_decimal_2(&avail)
+                                                    );
+                                                    state.auto_sell_placed = true;
+                                                    state.stop_loss_placed = true;
+                                                    state.pending_auto_sell = None;
+                                                    state.pending_stop_loss = None;
+                                                    state.last_buy_order = None;
+                                                    state.total_shares_this_interval = Decimal::ZERO;
+                                                    break;
+                                                }
+                                                Ok(Some(avail)) => {
+                                                    let use_size = avail.min(tp.size.clone());
+                                                    if avail < tp.size {
+                                                        info!(
+                                                            "[IntervalSniper] TP using available balance {} for this attempt (tracked was {})",
+                                                            fmt_decimal_2(&avail),
+                                                            fmt_decimal_2(&tp.size)
+                                                        );
+                                                    }
+                                                    use_size
+                                                }
+                                                _ => tp.size.clone(),
+                                            }
+                                        } else {
+                                            tp.size.clone()
+                                        };
                                         let top_retry = if let Some(ref ws) = state.ws_book {
                                             ws.get_top_of_book().await
                                         } else {
@@ -886,11 +949,10 @@ pub async fn run() -> Result<()> {
                                         if bid < trigger_price {
                                             continue;
                                         }
-                                        let position_size_real = tp.size.clone();
-                                        // Siempre vender la cantidad comprada; no consultar CLOB/API por cantidad.
+                                        // position_size_real already set above (from tp.size or from available balance when balance error).
                                         let size_retry = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
                                             .max(MIN_SELL_SIZE)
-                                            .min(position_size_real);
+                                            .min(position_size_real.clone());
                                         if size_retry < MIN_SELL_SIZE {
                                             warn!(
                                                 "[IntervalSniper] TP retry abort: position_size {} < min_sell_size (dust)",
@@ -1075,16 +1137,21 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // TP/SL: siempre usar el size de la orden (no API filled_size).
+                            // TP/SL: usar filled_size real del exchange (Polymarket puede dar 5.05 si pediste 5).
+                            let fill_size = result
+                                .filled_size
+                                .clone()
+                                .filter(|f| *f >= MIN_SELL_SIZE)
+                                .unwrap_or_else(|| size.clone());
                             state.ordered_this_interval = true;
                             state.trades_this_interval += 1;
-                            state.total_shares_this_interval += size.clone();
+                            state.total_shares_this_interval += fill_size.clone();
                             let entry_price = effective_price;
                             let entry_side = side;
                             state.last_buy_order = Some(LastBuyOrder {
                                 token_id: token_id.to_string(),
                                 side: entry_side,
-                                size: size.clone(),
+                                size: fill_size.clone(),
                                 price: entry_price.clone(),
                                 timestamp_ms: now_ms_u,
                             });
@@ -1093,7 +1160,7 @@ pub async fn run() -> Result<()> {
                             } else {
                                 round_to_tick(state.config.take_profit_price)
                             };
-                            let base_sell_size = floor_to_decimals(size.clone(), SELL_SIZE_DECIMALS)
+                            let base_sell_size = floor_to_decimals(fill_size.clone(), SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE);
                             let pct_tp =
                                 Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
