@@ -408,16 +408,11 @@ pub async fn run() -> Result<()> {
                             .max(MIN_SELL_SIZE)
                             .min(position_size_real.clone());
                         if size < MIN_SELL_SIZE_MAKER {
+                            // No marcar posición cerrada: el saldo puede tardar en llegar; seguir intentando SL hasta confirmar venta.
                             info!(
-                                "[IntervalSniper]  SELL  SL   dust (size {} < CLOB min), position closed",
+                                "[IntervalSniper]  SELL  SL   size {} < CLOB min (esperando saldo real), reintentando en siguiente tick",
                                 fmt_decimal_2(&size)
                             );
-                            state.stop_loss_placed = true;
-                            state.auto_sell_placed = true;
-                            state.pending_auto_sell = None;
-                            state.pending_stop_loss = None;
-                            state.last_buy_order = None;
-                            state.total_shares_this_interval = Decimal::ZERO;
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
                         }
@@ -504,19 +499,14 @@ pub async fn run() -> Result<()> {
                             let is_balance_error =
                                 is_position_closed_error(result.error_msg.as_deref());
                             let available_after_sl_error = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                            let balance_already_zero = is_balance_error && balance_zero_or_dust(available_after_sl_error.clone());
-                            if balance_already_zero {
+                            // No parar por balance 0/dust: el saldo puede tardar; solo considerar cerrada cuando se confirme la venta (fill).
+                            if is_balance_error && balance_zero_or_dust(available_after_sl_error.clone()) {
                                 info!(
-                                    "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
+                                    "[IntervalSniper] SL balance 0 o dust (available={:?}), puede ser retraso — reintentando hasta confirmar venta",
                                     available_after_sl_error
                                 );
-                                state.stop_loss_placed = true;
-                                state.auto_sell_placed = true;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.last_buy_order = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
-                            } else if is_no_match || is_balance_error {
+                            }
+                            if is_no_match || is_balance_error {
                                 if is_balance_error {
                                     info!("[IntervalSniper] stop loss: balance/allowance error, canceling open orders once and retrying with backoff");
                                 } else {
@@ -606,16 +596,11 @@ pub async fn run() -> Result<()> {
                                     };
                                     if size_retry < MIN_SELL_SIZE_MAKER {
                                         info!(
-                                            "[IntervalSniper] SL retry dust (size {} < CLOB min), position closed",
+                                            "[IntervalSniper] SL retry size {} < CLOB min (esperando saldo), backoff y reintento",
                                             fmt_decimal_2(&size_retry)
                                         );
-                                        state.stop_loss_placed = true;
-                                        state.auto_sell_placed = true;
-                                        state.pending_auto_sell = None;
-                                        state.pending_stop_loss = None;
-                                        state.last_buy_order = None;
-                                        state.total_shares_this_interval = Decimal::ZERO;
-                                        break;
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                        continue;
                                     }
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
@@ -685,18 +670,13 @@ pub async fn run() -> Result<()> {
                                             .await
                                             .ok()
                                             .flatten();
-                                        if balance_zero_or_dust(available_retry) {
+                                        if balance_zero_or_dust(available_retry.clone()) {
                                             info!(
-                                                "[IntervalSniper] SL retry: position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
+                                                "[IntervalSniper] SL retry: balance 0 o dust (available={:?}), puede ser retraso — reintentando",
                                                 available_retry
                                             );
-                                            state.stop_loss_placed = true;
-                                            state.auto_sell_placed = true;
-                                            state.pending_auto_sell = None;
-                                            state.pending_stop_loss = None;
-                                            state.last_buy_order = None;
-                                            state.total_shares_this_interval = Decimal::ZERO;
-                                            break;
+                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                            continue;
                                         }
                                         warn!("[IntervalSniper] stop loss retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
                                         continue;
@@ -786,18 +766,12 @@ pub async fn run() -> Result<()> {
                             let size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE)
                                 .min(position_size_real.clone());
-                            // CLOB maker = floor(size, 2 dec); size < 0.01 → API "invalid amounts". Treat as dust and close.
+                            // No marcar posición cerrada por dust: el saldo puede tardar; seguir intentando TP hasta confirmar venta.
                             if size < MIN_SELL_SIZE_MAKER {
                                 info!(
-                                    "[IntervalSniper]  SELL  TP   dust (size {} < CLOB min), position closed",
+                                    "[IntervalSniper]  SELL  TP   size {} < CLOB min (esperando saldo real), reintentando en siguiente tick",
                                     fmt_decimal_2(&size)
                                 );
-                                state.auto_sell_placed = true;
-                                state.stop_loss_placed = true;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.last_buy_order = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
                                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                                 continue;
                             }
@@ -899,21 +873,17 @@ pub async fn run() -> Result<()> {
                                 });
                                 let is_balance_error =
                                     is_position_closed_error(result.error_msg.as_deref());
-                                let balance_already_zero = is_balance_error
+                                // No parar por balance 0/dust: el saldo puede tardar; solo considerar cerrada cuando se confirme la venta (fill).
+                                if is_balance_error
                                     && balance_zero_or_dust(
                                         clob.get_available_balance(&tp.token_id).await.ok().flatten(),
-                                    );
-                                if balance_already_zero {
+                                    )
+                                {
                                     info!(
-                                        "[IntervalSniper] TP position already closed (balance 0 or dust), stopping — continue scanning book"
+                                        "[IntervalSniper] TP balance 0 o dust, puede ser retraso — reintentando hasta confirmar venta"
                                     );
-                                    state.auto_sell_placed = true;
-                                    state.stop_loss_placed = true;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
-                                } else if is_no_match || is_balance_error {
+                                }
+                                if is_no_match || is_balance_error {
                                     if is_balance_error {
                                         info!("[IntervalSniper] take profit: balance/allowance error, canceling open orders once and retrying with backoff");
                                     } else {
@@ -1006,16 +976,11 @@ pub async fn run() -> Result<()> {
                                         };
                                         if size_retry < MIN_SELL_SIZE_MAKER {
                                             info!(
-                                                "[IntervalSniper] TP retry dust (size {} < CLOB min), position closed",
+                                                "[IntervalSniper] TP retry size {} < CLOB min (esperando saldo), backoff y reintento",
                                                 fmt_decimal_2(&size_retry)
                                             );
-                                            state.auto_sell_placed = true;
-                                            state.stop_loss_placed = true;
-                                            state.pending_auto_sell = None;
-                                            state.pending_stop_loss = None;
-                                            state.last_buy_order = None;
-                                            state.total_shares_this_interval = Decimal::ZERO;
-                                            break;
+                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                            continue;
                                         }
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
@@ -1087,17 +1052,13 @@ pub async fn run() -> Result<()> {
                                                 .await
                                                 .ok()
                                                 .flatten();
-                                            if balance_zero_or_dust(available_tp_retry) {
+                                            if balance_zero_or_dust(available_tp_retry.clone()) {
                                                 info!(
-                                                    "[IntervalSniper] TP retry: position already closed (balance 0 or dust), stopping — continue scanning book"
+                                                    "[IntervalSniper] TP retry: balance 0 o dust (available={:?}), puede ser retraso — reintentando",
+                                                    available_tp_retry
                                                 );
-                                                state.auto_sell_placed = true;
-                                                state.stop_loss_placed = true;
-                                                state.pending_auto_sell = None;
-                                                state.pending_stop_loss = None;
-                                                state.last_buy_order = None;
-                                                state.total_shares_this_interval = Decimal::ZERO;
-                                                break;
+                                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                                continue;
                                             }
                                             warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
                                             continue;
