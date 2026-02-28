@@ -26,7 +26,7 @@ const FAK_RETRY_DELAY_MS: u64 = 10;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[50, 100, 200];
 /// After cancel_orders_for_token, balance can take a moment to appear. Retry get_available_balance with these delays (ms) before assuming position closed.
-const BALANCE_AFTER_CANCEL_RETRY_MS: &[u64] = &[150, 200, 250];
+const BALANCE_AFTER_CANCEL_RETRY_MS: &[u64] = &[150, 200, 250, 350, 500, 700];
 /// Retries continue until order fills or market interval ends (close_time_unix); no fixed attempt cap.
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
@@ -467,38 +467,56 @@ pub async fn run() -> Result<()> {
                                 .flatten();
                         }
                         if balance_zero_or_dust(available.clone()) {
+                            // Balance API may be stale after cancel. Try selling with position size before assuming closed.
+                            let fallback_size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(position_size_real.clone());
+                            if fallback_size < MIN_SELL_SIZE_MAKER {
+                                info!(
+                                    "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
+                                    available
+                                );
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                continue;
+                            }
                             info!(
-                                "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — continue scanning book"
+                                "[IntervalSniper] SL balance 0/dust after cancel retries; attempting sell with position size {} (API may be stale)",
+                                fmt_decimal_2(&fallback_size)
                             );
-                            state.stop_loss_placed = true;
-                            state.auto_sell_placed = true;
-                            state.pending_auto_sell = None;
-                            state.pending_stop_loss = None;
-                            state.last_buy_order = None;
-                            state.total_shares_this_interval = Decimal::ZERO;
-                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                            continue;
+                            available = Some(fallback_size.clone());
                         }
                         let size = {
-                            let from_api = effective_sell_size(position_size_real.clone(), available.clone());
-                            if from_api >= MIN_SELL_SIZE {
-                                from_api
-                            } else {
-                                let fallback = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS);
-                                if fallback >= MIN_SELL_SIZE {
-                                    info!(
-                                        "[IntervalSniper] SL using position size (API reported low/zero): size={}",
-                                        fallback
-                                    );
-                                    fallback
+                            if !balance_zero_or_dust(available.clone()) {
+                                let from_api = effective_sell_size(position_size_real.clone(), available.clone());
+                                if from_api >= MIN_SELL_SIZE {
+                                    from_api
                                 } else {
-                                    warn!(
-                                        "[IntervalSniper] SL skip: token_id={} available_shares={:?} position_size={} min_sell_size={}",
-                                        sl.token_id, available, fallback, MIN_SELL_SIZE
-                                    );
-                                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                    continue;
+                                    let fallback = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS);
+                                    if fallback >= MIN_SELL_SIZE {
+                                        info!(
+                                            "[IntervalSniper] SL using position size (API reported low/zero): size={}",
+                                            fmt_decimal_2(&fallback)
+                                        );
+                                        fallback
+                                    } else {
+                                        warn!(
+                                            "[IntervalSniper] SL skip: token_id={} available_shares={:?} position_size={} min_sell_size={}",
+                                            sl.token_id, available, fallback, MIN_SELL_SIZE
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                        continue;
+                                    }
                                 }
+                            } else {
+                                floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
+                                    .max(MIN_SELL_SIZE)
+                                    .min(position_size_real.clone())
                             }
                         };
                         if size < MIN_SELL_SIZE_MAKER {
@@ -597,13 +615,12 @@ pub async fn run() -> Result<()> {
                             // On balance/allowance error: cancel open orders once, then retry with backoff (100→200→400 ms), selling position.size.
                             let is_balance_error =
                                 is_position_closed_error(result.error_msg.as_deref());
-                            let balance_already_zero = is_balance_error
-                                && balance_zero_or_dust(
-                                    clob.get_available_balance(&sl.token_id).await.ok().flatten(),
-                                );
+                            let available_after_sl_error = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                            let balance_already_zero = is_balance_error && balance_zero_or_dust(available_after_sl_error.clone());
                             if balance_already_zero {
                                 info!(
-                                    "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — continue scanning book"
+                                    "[IntervalSniper] SL position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
+                                    available_after_sl_error
                                 );
                                 state.stop_loss_placed = true;
                                 state.auto_sell_placed = true;
@@ -782,7 +799,8 @@ pub async fn run() -> Result<()> {
                                             .flatten();
                                         if balance_zero_or_dust(available_retry) {
                                             info!(
-                                                "[IntervalSniper] SL retry: position already closed (balance 0 or dust), stopping — continue scanning book"
+                                                "[IntervalSniper] SL retry: position already closed (balance 0 or dust), stopping — available={:?} — continue scanning book",
+                                                available_retry
                                             );
                                             state.stop_loss_placed = true;
                                             state.auto_sell_placed = true;
