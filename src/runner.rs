@@ -383,18 +383,23 @@ pub async fn run() -> Result<()> {
                         // SELL FAK must cross: limit_price = best_bid (or best_bid - tick). Use best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
-                        // HFT: use fill size from buy first; don't wait for balance API (often stale after buy).
+                        // Siempre usar size comprado; no consultar balance. Enviar FAK con ese size.
                         let size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
                             .max(MIN_SELL_SIZE)
                             .min(position_size_real.clone());
-                        if size < MIN_SELL_SIZE_MAKER {
-                            // No marcar posición cerrada: el saldo puede tardar en llegar; seguir intentando SL hasta confirmar venta.
-                            info!(
-                                "[IntervalSniper]  SELL  SL   size {} < CLOB min (esperando saldo real), reintentando en siguiente tick",
+                        if size < MIN_SELL_SIZE {
+                            warn!(
+                                "[IntervalSniper]  SELL  SL   size {} < min (dust), no enviando",
                                 fmt_decimal_2(&size)
                             );
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
+                        }
+                        if size < MIN_SELL_SIZE_MAKER {
+                            info!(
+                                "[IntervalSniper]  SELL  SL   size {} (comprado) < CLOB maker min 0.01 — enviando FAK de todas formas",
+                                fmt_decimal_2(&size)
+                            );
                         }
                         let result = clob
                             .place_sell_order(
@@ -552,11 +557,9 @@ pub async fn run() -> Result<()> {
                                     }
                                     if size_retry < MIN_SELL_SIZE_MAKER {
                                         info!(
-                                            "[IntervalSniper] SL retry size {} < CLOB min (esperando saldo), backoff y reintento",
+                                            "[IntervalSniper] SL retry size {} (comprado) < CLOB maker min 0.01 — enviando FAK de todas formas",
                                             fmt_decimal_2(&size_retry)
                                         );
-                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                        continue;
                                     }
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
@@ -705,18 +708,23 @@ pub async fn run() -> Result<()> {
                             // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                             tokio::time::sleep(Duration::from_millis(350)).await;
                             let position_size_real = tp.size.clone();
-                            // HFT: use fill size from buy first; don't wait for balance API (often stale after buy).
+                            // Siempre usar size comprado; enviar FAK con ese size.
                             let size = floor_to_decimals(position_size_real.clone(), SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE)
                                 .min(position_size_real.clone());
-                            // No marcar posición cerrada por dust: el saldo puede tardar; seguir intentando TP hasta confirmar venta.
-                            if size < MIN_SELL_SIZE_MAKER {
-                                info!(
-                                    "[IntervalSniper]  SELL  TP   size {} < CLOB min (esperando saldo real), reintentando en siguiente tick",
+                            if size < MIN_SELL_SIZE {
+                                warn!(
+                                    "[IntervalSniper]  SELL  TP   size {} < min (dust), no enviando",
                                     fmt_decimal_2(&size)
                                 );
                                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                                 continue;
+                            }
+                            if size < MIN_SELL_SIZE_MAKER {
+                                info!(
+                                    "[IntervalSniper]  SELL  TP   size {} (comprado) < CLOB maker min 0.01 — enviando FAK de todas formas",
+                                    fmt_decimal_2(&size)
+                                );
                             }
                             // GTC: limit at entry (buy) price so it fills automatically when bid already at TP.
                             // FAK: cross at best_bid. FOK: at most target + margin.
@@ -891,11 +899,9 @@ pub async fn run() -> Result<()> {
                                         }
                                         if size_retry < MIN_SELL_SIZE_MAKER {
                                             info!(
-                                                "[IntervalSniper] TP retry size {} < CLOB min (esperando saldo), backoff y reintento",
+                                                "[IntervalSniper] TP retry size {} (comprado) < CLOB maker min 0.01 — enviando FAK de todas formas",
                                                 fmt_decimal_2(&size_retry)
                                             );
-                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                            continue;
                                         }
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
@@ -1068,29 +1074,16 @@ pub async fn run() -> Result<()> {
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
                         if result.success {
-                            // FAK buy: only arm TP/SL when we actually got filled shares.
-                            // If filled_size is 0/None, the order was accepted but matched 0 and then canceled.
-                            let filled = match result.filled_size.clone().filter(|s| *s > Decimal::ZERO) {
-                                Some(f) => f,
-                                None => {
-                                    info!(
-                                        "[IntervalSniper]  BUY   FAK no fill (filled_size={:?}); not arming TP/SL",
-                                        result.filled_size
-                                    );
-                                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                    continue;
-                                }
-                            };
-                            // No cap: register exactly what we received so we sell it all at TP/SL.
+                            // TP/SL: siempre usar el size de la orden (no API filled_size).
                             state.ordered_this_interval = true;
                             state.trades_this_interval += 1;
-                            state.total_shares_this_interval += filled.clone();
+                            state.total_shares_this_interval += size.clone();
                             let entry_price = effective_price;
                             let entry_side = side;
                             state.last_buy_order = Some(LastBuyOrder {
                                 token_id: token_id.to_string(),
                                 side: entry_side,
-                                size: filled.clone(),
+                                size: size.clone(),
                                 price: entry_price.clone(),
                                 timestamp_ms: now_ms_u,
                             });
@@ -1099,8 +1092,7 @@ pub async fn run() -> Result<()> {
                             } else {
                                 round_to_tick(state.config.take_profit_price)
                             };
-                            // Sell the full amount we received (no cap at config.size_shares).
-                            let base_sell_size = floor_to_decimals(filled.clone(), SELL_SIZE_DECIMALS)
+                            let base_sell_size = floor_to_decimals(size.clone(), SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE);
                             let pct_tp =
                                 Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
@@ -1151,7 +1143,7 @@ pub async fn run() -> Result<()> {
                             if !state.config.dry_run {
                                 let clob_balance = Arc::clone(&clob);
                                 let token_id_balance = state.pending_stop_loss.as_ref().unwrap().token_id.clone();
-                                let filled_balance = filled.clone();
+                                let filled_balance = size.clone();
                                 let buy_ts_ms = now_ms_u;
                                 tokio::spawn(async move {
                                     let mut attempt = 0u32;
