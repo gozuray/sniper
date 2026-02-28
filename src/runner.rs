@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
@@ -328,11 +328,11 @@ pub async fn run() -> Result<()> {
             }
         };
 
-        // Periodic log: order book scan (real-time visibility)
+        // Periodic log: order book scan (real-time visibility) — debug only so terminal shows only buy/sell events
         if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
             let up = top.token_id_up.as_ref();
             let down = top.token_id_down.as_ref();
-            info!(
+            debug!(
                 "[IntervalSniper] order book Up bid={} ask={} | Down bid={} ask={} | secs_to_close={}",
                 fmt_price(up.and_then(|s| s.best_bid.as_ref())),
                 fmt_price(up.and_then(|s| s.best_ask.as_ref())),
@@ -340,7 +340,7 @@ pub async fn run() -> Result<()> {
                 fmt_price(down.and_then(|s| s.best_ask.as_ref())),
                 fmt_secs(secs_to_close)
             );
-            // When position open, log TP/SL monitoring so user sees we're checking for fills
+            // When position open, log TP/SL monitoring so user sees we're checking for fills (debug only)
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
                     let is_up = tp.token_id == market.token_id_up;
@@ -349,7 +349,7 @@ pub async fn run() -> Result<()> {
                     } else {
                         &top.token_id_down
                     };
-                    info!(
+                    debug!(
                         "[IntervalSniper]  POS   TP   target={}  best_bid={}  (sell when bid >= target)",
                         fmt_price(Some(&tp.target_price)),
                         fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
@@ -364,7 +364,7 @@ pub async fn run() -> Result<()> {
                     } else {
                         &top.token_id_down
                     };
-                    info!(
+                    debug!(
                         "[IntervalSniper]  POS   SL   trigger={}  best_bid={}  (sell when bid <= trigger)",
                         fmt_price(Some(&sl.trigger_price)),
                         fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
