@@ -827,9 +827,11 @@ pub async fn run() -> Result<()> {
         }
 
         // Buy path: up to MAX_TRADES_PER_INTERVAL per interval; re-entry only after SL (not after TP).
+        // Require !ordered_this_interval for first slot so we don't double-buy when first order
+        // returns success=false but actually filled on the exchange.
         let no_open_position = state.pending_auto_sell.is_none() && state.pending_stop_loss.is_none();
         let can_buy = no_open_position
-            && (state.trades_this_interval == 0
+            && (state.trades_this_interval == 0 && !state.ordered_this_interval
                 || (state.trades_this_interval == 1 && state.re_entry_allowed_after_sl));
         if can_buy {
             let in_window = state.config.no_window_all_intervals
@@ -886,6 +888,9 @@ pub async fn run() -> Result<()> {
                             fee_rate_bps: None,
                         };
                         let result = clob.place_limit_order(params, order_type).await?;
+                        // Mark that we attempted a buy this interval (prevents second buy if first
+                        // returned success=false but filled on exchange; re-entry only after SL).
+                        state.ordered_this_interval = true;
                         if result.success {
                             // Position must use actual filled_size from CLOB (FAK can be partial; TP/SL must sell only what we have).
                             let filled = result
@@ -893,7 +898,6 @@ pub async fn run() -> Result<()> {
                                 .filter(|s| *s > Decimal::ZERO && *s >= size.clone() * dec!(0.01))
                                 .unwrap_or(size.clone());
                             let filled = filled.min(size.clone());
-                            state.ordered_this_interval = true;
                             state.trades_this_interval += 1;
                             state.total_shares_this_interval += filled.clone();
                             let entry_price = effective_price;
