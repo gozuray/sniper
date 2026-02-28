@@ -26,6 +26,10 @@ const LOG_BOOK_EVERY_TICKS: u64 = 10;
 const FAK_RETRY_DELAY_MS: u64 = 30;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
+/// When API returns success but no filled_size (e.g. FAK response missing makingAmount/takingAmount), wait this long for balance to update before reading remaining.
+const FILL_UNKNOWN_BALANCE_DELAY_MS: u64 = 1500;
+/// If filled_size was unknown and balance dropped by less than this many shares, assume full fill (avoid double-sell).
+const FILL_UNKNOWN_ASSUME_FULL_THRESHOLD: Decimal = dec!(0.02);
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
@@ -491,13 +495,24 @@ pub async fn run() -> Result<()> {
                                     floor_to_decimals(rem.max(Decimal::ZERO), SELL_SIZE_DECIMALS)
                                 }
                                 None => {
-                                    tokio::time::sleep(Duration::from_millis(400)).await;
-                                    clob
+                                    // API did not return filled amount (e.g. makingAmount/takingAmount missing). Wait for balance to update.
+                                    tokio::time::sleep(Duration::from_millis(FILL_UNKNOWN_BALANCE_DELAY_MS)).await;
+                                    let balance = clob
                                         .get_available_balance(&sl.token_id)
                                         .await
                                         .ok()
                                         .flatten()
-                                        .unwrap_or(Decimal::ZERO)
+                                        .unwrap_or(Decimal::ZERO);
+                                    // If balance barely dropped, exchange filled but API didn't report it — assume full fill to avoid double-sell.
+                                    if balance >= sl.size - FILL_UNKNOWN_ASSUME_FULL_THRESHOLD && balance <= sl.size + FILL_UNKNOWN_ASSUME_FULL_THRESHOLD {
+                                        info!(
+                                            "[IntervalSniper] SL filled (API did not return filled size; balance ~unchanged {}) — considering position closed",
+                                            balance
+                                        );
+                                        Decimal::ZERO
+                                    } else {
+                                        balance
+                                    }
                                 }
                             };
                             if remaining >= DUST_THRESHOLD {
@@ -667,13 +682,24 @@ pub async fn run() -> Result<()> {
                                                 floor_to_decimals(rem.max(Decimal::ZERO), SELL_SIZE_DECIMALS)
                                             }
                                             None => {
-                                                tokio::time::sleep(Duration::from_millis(400)).await;
-                                                clob
+                                                tokio::time::sleep(Duration::from_millis(FILL_UNKNOWN_BALANCE_DELAY_MS)).await;
+                                                let balance = clob
                                                     .get_available_balance(&sl.token_id)
                                                     .await
                                                     .ok()
                                                     .flatten()
-                                                    .unwrap_or(Decimal::ZERO)
+                                                    .unwrap_or(Decimal::ZERO);
+                                                if balance >= size_retry - FILL_UNKNOWN_ASSUME_FULL_THRESHOLD
+                                                    && balance <= size_retry + FILL_UNKNOWN_ASSUME_FULL_THRESHOLD
+                                                {
+                                                    info!(
+                                                        "[IntervalSniper] SL filled (attempt {}, API did not return filled size; balance ~unchanged {}) — considering position closed",
+                                                        attempt, balance
+                                                    );
+                                                    Decimal::ZERO
+                                                } else {
+                                                    balance
+                                                }
                                             }
                                         };
                                         if remaining >= DUST_THRESHOLD {
