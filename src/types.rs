@@ -25,6 +25,8 @@ impl std::str::FromStr for IntervalMarketAsset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStrategy {
     GtcResting,
+    /// GTC: when best_ask is in range, place GTC limit at min_buy_price.
+    Gtc,
     FokSamePrice,
     FakSamePrice,
     CrossSpread,

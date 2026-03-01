@@ -90,6 +90,7 @@ pub fn load_config() -> Result<Config> {
         .as_str()
     {
         "gtc_resting" => OrderStrategy::GtcResting,
+        "gtc" => OrderStrategy::Gtc,
         "fok_same_price" => OrderStrategy::FokSamePrice,
         "fak_same_price" => OrderStrategy::FakSamePrice,
         "cross_spread" => OrderStrategy::CrossSpread,
