@@ -47,10 +47,10 @@ const DUST_THRESHOLD: Decimal = dec!(0.01);
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
 const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
-/// When GTC fill not seen via WS after this many ms, fall back to REST balance to detect fill.
-const PENDING_GTC_FALLBACK_MS: u64 = 45_000;
-/// When no WS user channel, wait this long before using REST balance to detect GTC fill.
-const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 5_000;
+/// When WS is present, check REST balance every tick from buy (0 = no delay, WS + REST in parallel).
+const PENDING_GTC_REST_CHECK_MS: u64 = 0;
+/// When no WS user channel, check REST balance every tick from buy (0 = no delay).
+const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 0;
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -965,9 +965,9 @@ pub async fn run() -> Result<()> {
                     .await;
                 }
             } else {
-                // Fallback: WS never sent fill; after PENDING_GTC_FALLBACK_MS check REST balance.
+                // Use both: check REST balance after short delay (WS checked every tick above).
                 let waited_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(0));
-                if waited_ms >= PENDING_GTC_FALLBACK_MS
+                if waited_ms >= PENDING_GTC_REST_CHECK_MS
                     && state.pending_gtc_token_id.is_some()
                     && state.pending_gtc_requested_size.is_some()
                     && state.pending_gtc_side.is_some()
