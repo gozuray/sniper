@@ -7,6 +7,7 @@ mod config;
 mod market;
 mod orderbook;
 mod runner;
+mod session_log;
 mod signing;
 mod types;
 

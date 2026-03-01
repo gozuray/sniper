@@ -1,2 +1,4 @@
 /target
 .env
+# Session logs (JSONL); la carpeta logs/ se conserva con .gitkeep
+#logs/*.jsonl

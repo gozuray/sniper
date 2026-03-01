@@ -6,6 +6,7 @@ use crate::clob_ws_book::ClobWsBook;
 use crate::config::{current_5min_slug, load_config};
 use crate::market::fetch_market_by_slug;
 use crate::orderbook::fetch_top_of_book;
+use crate::session_log::{ExitType, SessionLog};
 use crate::types::{
     Config, EntrySide, LastBuyOrder, PendingAutoSell, PendingStopLoss, ResolvedMarket, TopOfBook,
     OrderStrategy,
@@ -56,6 +57,49 @@ fn top_has_book_data(top: &TopOfBook) -> bool {
     up_ok || down_ok
 }
 
+/// Update per-interval min/max best_bid and last_best_bid_for_position from current book.
+fn update_interval_bids(
+    state: &mut RunnerState,
+    token_id_up: &str,
+    _token_id_down: &str,
+    top: &TopOfBook,
+) {
+    if let Some(ref up) = top.token_id_up {
+        if let Some(bid) = up.best_bid {
+            state.interval_min_bid_up = Some(
+                state.interval_min_bid_up.map(|m| m.min(bid)).unwrap_or(bid),
+            );
+            state.interval_max_bid_up = Some(
+                state.interval_max_bid_up.map(|m| m.max(bid)).unwrap_or(bid),
+            );
+        }
+    }
+    if let Some(ref down) = top.token_id_down {
+        if let Some(bid) = down.best_bid {
+            state.interval_min_bid_down = Some(
+                state.interval_min_bid_down.map(|m| m.min(bid)).unwrap_or(bid),
+            );
+            state.interval_max_bid_down = Some(
+                state.interval_max_bid_down.map(|m| m.max(bid)).unwrap_or(bid),
+            );
+        }
+    }
+    if state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some() {
+        let token_id = state
+            .pending_stop_loss
+            .as_ref()
+            .map(|s| s.token_id.as_str())
+            .or_else(|| state.pending_auto_sell.as_ref().map(|t| t.token_id.as_str()));
+        if let Some(tid) = token_id {
+            state.last_best_bid_for_position = if tid == token_id_up {
+                top.token_id_up.as_ref().and_then(|s| s.best_bid)
+            } else {
+                top.token_id_down.as_ref().and_then(|s| s.best_bid)
+            };
+        }
+    }
+}
+
 /// Maximum number of trades (buy + sell) allowed per interval; second trade only when the first was closed by SL.
 const MAX_TRADES_PER_INTERVAL: u32 = 2;
 
@@ -76,6 +120,15 @@ struct RunnerState {
     auto_sell_placed: bool,
     stop_loss_placed: bool,
     interval_switch_wall_time_ms: Option<u64>,
+    /// Session log (JSONL) when MM_SESSION_LOG=true.
+    session_log: Option<SessionLog>,
+    /// Per-interval min/max best_bid for session log (ranged 0.01–0.99).
+    interval_min_bid_up: Option<Decimal>,
+    interval_max_bid_up: Option<Decimal>,
+    interval_min_bid_down: Option<Decimal>,
+    interval_max_bid_down: Option<Decimal>,
+    /// Last best_bid for position side (for MARKET_CLOSE exit_price).
+    last_best_bid_for_position: Option<Decimal>,
 }
 
 fn now_unix() -> u64 {
@@ -245,7 +298,18 @@ pub async fn run() -> Result<()> {
         auto_sell_placed: false,
         stop_loss_placed: false,
         interval_switch_wall_time_ms: None,
+        session_log: None,
+        interval_min_bid_up: None,
+        interval_max_bid_up: None,
+        interval_min_bid_down: None,
+        interval_max_bid_down: None,
+        last_best_bid_for_position: None,
     };
+
+    if config.session_log_enabled {
+        let session_start_ms = now_ms();
+        state.session_log = SessionLog::new(session_start_ms, &config.session_log_dir)?;
+    }
 
     info!(
         "[IntervalSniper] started dry_run={} slug={}",
@@ -276,6 +340,76 @@ pub async fn run() -> Result<()> {
                 .unwrap_or(true);
 
         if need_new_market {
+            // Log position close (MARKET_CLOSE) and interval summary for the market we're leaving
+            if let Some(ref old_market) = state.market {
+                if let Some(ref mut log) = state.session_log {
+                    if state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some() {
+                        let (side, entry_price, entry_time_ms, size) =
+                            if let Some(ref buy) = state.last_buy_order {
+                                (
+                                    buy.side,
+                                    buy.price,
+                                    buy.timestamp_ms,
+                                    buy.size.clone(),
+                                )
+                            } else if let Some(ref sl) = state.pending_stop_loss {
+                                let side = if sl.token_id == old_market.token_id_up {
+                                    EntrySide::Up
+                                } else {
+                                    EntrySide::Down
+                                };
+                                (
+                                    side,
+                                    sl.entry_price,
+                                    sl.placed_at_ms,
+                                    sl.size.clone(),
+                                )
+                            } else if let Some(ref tp) = state.pending_auto_sell {
+                                let side = if tp.token_id == old_market.token_id_up {
+                                    EntrySide::Up
+                                } else {
+                                    EntrySide::Down
+                                };
+                                (
+                                    side,
+                                    state.pending_stop_loss.as_ref().map(|s| s.entry_price).unwrap_or(Decimal::ZERO),
+                                    tp.placed_at_ms,
+                                    tp.size.clone(),
+                                )
+                            } else {
+                                (EntrySide::Up, Decimal::ZERO, now_ms_u, Decimal::ZERO)
+                            };
+                        let exit_price = state.last_best_bid_for_position.unwrap_or(Decimal::ZERO);
+                        if size > Decimal::ZERO {
+                            let _ = log.log_position_close(
+                                &old_market.slug,
+                                old_market.interval_start_unix,
+                                old_market.close_time_unix,
+                                side,
+                                entry_price,
+                                exit_price,
+                                entry_time_ms,
+                                now_ms_u,
+                                ExitType::MarketClose,
+                                size,
+                                state.interval_min_bid_up,
+                                state.interval_max_bid_up,
+                                state.interval_min_bid_down,
+                                state.interval_max_bid_down,
+                            );
+                        }
+                    }
+                    let _ = log.log_interval_summary(
+                        &old_market.slug,
+                        old_market.interval_start_unix,
+                        old_market.close_time_unix,
+                        state.interval_min_bid_up,
+                        state.interval_max_bid_up,
+                        state.interval_min_bid_down,
+                        state.interval_max_bid_down,
+                    );
+                }
+            }
             match fetch_market_by_slug(&http, &config.gamma_base_url, &current_slug).await {
                 Ok(market) => {
                     state.ws_book = None; // drop previous WS before creating new
@@ -305,6 +439,11 @@ pub async fn run() -> Result<()> {
                     state.auto_sell_placed = false;
                     state.stop_loss_placed = false;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
+                    state.interval_min_bid_up = None;
+                    state.interval_max_bid_up = None;
+                    state.interval_min_bid_down = None;
+                    state.interval_max_bid_down = None;
+                    state.last_best_bid_for_position = None;
                     let up_id = market.token_id_up.trim();
                     let down_id = market.token_id_down.trim();
                     info!(
@@ -372,6 +511,14 @@ pub async fn run() -> Result<()> {
                 }
             }
         };
+
+        let token_id_up = market.token_id_up.clone();
+        let token_id_down = market.token_id_down.clone();
+        update_interval_bids(&mut state, &token_id_up, &token_id_down, &top);
+        let market = state
+            .market
+            .as_ref()
+            .expect("market set after need_new_market check");
 
         // Periodic log: order book scan (real-time visibility) — debug only so terminal shows only buy/sell events
         if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
@@ -494,6 +641,26 @@ pub async fn run() -> Result<()> {
                                 "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
                                 fmt_price(Some(&price))
                             );
+                            if let Some(ref mut log) = state.session_log {
+                                if let Some(ref buy) = state.last_buy_order {
+                                    let _ = log.log_position_close(
+                                        &market.slug,
+                                        market.interval_start_unix,
+                                        market.close_time_unix,
+                                        buy.side,
+                                        buy.price,
+                                        price,
+                                        buy.timestamp_ms,
+                                        now_ms_u,
+                                        ExitType::StopLoss,
+                                        size.clone(),
+                                        state.interval_min_bid_up,
+                                        state.interval_max_bid_up,
+                                        state.interval_min_bid_down,
+                                        state.interval_max_bid_down,
+                                    );
+                                }
+                            }
                             state.stop_loss_placed = true;
                             state.auto_sell_placed = true;
                             state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
@@ -648,6 +815,26 @@ pub async fn run() -> Result<()> {
                                             "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
                                             fmt_price(Some(&price_retry))
                                         );
+                                        if let Some(ref mut log) = state.session_log {
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let _ = log.log_position_close(
+                                                    &market.slug,
+                                                    market.interval_start_unix,
+                                                    market.close_time_unix,
+                                                    buy.side,
+                                                    buy.price,
+                                                    price_retry,
+                                                    buy.timestamp_ms,
+                                                    now_ms_u,
+                                                    ExitType::StopLoss,
+                                                    size_retry.clone(),
+                                                    state.interval_min_bid_up,
+                                                    state.interval_max_bid_up,
+                                                    state.interval_min_bid_down,
+                                                    state.interval_max_bid_down,
+                                                );
+                                            }
+                                        }
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
                                         state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
@@ -789,6 +976,26 @@ pub async fn run() -> Result<()> {
                                     "[IntervalSniper] ✓ TP filled @ {} — position closed",
                                     fmt_price(Some(&price))
                                 );
+                                if let Some(ref mut log) = state.session_log {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let _ = log.log_position_close(
+                                            &market.slug,
+                                            market.interval_start_unix,
+                                            market.close_time_unix,
+                                            buy.side,
+                                            buy.price,
+                                            price,
+                                            buy.timestamp_ms,
+                                            now_ms_u,
+                                            ExitType::TakeProfit,
+                                            size.clone(),
+                                            state.interval_min_bid_up,
+                                            state.interval_max_bid_up,
+                                            state.interval_min_bid_down,
+                                            state.interval_max_bid_down,
+                                        );
+                                    }
+                                }
                                 state.auto_sell_placed = true;
                                 state.stop_loss_placed = true;
                                 state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
@@ -939,6 +1146,26 @@ pub async fn run() -> Result<()> {
                                                     "[IntervalSniper] ✓ TP filled @ {} — position closed",
                                                     fmt_price(Some(&price_retry))
                                                 );
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        buy.side,
+                                                        buy.price,
+                                                        price_retry,
+                                                        buy.timestamp_ms,
+                                                        now_ms_u,
+                                                        ExitType::TakeProfit,
+                                                        size_retry.clone(),
+                                                        state.interval_min_bid_up,
+                                                        state.interval_max_bid_up,
+                                                        state.interval_min_bid_down,
+                                                        state.interval_max_bid_down,
+                                                    );
+                                                }
+                                            }
                                             state.auto_sell_placed = true;
                                             state.stop_loss_placed = true;
                                             state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL

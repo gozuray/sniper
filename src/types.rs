@@ -72,6 +72,10 @@ pub struct Config {
     pub min_seconds_after_market_open: u32,
     pub min_seconds_after_buy_before_auto_sell: u32,
     pub take_profit_price_margin: Decimal,
+    /// If true, append session events to a JSONL file in session_log_dir (close, interval_summary, session_summary).
+    pub session_log_enabled: bool,
+    /// Directory for session log files (e.g. "logs"). Created if missing.
+    pub session_log_dir: String,
 }
 
 /// Resolved market from Gamma API.

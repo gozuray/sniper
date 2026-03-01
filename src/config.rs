@@ -153,5 +153,7 @@ pub fn load_config() -> Result<Config> {
         )
         .min(30),
         take_profit_price_margin: take_profit_margin,
+        session_log_enabled: env_bool("MM_SESSION_LOG", false),
+        session_log_dir: env("MM_SESSION_LOG_DIR", "logs").to_string(),
     })
 }
