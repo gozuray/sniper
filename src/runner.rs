@@ -1408,7 +1408,8 @@ pub async fn run() -> Result<()> {
             if in_window && can_buy_after_open {
                 let min_order_size = CLOB_DEFAULT_MIN_ORDER_SIZE;
                 // GtcResting: trigger when best_bid touches range; place GTC limit at max_buy_price + 1 tick.
-                // Otherwise: trigger when best_ask in range; place FAK at best_ask + 1 tick (clamped to range).
+                // FokCrossSpread: trigger when best_ask in range; place FOK at exact price if min==max else best_ask + 1 tick (all-or-nothing).
+                // Otherwise (FakCrossSpread etc): trigger when best_ask in range; place FAK at best_ask + 1 tick (clamped to range).
                 let entry = match state.config.order_strategy {
                     OrderStrategy::GtcResting => choose_side_by_bid(&state.config, &top, min_order_size)
                         .map(|(side, _best_bid, size_available)| {
@@ -1416,14 +1417,38 @@ pub async fn run() -> Result<()> {
                                 round_to_tick(state.config.max_buy_price + TICK_SIZE);
                             (side, size_available, OrderType::Gtc, limit_price)
                         }),
+                    OrderStrategy::FokCrossSpread => {
+                        let exact_price = state.config.min_buy_price == state.config.max_buy_price;
+                        choose_side(&state.config, &top, min_order_size).map(
+                            |(side, best_ask, size_available)| {
+                                let limit_price = if exact_price {
+                                    round_to_tick(state.config.min_buy_price)
+                                } else {
+                                    round_to_tick(
+                                        (best_ask + TICK_SIZE)
+                                            .max(state.config.min_buy_price)
+                                            .min(state.config.max_buy_price),
+                                    )
+                                    .max(best_ask)
+                                };
+                                (side, size_available, OrderType::Fok, limit_price)
+                            },
+                        )
+                    }
                     _ => choose_side(&state.config, &top, min_order_size).map(
                         |(side, best_ask, size_available)| {
-                            let limit_price = round_to_tick(
-                                (best_ask + TICK_SIZE)
-                                    .max(state.config.min_buy_price)
-                                    .min(state.config.max_buy_price),
-                            )
-                            .max(best_ask);
+                            let exact_price =
+                                state.config.min_buy_price == state.config.max_buy_price;
+                            let limit_price = if exact_price {
+                                round_to_tick(state.config.min_buy_price)
+                            } else {
+                                round_to_tick(
+                                    (best_ask + TICK_SIZE)
+                                        .max(state.config.min_buy_price)
+                                        .min(state.config.max_buy_price),
+                                )
+                                .max(best_ask)
+                            };
                             (side, size_available, OrderType::Fak, limit_price)
                         },
                     ),
@@ -1457,6 +1482,7 @@ pub async fn run() -> Result<()> {
                         };
                         let type_str = match order_type {
                             OrderType::Gtc => "GTC limit",
+                            OrderType::Fok => "FOK",
                             OrderType::Fak => "FAK",
                             _ => "limit",
                         };
