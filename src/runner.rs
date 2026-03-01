@@ -246,6 +246,7 @@ fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
 }
 
 /// Fetch CLOB balance for both tokens, optionally detect when balance reflected the last buy, and log every BALANCE_LOG_INTERVAL_MS.
+/// Only runs after a buy in this interval (open position); stops when the interval ends (position cleared).
 /// Logs: balance Up/Down and, when known, "delay desde compra hasta que se reflejó en CLOB: X ms".
 async fn log_clob_balance_if_due(
     clob: &dyn ClobClient,
@@ -253,6 +254,11 @@ async fn log_clob_balance_if_due(
     state: &mut RunnerState,
     now_ms_u: u64,
 ) -> Result<()> {
+    // Solo imprimir después de una compra en este intervalo; al terminar el intervalo se limpia la posición y dejamos de loguear.
+    let has_position = state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some();
+    if !has_position {
+        return Ok(());
+    }
     let due = state
         .last_balance_log_ms
         .map_or(true, |t| now_ms_u.saturating_sub(t) >= BALANCE_LOG_INTERVAL_MS);
