@@ -31,6 +31,8 @@ const FAK_RETRY_DELAY_MS: u64 = 30;
 const SL_FOK_RETRY_DELAY_MS: u64 = 50;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
+/// After backoff, poll CLOB balance this often (ms) until balance available or interval closes.
+const BALANCE_POLL_MS: u64 = 50;
 /// When API returns success but no filled_size (e.g. FAK response missing makingAmount/takingAmount), wait this long for balance to update before reading remaining.
 const FILL_UNKNOWN_BALANCE_DELAY_MS: u64 = 1500;
 /// If filled_size was unknown and balance dropped by less than this many shares, assume full fill (avoid double-sell).
@@ -1197,17 +1199,33 @@ pub async fn run() -> Result<()> {
 
         // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK at best bid, retry at latest bid).
         // Always use position.token_id; sell_size = min(position.size, available). FAK = fill as much as possible or cancel.
+        // Re-fetch book here so we use current best_bid; the main-loop `top` may be stale from earlier work.
         let mut close_sl_available_dust = false;
         let mut close_sl_retry_dust = false;
         if state.config.enable_stop_loss {
             if let Some(ref mut sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
+                    let top_sl = if let Some(ref ws) = state.ws_book {
+                        ws.get_top_of_book().await
+                    } else {
+                        match fetch_top_of_book(
+                            &http,
+                            &clob_host,
+                            &market.token_id_up,
+                            &market.token_id_down,
+                        )
+                        .await
+                        {
+                            Ok(t) => t,
+                            Err(_) => top.clone(),
+                        }
+                    };
                     // Use book only for best_bid; token to sell is always position.token_id.
                     let is_up = sl.token_id == market.token_id_up;
                     let side_book = if is_up {
-                        &top.token_id_up
+                        &top_sl.token_id_up
                     } else {
-                        &top.token_id_down
+                        &top_sl.token_id_down
                     };
                     let best_bid = side_book
                         .as_ref()
@@ -1222,8 +1240,6 @@ pub async fn run() -> Result<()> {
                             }
                             _ => {}
                         }
-                        // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
-                        tokio::time::sleep(Duration::from_millis(350)).await;
                         // SELL FAK at best_bid (aggressive crossing spread): fill as much as possible; price = best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
@@ -1477,7 +1493,6 @@ pub async fn run() -> Result<()> {
                                 );
                                 // Cancel the resting FAK order so balance is freed; next iteration will place one order for remainder.
                                 let _ = clob.cancel_orders_for_token(&sl.token_id).await;
-                                tokio::time::sleep(Duration::from_millis(350)).await;
                             }
                         } else {
                             if result.http_status == Some(400) {
@@ -1536,7 +1551,7 @@ pub async fn run() -> Result<()> {
                                         BALANCE_RETRY_BACKOFF_MS
                                             .get((attempt as usize).saturating_sub(1))
                                             .copied()
-                                            .unwrap_or(400)
+                                            .unwrap_or(BALANCE_POLL_MS)
                                     } else {
                                         // First retry immediate (latest bid); then every 50 ms.
                                         if attempt == 1 {
@@ -1549,7 +1564,6 @@ pub async fn run() -> Result<()> {
                                     if is_balance_error && !canceled_once_for_balance {
                                         let _ = clob.cancel_orders_for_token(&sl.token_id).await;
                                         canceled_once_for_balance = true;
-                                        tokio::time::sleep(Duration::from_millis(350)).await;
                                     }
                                     let top_retry = if let Some(ref ws) = state.ws_book {
                                         ws.get_top_of_book().await
@@ -1750,17 +1764,34 @@ pub async fn run() -> Result<()> {
 
         // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid until filled).
         // Always use position.token_id (the token we bought); sell_size = min(position.size, available).
+        // Re-fetch book here so we use current best_bid; the main-loop `top` may be stale after SL/other work.
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
             if let Some(ref tp) = state.pending_auto_sell {
                 if !state.auto_sell_placed {
                     let elapsed_sec = (now_ms_u - tp.placed_at_ms) / 1000;
                     if elapsed_sec >= state.config.min_seconds_after_buy_before_auto_sell as u64 {
+                        // Fresh book for TP decision so we don't miss the level when price is there.
+                        let top_tp = if let Some(ref ws) = state.ws_book {
+                            ws.get_top_of_book().await
+                        } else {
+                            match fetch_top_of_book(
+                                &http,
+                                &clob_host,
+                                &market.token_id_up,
+                                &market.token_id_down,
+                            )
+                            .await
+                            {
+                                Ok(t) => t,
+                                Err(_) => top.clone(),
+                            }
+                        };
                         // Use book only for best_bid; token to sell is always position.token_id.
                         let is_up = tp.token_id == market.token_id_up;
                         let side_book = if is_up {
-                            &top.token_id_up
+                            &top_tp.token_id_up
                         } else {
-                            &top.token_id_down
+                            &top_tp.token_id_down
                         };
                         let best_bid = side_book
                             .as_ref()
@@ -1776,8 +1807,6 @@ pub async fn run() -> Result<()> {
                                 }
                                 _ => {}
                             }
-                            // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
-                            tokio::time::sleep(Duration::from_millis(350)).await;
                             let position_size_real = tp.size.clone();
                             let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
                             let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
@@ -1918,7 +1947,7 @@ pub async fn run() -> Result<()> {
                                             BALANCE_RETRY_BACKOFF_MS
                                                 .get((attempt as usize).saturating_sub(1))
                                                 .copied()
-                                                .unwrap_or(400)
+                                                .unwrap_or(BALANCE_POLL_MS)
                                         } else {
                                             FAK_RETRY_DELAY_MS
                                         };
@@ -1927,7 +1956,6 @@ pub async fn run() -> Result<()> {
                                             let _ =
                                                 clob.cancel_orders_for_token(&tp.token_id).await;
                                             canceled_once_for_balance = true;
-                                            tokio::time::sleep(Duration::from_millis(350)).await;
                                         }
                                         let top_retry = if let Some(ref ws) = state.ws_book {
                                             ws.get_top_of_book().await
@@ -1965,14 +1993,14 @@ pub async fn run() -> Result<()> {
                                         );
                                         if size_retry < MIN_SELL_SIZE {
                                             warn!(
-                                                "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
+                                                "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={} (retrying until balance available or interval closes)",
                                                 tp.token_id,
                                                 attempt,
                                                 available,
                                                 size_retry,
                                                 MIN_SELL_SIZE
                                             );
-                                            break;
+                                            continue;
                                         }
                                         if size_retry < DUST_THRESHOLD {
                                             if tp.size < DUST_THRESHOLD {
