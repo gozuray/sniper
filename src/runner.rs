@@ -274,10 +274,13 @@ async fn get_available_for_sell(
 }
 
 /// Log balance immediately after a buy (for fast feedback; uses WS when available).
+/// Source label is "WS" only when both balances came from WS; otherwise "REST".
+/// If buy_timestamp_ms is Some, logs delay from buy to balance visible.
 async fn log_balance_after_buy(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
     ws_user: Option<&ClobWsUser>,
+    buy_timestamp_ms: Option<u64>,
 ) {
     let (up, down, source) = if let Some(ws) = ws_user {
         let up_ws = ws.get_balance_for_token(&market.token_id_up).await;
@@ -298,7 +301,12 @@ async fn log_balance_after_buy(
                 .ok()
                 .flatten()
         };
-        (up, down, "WS")
+        let source = if up_ws.is_some() && down_ws.is_some() {
+            "WS"
+        } else {
+            "REST"
+        };
+        (up, down, source)
     } else {
         let up = clob
             .get_available_balance(&market.token_id_up)
@@ -324,6 +332,13 @@ async fn log_balance_after_buy(
         "[IntervalSniper] Balance after buy ({}):  Up={}  Down={}",
         source, up_str, down_str
     );
+    if let Some(ts) = buy_timestamp_ms {
+        let delay_ms = now_ms().saturating_sub(ts);
+        info!(
+            "[IntervalSniper] delay desde compra hasta balance visible: {} ms",
+            delay_ms
+        );
+    }
 }
 
 /// Fetch CLOB balance for both tokens, optionally detect when balance reflected the last buy, and log every BALANCE_LOG_INTERVAL_MS.
@@ -939,7 +954,13 @@ pub async fn run() -> Result<()> {
                         fmt_decimal_2(&sl_size),
                         state.config.stop_loss_quantity_percent
                     );
-                    log_balance_after_buy(clob.as_ref().as_ref(), &market, Some(ws_user)).await;
+                    log_balance_after_buy(
+                        clob.as_ref().as_ref(),
+                        &market,
+                        Some(ws_user),
+                        state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                    )
+                    .await;
                 }
             } else {
                 // Fallback: WS never sent fill; after PENDING_GTC_FALLBACK_MS check REST balance.
@@ -1022,7 +1043,13 @@ pub async fn run() -> Result<()> {
                                 fmt_decimal_2(&sl_size),
                                 state.config.stop_loss_quantity_percent
                             );
-                            log_balance_after_buy(clob.as_ref().as_ref(), &market, Some(ws_user)).await;
+                            log_balance_after_buy(
+                        clob.as_ref().as_ref(),
+                        &market,
+                        Some(ws_user),
+                        state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                    )
+                    .await;
                         }
                     }
                 }
@@ -1111,7 +1138,13 @@ pub async fn run() -> Result<()> {
                             fmt_decimal_2(&sl_size),
                             state.config.stop_loss_quantity_percent
                         );
-                        log_balance_after_buy(clob.as_ref().as_ref(), &market, None).await;
+                        log_balance_after_buy(
+                            clob.as_ref().as_ref(),
+                            &market,
+                            None,
+                            state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                        )
+                        .await;
                     }
                 }
             }
@@ -2266,7 +2299,13 @@ pub async fn run() -> Result<()> {
                                     state.config.stop_loss_quantity_percent
                                 );
                                 let w = state.ws_user.clone();
-                                log_balance_after_buy(clob.as_ref().as_ref(), &market, w.as_ref().map(|a| a.as_ref())).await;
+                                log_balance_after_buy(
+                                    clob.as_ref().as_ref(),
+                                    &market,
+                                    w.as_ref().map(|a| a.as_ref()),
+                                    state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                                )
+                                .await;
                             }
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper]  FAIL  BUY   {}", msg);
