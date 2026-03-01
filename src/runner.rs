@@ -45,6 +45,10 @@ const DUST_THRESHOLD: Decimal = dec!(0.01);
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
 const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
+/// When GTC fill not seen via WS after this many ms, fall back to REST balance to detect fill.
+const PENDING_GTC_FALLBACK_MS: u64 = 45_000;
+/// When no WS user channel, wait this long before using REST balance to detect GTC fill.
+const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 5_000;
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -253,6 +257,73 @@ fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
         let lower = m.to_lowercase();
         lower.contains("invalid amounts") || lower.contains("maker and taker amount")
     })
+}
+
+/// Get available balance for a token for TP/SL: prefer WS (instant after fill) then REST.
+async fn get_available_for_sell(
+    clob: &dyn ClobClient,
+    ws_user: Option<&ClobWsUser>,
+    token_id: &str,
+) -> Option<Decimal> {
+    if let Some(ws) = ws_user {
+        if let Some(b) = ws.get_balance_for_token(token_id).await {
+            return Some(b);
+        }
+    }
+    clob.get_available_balance(token_id).await.ok().flatten()
+}
+
+/// Log balance immediately after a buy (for fast feedback; uses WS when available).
+async fn log_balance_after_buy(
+    clob: &dyn ClobClient,
+    market: &ResolvedMarket,
+    ws_user: Option<&ClobWsUser>,
+) {
+    let (up, down, source) = if let Some(ws) = ws_user {
+        let up_ws = ws.get_balance_for_token(&market.token_id_up).await;
+        let down_ws = ws.get_balance_for_token(&market.token_id_down).await;
+        let up = if up_ws.is_some() {
+            up_ws
+        } else {
+            clob.get_available_balance(&market.token_id_up)
+                .await
+                .ok()
+                .flatten()
+        };
+        let down = if down_ws.is_some() {
+            down_ws
+        } else {
+            clob.get_available_balance(&market.token_id_down)
+                .await
+                .ok()
+                .flatten()
+        };
+        (up, down, "WS")
+    } else {
+        let up = clob
+            .get_available_balance(&market.token_id_up)
+            .await
+            .ok()
+            .flatten();
+        let down = clob
+            .get_available_balance(&market.token_id_down)
+            .await
+            .ok()
+            .flatten();
+        (up, down, "REST")
+    };
+    let up_str = up
+        .as_ref()
+        .map(fmt_decimal_2)
+        .unwrap_or_else(|| "-".to_string());
+    let down_str = down
+        .as_ref()
+        .map(fmt_decimal_2)
+        .unwrap_or_else(|| "-".to_string());
+    info!(
+        "[IntervalSniper] Balance after buy ({}):  Up={}  Down={}",
+        source, up_str, down_str
+    );
 }
 
 /// Fetch CLOB balance for both tokens, optionally detect when balance reflected the last buy, and log every BALANCE_LOG_INTERVAL_MS.
@@ -868,6 +939,180 @@ pub async fn run() -> Result<()> {
                         fmt_decimal_2(&sl_size),
                         state.config.stop_loss_quantity_percent
                     );
+                    log_balance_after_buy(clob.as_ref().as_ref(), &market, Some(ws_user)).await;
+                }
+            } else {
+                // Fallback: WS never sent fill; after PENDING_GTC_FALLBACK_MS check REST balance.
+                let waited_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(0));
+                if waited_ms >= PENDING_GTC_FALLBACK_MS
+                    && state.pending_gtc_token_id.is_some()
+                    && state.pending_gtc_requested_size.is_some()
+                    && state.pending_gtc_side.is_some()
+                    && state.pending_gtc_price.is_some()
+                {
+                    let token_id = state.pending_gtc_token_id.as_ref().unwrap().clone();
+                    let requested = state.pending_gtc_requested_size.as_ref().unwrap().clone();
+                    if let Ok(Some(av)) = clob.as_ref().get_available_balance(&token_id).await {
+                        let threshold = (requested.clone() * dec!(0.99)).max(requested.clone() - dec!(0.01));
+                        if av >= threshold && av >= MIN_SELL_SIZE {
+                            let filled = av.min(requested);
+                            let entry_side = state.pending_gtc_side.unwrap();
+                            let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
+                            state.trades_this_interval += 1;
+                            state.total_shares_this_interval += filled.clone();
+                            state.last_buy_order = Some(LastBuyOrder {
+                                token_id: token_id.clone(),
+                                side: entry_side,
+                                size: filled.clone(),
+                                price: entry_price.clone(),
+                                timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
+                            });
+                            let target_price = if state.config.auto_sell_at_max_price {
+                                dec!(0.99)
+                            } else {
+                                round_to_tick(state.config.take_profit_price)
+                            };
+                            let base_sell_size = floor_to_decimals(
+                                filled.clone().min(state.config.size_shares),
+                                SELL_SIZE_DECIMALS,
+                            )
+                            .max(MIN_SELL_SIZE);
+                            let pct_tp =
+                                Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
+                            let pct_sl =
+                                Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
+                            let tp_size = floor_to_decimals(base_sell_size * pct_tp, SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(base_sell_size);
+                            let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(base_sell_size);
+                            state.pending_auto_sell = Some(PendingAutoSell {
+                                token_id: token_id.clone(),
+                                target_price,
+                                size: tp_size,
+                                placed_at_ms: now_ms_u,
+                            });
+                            state.pending_stop_loss = Some(PendingStopLoss {
+                                token_id,
+                                entry_price: entry_price.clone(),
+                                size: sl_size,
+                                trigger_price: round_to_tick(state.config.stop_loss_price),
+                                placed_at_ms: now_ms_u,
+                            });
+                            state.auto_sell_placed = false;
+                            state.stop_loss_placed = false;
+                            state.pending_gtc_order_id = None;
+                            state.pending_gtc_token_id = None;
+                            state.pending_gtc_side = None;
+                            state.pending_gtc_price = None;
+                            state.pending_gtc_requested_size = None;
+                            state.pending_gtc_timestamp_ms = None;
+                            let side_str = match entry_side {
+                                EntrySide::Up => "Up  ",
+                                EntrySide::Down => "Down",
+                            };
+                            info!(
+                                "[IntervalSniper]  BUY   {}  @ {}   size={} (fill from REST fallback)   TP size={} ({}%)   SL size={} ({}%)",
+                                side_str,
+                                fmt_decimal_2(&entry_price),
+                                fmt_decimal_2(&filled),
+                                fmt_decimal_2(&tp_size),
+                                state.config.auto_sell_quantity_percent,
+                                fmt_decimal_2(&sl_size),
+                                state.config.stop_loss_quantity_percent
+                            );
+                            log_balance_after_buy(clob.as_ref().as_ref(), &market, Some(ws_user)).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // When pending GTC but no WS user channel, use REST balance after short delay to detect fill.
+        if state.pending_gtc_order_id.is_some()
+            && state.ws_user.is_none()
+            && state.pending_gtc_token_id.is_some()
+            && state.pending_gtc_requested_size.is_some()
+            && state.pending_gtc_side.is_some()
+            && state.pending_gtc_price.is_some()
+        {
+            let waited_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(0));
+            if waited_ms >= PENDING_GTC_NO_WS_FALLBACK_MS {
+                let token_id = state.pending_gtc_token_id.as_ref().unwrap().clone();
+                let requested = state.pending_gtc_requested_size.as_ref().unwrap().clone();
+                if let Ok(Some(av)) = clob.as_ref().get_available_balance(&token_id).await {
+                    let threshold = (requested.clone() * dec!(0.99)).max(requested.clone() - dec!(0.01));
+                    if av >= threshold && av >= MIN_SELL_SIZE {
+                        let filled = av.min(requested);
+                        let entry_side = state.pending_gtc_side.unwrap();
+                        let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
+                        state.trades_this_interval += 1;
+                        state.total_shares_this_interval += filled.clone();
+                        state.last_buy_order = Some(LastBuyOrder {
+                            token_id: token_id.clone(),
+                            side: entry_side,
+                            size: filled.clone(),
+                            price: entry_price.clone(),
+                            timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
+                        });
+                        let target_price = if state.config.auto_sell_at_max_price {
+                            dec!(0.99)
+                        } else {
+                            round_to_tick(state.config.take_profit_price)
+                        };
+                        let base_sell_size = floor_to_decimals(
+                            filled.clone().min(state.config.size_shares),
+                            SELL_SIZE_DECIMALS,
+                        )
+                        .max(MIN_SELL_SIZE);
+                        let pct_tp =
+                            Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
+                        let pct_sl =
+                            Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
+                        let tp_size = floor_to_decimals(base_sell_size * pct_tp, SELL_SIZE_DECIMALS)
+                            .max(MIN_SELL_SIZE)
+                            .min(base_sell_size);
+                        let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
+                            .max(MIN_SELL_SIZE)
+                            .min(base_sell_size);
+                        state.pending_auto_sell = Some(PendingAutoSell {
+                            token_id: token_id.clone(),
+                            target_price,
+                            size: tp_size,
+                            placed_at_ms: now_ms_u,
+                        });
+                        state.pending_stop_loss = Some(PendingStopLoss {
+                            token_id,
+                            entry_price: entry_price.clone(),
+                            size: sl_size,
+                            trigger_price: round_to_tick(state.config.stop_loss_price),
+                            placed_at_ms: now_ms_u,
+                        });
+                        state.auto_sell_placed = false;
+                        state.stop_loss_placed = false;
+                        state.pending_gtc_order_id = None;
+                        state.pending_gtc_token_id = None;
+                        state.pending_gtc_side = None;
+                        state.pending_gtc_price = None;
+                        state.pending_gtc_requested_size = None;
+                        state.pending_gtc_timestamp_ms = None;
+                        let side_str = match entry_side {
+                            EntrySide::Up => "Up  ",
+                            EntrySide::Down => "Down",
+                        };
+                        info!(
+                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill from REST, no WS)   TP size={} ({}%)   SL size={} ({}%)",
+                            side_str,
+                            fmt_decimal_2(&entry_price),
+                            fmt_decimal_2(&filled),
+                            fmt_decimal_2(&tp_size),
+                            state.config.auto_sell_quantity_percent,
+                            fmt_decimal_2(&sl_size),
+                            state.config.stop_loss_quantity_percent
+                        );
+                        log_balance_after_buy(clob.as_ref().as_ref(), &market, None).await;
+                    }
                 }
             }
         }
@@ -949,11 +1194,7 @@ pub async fn run() -> Result<()> {
                         // SELL FAK at best_bid (aggressive crossing spread): fill as much as possible; price = best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
-                        let available = clob
-                            .get_available_balance(&sl.token_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id).await;
                         let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                         if size < MIN_SELL_SIZE {
                             // Balance puede estar bloqueado. Reintentar cada 50 ms hasta venta success,
@@ -1007,11 +1248,7 @@ pub async fn run() -> Result<()> {
                                     );
                                     break;
                                 }
-                                let available_recheck = clob
-                                    .get_available_balance(&sl.token_id)
-                                    .await
-                                    .ok()
-                                    .flatten();
+                                let available_recheck = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id).await;
                                 let size_recheck =
                                     effective_sell_size(position_size_real.clone(), available_recheck.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                                 if size_recheck < MIN_SELL_SIZE {
@@ -1318,11 +1555,7 @@ pub async fn run() -> Result<()> {
                                         break;
                                     }
                                     let position_size_real = sl.size.clone();
-                                    let available = clob
-                                        .get_available_balance(&sl.token_id)
-                                        .await
-                                        .ok()
-                                        .flatten();
+                                    let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id).await;
                                     let size_retry =
                                         effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                                     if size_retry < MIN_SELL_SIZE {
@@ -1513,11 +1746,7 @@ pub async fn run() -> Result<()> {
                             // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                             tokio::time::sleep(Duration::from_millis(350)).await;
                             let position_size_real = tp.size.clone();
-                            let available = clob
-                                .get_available_balance(&tp.token_id)
-                                .await
-                                .ok()
-                                .flatten();
+                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
                             let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                             if size < MIN_SELL_SIZE {
                                 warn!(
@@ -1695,11 +1924,7 @@ pub async fn run() -> Result<()> {
                                             continue;
                                         }
                                         let position_size_real = tp.size.clone();
-                                        let available = clob
-                                            .get_available_balance(&tp.token_id)
-                                            .await
-                                            .ok()
-                                            .flatten();
+                                        let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
                                         let size_retry = effective_sell_size(
                                             position_size_real,
                                             available.clone(),
@@ -2040,6 +2265,8 @@ pub async fn run() -> Result<()> {
                                     fmt_decimal_2(&sl_size),
                                     state.config.stop_loss_quantity_percent
                                 );
+                                let w = state.ws_user.clone();
+                                log_balance_after_buy(clob.as_ref().as_ref(), &market, w.as_ref().map(|a| a.as_ref())).await;
                             }
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper]  FAIL  BUY   {}", msg);

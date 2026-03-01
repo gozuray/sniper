@@ -41,6 +41,16 @@ fn parse_decimal_value(v: &serde_json::Value) -> Option<Decimal> {
     Decimal::from_str(&s).ok().filter(|d| *d >= Decimal::ZERO)
 }
 
+/// Canonical order_id for map key: "0x" + lowercase hex (REST and WS may differ by case).
+fn normalize_order_id(id: &str) -> String {
+    let s = id.trim().trim_start_matches("0x").to_lowercase();
+    if s.is_empty() {
+        id.to_string()
+    } else {
+        format!("0x{}", s)
+    }
+}
+
 /// Client for CLOB WebSocket user channel. Holds order fill state in a background task.
 pub struct ClobWsUser {
     state: Arc<RwLock<HashMap<String, UserOrderState>>>,
@@ -157,8 +167,9 @@ impl ClobWsUser {
                 .to_uppercase();
 
             if let Some(order_id) = id {
+                let key = normalize_order_id(&order_id);
                 let entry = UserOrderState {
-                    order_id: order_id.clone(),
+                    order_id: key.clone(),
                     asset_id,
                     side,
                     original_size,
@@ -166,7 +177,7 @@ impl ClobWsUser {
                     order_type: order_type.clone(),
                 };
                 let mut map = state.write().await;
-                map.insert(order_id, entry);
+                map.insert(key, entry);
             }
         } else if event_type == "trade" {
             // Trade: optional order id linkage; we may get size/price here too.
@@ -179,8 +190,9 @@ impl ClobWsUser {
 
     /// Return the current filled size (size_matched) for an order, if known.
     pub async fn get_order_filled_size(&self, order_id: &str) -> Option<Decimal> {
+        let key = normalize_order_id(order_id);
         let map = self.state.read().await;
-        map.get(order_id)
+        map.get(&key)
             .filter(|s| s.size_matched > Decimal::ZERO)
             .map(|s| s.size_matched)
     }
@@ -212,7 +224,8 @@ impl ClobWsUser {
 
     /// Return full order state for an order_id.
     pub async fn get_order_state(&self, order_id: &str) -> Option<UserOrderState> {
+        let key = normalize_order_id(order_id);
         let map = self.state.read().await;
-        map.get(order_id).cloned()
+        map.get(&key).cloned()
     }
 }
