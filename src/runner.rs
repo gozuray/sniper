@@ -24,6 +24,8 @@ const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
 /// Delay between FAK retries when no match (ms). Kept low for near-instant retries.
 const FAK_RETRY_DELAY_MS: u64 = 30;
+/// Delay between SL FOK retries (ms). Each retry uses latest best bid.
+const SL_FOK_RETRY_DELAY_MS: u64 = 100;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
 /// When API returns success but no filled_size (e.g. FAK response missing makingAmount/takingAmount), wait this long for balance to update before reading remaining.
@@ -416,9 +418,8 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK, retry at latest bid until filled).
-        // Always use position.token_id (the token we bought), never derive from book; sell_size = min(position.size, available).
-        // On partial fill: update pending size and repeat until position is fully closed.
+        // Stop loss: if pending and best_bid <= trigger_price -> sell (FOK at best bid, retry every 100 ms at latest bid).
+        // Always use position.token_id; sell_size = min(position.size, available). FOK = 100% fill or nothing.
         if state.config.enable_stop_loss {
             if let Some(ref mut sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
@@ -444,7 +445,7 @@ pub async fn run() -> Result<()> {
                         }
                         // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                         tokio::time::sleep(Duration::from_millis(350)).await;
-                        // SELL FAK must cross: limit_price = best_bid (or best_bid - tick). Use best_bid so order matches.
+                        // SELL FOK at best_bid (target for SL): 100% fill or cancel; price = best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
                         let available = clob
@@ -484,46 +485,11 @@ pub async fn run() -> Result<()> {
                                 &sl.token_id,
                                 price,
                                 size.clone(),
-                                state.config.stop_loss_time_in_force,
+                                crate::types::SellOrderTimeInForce::Fok,
                             )
                             .await?;
                         if result.success {
-                            // Check if sell was partial: repeat until position fully closed.
-                            let remaining = match result.filled_size {
-                                Some(filled) => {
-                                    let rem = sl.size - filled;
-                                    floor_to_decimals(rem.max(Decimal::ZERO), SELL_SIZE_DECIMALS)
-                                }
-                                None => {
-                                    // API did not return filled amount (e.g. makingAmount/takingAmount missing). Wait for balance to update.
-                                    tokio::time::sleep(Duration::from_millis(FILL_UNKNOWN_BALANCE_DELAY_MS)).await;
-                                    let balance = clob
-                                        .get_available_balance(&sl.token_id)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or(Decimal::ZERO);
-                                    // If balance barely dropped, exchange filled but API didn't report it — assume full fill to avoid double-sell.
-                                    if balance >= sl.size - FILL_UNKNOWN_ASSUME_FULL_THRESHOLD && balance <= sl.size + FILL_UNKNOWN_ASSUME_FULL_THRESHOLD {
-                                        info!(
-                                            "[IntervalSniper] SL filled (API did not return filled size; balance ~unchanged {}) — considering position closed",
-                                            balance
-                                        );
-                                        Decimal::ZERO
-                                    } else {
-                                        balance
-                                    }
-                                }
-                            };
-                            if remaining >= DUST_THRESHOLD {
-                                info!(
-                                    "[IntervalSniper] SL partial fill, remaining to sell: {} — will repeat until complete",
-                                    remaining
-                                );
-                                sl.size = remaining;
-                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                continue;
-                            }
+                            // FOK success = 100% filled; position closed.
                             info!(
                                 "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
                                 fmt_price(Some(&price)),
@@ -533,7 +499,6 @@ pub async fn run() -> Result<()> {
                             state.stop_loss_placed = true;
                             state.auto_sell_placed = true;
                             state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
-                            // Clear position state so we can re-enter at target price (max 2 trades per interval).
                             state.pending_auto_sell = None;
                             state.pending_stop_loss = None;
                             state.last_buy_order = None;
@@ -573,7 +538,7 @@ pub async fn run() -> Result<()> {
                                 if is_balance_error {
                                     info!("[IntervalSniper] stop loss: balance/allowance error, canceling open orders once and retrying with backoff");
                                 } else {
-                                    info!("[IntervalSniper] stop loss no match, retrying FAK at latest bid until liquidated");
+                                    info!("[IntervalSniper] stop loss FOK no match, retrying at latest bid every 100 ms until filled");
                                 }
                                 let mut filled = false;
                                 let mut canceled_once_for_balance = false;
@@ -597,7 +562,12 @@ pub async fn run() -> Result<()> {
                                             .copied()
                                             .unwrap_or(400)
                                     } else {
-                                        FAK_RETRY_DELAY_MS
+                                        // First retry immediate (latest bid); then every 100 ms.
+                                        if attempt == 1 {
+                                            0
+                                        } else {
+                                            SL_FOK_RETRY_DELAY_MS
+                                        }
                                     };
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                     if is_balance_error && !canceled_once_for_balance {
@@ -671,45 +641,11 @@ pub async fn run() -> Result<()> {
                                             &sl.token_id,
                                             price_retry,
                                             size_retry.clone(),
-                                            crate::types::SellOrderTimeInForce::Fak,
+                                            crate::types::SellOrderTimeInForce::Fok,
                                         )
                                         .await?;
                                     if result_retry.success {
-                                        // Partial fill: repeat until position fully closed.
-                                        let remaining = match result_retry.filled_size {
-                                            Some(filled) => {
-                                                let rem = size_retry - filled;
-                                                floor_to_decimals(rem.max(Decimal::ZERO), SELL_SIZE_DECIMALS)
-                                            }
-                                            None => {
-                                                tokio::time::sleep(Duration::from_millis(FILL_UNKNOWN_BALANCE_DELAY_MS)).await;
-                                                let balance = clob
-                                                    .get_available_balance(&sl.token_id)
-                                                    .await
-                                                    .ok()
-                                                    .flatten()
-                                                    .unwrap_or(Decimal::ZERO);
-                                                if balance >= size_retry - FILL_UNKNOWN_ASSUME_FULL_THRESHOLD
-                                                    && balance <= size_retry + FILL_UNKNOWN_ASSUME_FULL_THRESHOLD
-                                                {
-                                                    info!(
-                                                        "[IntervalSniper] SL filled (attempt {}, API did not return filled size; balance ~unchanged {}) — considering position closed",
-                                                        attempt, balance
-                                                    );
-                                                    Decimal::ZERO
-                                                } else {
-                                                    balance
-                                                }
-                                            }
-                                        };
-                                        if remaining >= DUST_THRESHOLD {
-                                            info!(
-                                                "[IntervalSniper] SL partial fill (attempt {}), remaining to sell: {} — continuing until complete",
-                                                attempt, remaining
-                                            );
-                                            sl.size = remaining;
-                                            continue;
-                                        }
+                                        // FOK success = 100% filled; position closed.
                                         info!(
                                             "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
                                             fmt_price(Some(&price_retry)),

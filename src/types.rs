@@ -66,7 +66,6 @@ pub struct Config {
     /// Fixed price: sell when best_bid <= this (stop loss).
     pub stop_loss_price: Decimal,
     pub stop_loss_quantity_percent: u8,
-    pub stop_loss_time_in_force: SellOrderTimeInForce,
     pub loop_ms: u64,
     pub cooldown_between_orders_ms: u64,
     pub no_window_all_intervals: bool,
