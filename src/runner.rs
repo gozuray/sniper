@@ -145,6 +145,8 @@ struct RunnerState {
     last_balance_log_ms: Option<u64>,
     /// When the CLOB balance first reflected the last buy (ms); used to log delay since purchase.
     balance_reflected_at_ms: Option<u64>,
+    /// True after we logged "delay desde compra hasta que se reflejó en CLOB" once this position; avoids spam.
+    balance_delay_clob_logged: bool,
     /// GTC order placed but no filled_size in response: wait for fill from ws_user or balance.
     pending_gtc_order_id: Option<String>,
     pending_gtc_token_id: Option<String>,
@@ -277,12 +279,13 @@ async fn get_available_for_sell(
 
 /// Log balance immediately after a buy (for fast feedback; uses WS when available).
 /// Source label is "WS" only when both balances came from WS; otherwise "REST".
-/// If buy_timestamp_ms is Some, logs delay from buy to balance visible.
+/// If buy_timestamp_ms is Some, logs delay from buy to balance visible only when bought-side balance > 0.2 (once, no spam).
 async fn log_balance_after_buy(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
     ws_user: Option<&ClobWsUser>,
     buy_timestamp_ms: Option<u64>,
+    bought_side: Option<EntrySide>,
 ) {
     let (up, down, source) = if let Some(ws) = ws_user {
         let up_ws = ws.get_balance_for_token(&market.token_id_up).await;
@@ -334,12 +337,19 @@ async fn log_balance_after_buy(
         "[IntervalSniper] Balance after buy ({}):  Up={}  Down={}",
         source, up_str, down_str
     );
+    let bought_balance = match bought_side {
+        Some(EntrySide::Up) => up,
+        Some(EntrySide::Down) => down,
+        None => None,
+    };
     if let Some(ts) = buy_timestamp_ms {
-        let delay_ms = now_ms().saturating_sub(ts);
-        info!(
-            "[IntervalSniper] delay desde compra hasta balance visible: {} ms",
-            delay_ms
-        );
+        if bought_balance.map_or(false, |b| b > dec!(0.2)) {
+            let delay_ms = now_ms().saturating_sub(ts);
+            info!(
+                "[IntervalSniper] delay desde compra hasta balance visible: {} ms",
+                delay_ms
+            );
+        }
     }
 }
 
@@ -354,6 +364,7 @@ async fn log_clob_balance_if_due(
     ws_user: Option<&ClobWsUser>,
 ) -> Result<()> {
     // Solo imprimir después de una compra en este intervalo; al terminar el intervalo se limpia la posición y dejamos de loguear.
+    const MIN_BALANCE_FOR_DELAY_LOG: Decimal = dec!(0.2);
     let has_position = state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some();
     if !has_position {
         return Ok(());
@@ -418,7 +429,7 @@ async fn log_clob_balance_if_due(
                 state.balance_reflected_at_ms = state
                     .balance_reflected_at_ms
                     .or_else(|| state.last_buy_order.as_ref().map(|b| b.timestamp_ms));
-            } else if available.map_or(false, |a| a >= threshold) {
+            } else if available.map_or(false, |a| a >= threshold && a > MIN_BALANCE_FOR_DELAY_LOG) {
                 state.balance_reflected_at_ms = Some(now_ms_u);
             }
         }
@@ -436,12 +447,25 @@ async fn log_clob_balance_if_due(
         "[IntervalSniper] CLOB balance{}  Up={}  Down={}",
         source, up_str, down_str
     );
-    if let (Some(reflected_ms), Some(ref buy)) = (state.balance_reflected_at_ms, &state.last_buy_order) {
-        let delay_ms = reflected_ms.saturating_sub(buy.timestamp_ms);
-        info!(
-            "[IntervalSniper] delay desde compra hasta que se reflejó en CLOB: {} ms",
-            delay_ms
-        );
+    if !state.balance_delay_clob_logged {
+        if let (Some(reflected_ms), Some(ref buy)) = (state.balance_reflected_at_ms, &state.last_buy_order) {
+            let token_id = state
+                .pending_auto_sell
+                .as_ref()
+                .map(|t| t.token_id.as_str())
+                .or_else(|| state.pending_stop_loss.as_ref().map(|s| s.token_id.as_str()));
+            let available = token_id.and_then(|tid| {
+                if tid == market.token_id_up { up } else { down }
+            });
+            if available.map_or(false, |a| a > MIN_BALANCE_FOR_DELAY_LOG) {
+                let delay_ms = reflected_ms.saturating_sub(buy.timestamp_ms);
+                info!(
+                    "[IntervalSniper] delay desde compra hasta que se reflejó en CLOB: {} ms",
+                    delay_ms
+                );
+                state.balance_delay_clob_logged = true;
+            }
+        }
     }
     state.last_balance_log_ms = Some(now_ms_u);
     Ok(())
@@ -618,6 +642,7 @@ pub async fn run() -> Result<()> {
         last_best_bid_for_position: None,
         last_balance_log_ms: None,
         balance_reflected_at_ms: None,
+        balance_delay_clob_logged: false,
         pending_gtc_order_id: None,
         pending_gtc_token_id: None,
         pending_gtc_side: None,
@@ -770,7 +795,7 @@ pub async fn run() -> Result<()> {
                     state.trades_this_interval = 0;
                     state.re_entry_allowed_after_sl = false;
                     state.total_shares_this_interval = Decimal::ZERO;
-                    state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                     state.pending_gtc_order_id = None;
                     state.pending_gtc_token_id = None;
                     state.pending_gtc_side = None;
@@ -788,7 +813,7 @@ pub async fn run() -> Result<()> {
                     state.interval_max_bid_down = None;
                     state.last_best_bid_for_position = None;
                     state.last_balance_log_ms = None;
-                    state.balance_reflected_at_ms = None;
+                    state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                     let up_id = market.token_id_up.trim();
                     let down_id = market.token_id_down.trim();
                     info!(
@@ -965,6 +990,7 @@ pub async fn run() -> Result<()> {
                         &market,
                         Some(ws_user),
                         state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                        state.last_buy_order.as_ref().map(|b| b.side),
                     )
                     .await;
                 }
@@ -1054,6 +1080,7 @@ pub async fn run() -> Result<()> {
                         &market,
                         Some(ws_user),
                         state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                        state.last_buy_order.as_ref().map(|b| b.side),
                     )
                     .await;
                         }
@@ -1149,6 +1176,7 @@ pub async fn run() -> Result<()> {
                             &market,
                             None,
                             state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                            state.last_buy_order.as_ref().map(|b| b.side),
                         )
                         .await;
                     }
@@ -1318,7 +1346,7 @@ pub async fn run() -> Result<()> {
                                         state.re_entry_allowed_after_sl = true;
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
-                                        state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                        state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                         state.total_shares_this_interval = Decimal::ZERO;
                                         break;
                                     }
@@ -1369,7 +1397,7 @@ pub async fn run() -> Result<()> {
                                         state.re_entry_allowed_after_sl = true;
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
-                                        state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                        state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                         state.total_shares_this_interval = Decimal::ZERO;
                                         break;
                                     }
@@ -1391,7 +1419,7 @@ pub async fn run() -> Result<()> {
                                     state.re_entry_allowed_after_sl = true;
                                     state.pending_auto_sell = None;
                                     state.pending_stop_loss = None;
-                                    state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                     state.total_shares_this_interval = Decimal::ZERO;
                                     break;
                                 }
@@ -1411,7 +1439,7 @@ pub async fn run() -> Result<()> {
                                 state.re_entry_allowed_after_sl = true;
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
-                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                 state.total_shares_this_interval = Decimal::ZERO;
                             } else {
                                 // Sync position size to available when exchange balance is much lower (e.g. first order filled most).
@@ -1425,7 +1453,7 @@ pub async fn run() -> Result<()> {
                                         state.auto_sell_placed = true;
                                         state.re_entry_allowed_after_sl = true;
                                         state.pending_auto_sell = None;
-                                        state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                        state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                         state.total_shares_this_interval = Decimal::ZERO;
                                         close_sl_available_dust = true;
                                     } else if *a < sl.size {
@@ -1485,7 +1513,7 @@ pub async fn run() -> Result<()> {
                                 state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
-                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                 state.total_shares_this_interval = Decimal::ZERO; // re-entry can use full size again
                             } else {
                                 sl.size = remainder.clone();
@@ -1518,7 +1546,7 @@ pub async fn run() -> Result<()> {
                                 state.re_entry_allowed_after_sl = true;
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
-                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                 state.total_shares_this_interval = Decimal::ZERO;
                             } else {
                             let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
@@ -1621,7 +1649,7 @@ pub async fn run() -> Result<()> {
                                                 state.auto_sell_placed = true;
                                                 state.re_entry_allowed_after_sl = true;
                                                 state.pending_auto_sell = None;
-                                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                                 state.total_shares_this_interval = Decimal::ZERO;
                                                 close_sl_retry_dust = true;
                                                 break;
@@ -1650,7 +1678,7 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = true;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
-                                            state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                            state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                             state.total_shares_this_interval = Decimal::ZERO;
                                             break;
                                         }
@@ -1701,7 +1729,7 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
-                                            state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                            state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                             state.total_shares_this_interval = Decimal::ZERO;
                                             filled = true;
                                             break;
@@ -1744,7 +1772,7 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = true;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
-                                            state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                            state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                             state.total_shares_this_interval = Decimal::ZERO;
                                         }
                                         if let Some(msg) = result_retry.error_msg {
@@ -1836,7 +1864,7 @@ pub async fn run() -> Result<()> {
                                     state.re_entry_allowed_after_sl = false;
                                     state.pending_auto_sell = None;
                                     state.pending_stop_loss = None;
-                                    state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                     state.total_shares_this_interval = Decimal::ZERO;
                                 } else {
                                     // Position size is real (e.g. second entry); low available = balance not updated yet — retry like first entry.
@@ -1893,7 +1921,7 @@ pub async fn run() -> Result<()> {
                                 state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
-                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                 state.total_shares_this_interval = Decimal::ZERO;
                             } else {
                                 if result.http_status == Some(400) {
@@ -1915,7 +1943,7 @@ pub async fn run() -> Result<()> {
                                     state.re_entry_allowed_after_sl = false;
                                     state.pending_auto_sell = None;
                                     state.pending_stop_loss = None;
-                                    state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                     state.total_shares_this_interval = Decimal::ZERO;
                                 } else {
                                 let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
@@ -2017,7 +2045,7 @@ pub async fn run() -> Result<()> {
                                                 state.re_entry_allowed_after_sl = false;
                                                 state.pending_auto_sell = None;
                                                 state.pending_stop_loss = None;
-                                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                                 state.total_shares_this_interval = Decimal::ZERO;
                                                 break;
                                             }
@@ -2062,7 +2090,7 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
-                                            state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                            state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                             state.total_shares_this_interval = Decimal::ZERO;
                                             filled = true;
                                             break;
@@ -2095,7 +2123,7 @@ pub async fn run() -> Result<()> {
                                                 state.re_entry_allowed_after_sl = false;
                                                 state.pending_auto_sell = None;
                                                 state.pending_stop_loss = None;
-                                                state.last_buy_order = None; state.balance_reflected_at_ms = None;
+                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false;
                                                 state.total_shares_this_interval = Decimal::ZERO;
                                             }
                                             if let Some(msg) = result_retry.error_msg {
@@ -2338,6 +2366,7 @@ pub async fn run() -> Result<()> {
                                     &market,
                                     w.as_ref().map(|a| a.as_ref()),
                                     state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
+                                    state.last_buy_order.as_ref().map(|b| b.side),
                                 )
                                 .await;
                             }
