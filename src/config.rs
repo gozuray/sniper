@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 const BTC_5MIN_INTERVAL_SEC: u64 = 300;
 const DEFAULT_SECONDS_BEFORE_CLOSE: u32 = 20;
+const DEFAULT_BLOCK_BUY_LAST_SECONDS: u32 = 0;
 const DEFAULT_SIZE_SHARES: &str = "5";
 const DEFAULT_MIN_BUY_PRICE: &str = "0.9";
 const DEFAULT_MAX_BUY_PRICE: &str = "0.95";
@@ -147,6 +148,8 @@ pub fn load_config() -> Result<Config> {
         loop_ms,
         cooldown_between_orders_ms: cooldown_ms,
         no_window_all_intervals: env_bool("MM_NO_WINDOW_ALL_INTERVALS", true),
+        block_buy_last_seconds: env_u32("MM_BLOCK_BUY_LAST_SECONDS", DEFAULT_BLOCK_BUY_LAST_SECONDS)
+            .min(300),
         min_seconds_after_market_open: env_u32("MM_MIN_SECONDS_AFTER_MARKET_OPEN", 0).min(300),
         min_seconds_after_buy_before_auto_sell: env_u32(
             "MM_MIN_SECONDS_AFTER_BUY_BEFORE_AUTO_SELL",

@@ -71,6 +71,8 @@ pub struct Config {
     pub loop_ms: u64,
     pub cooldown_between_orders_ms: u64,
     pub no_window_all_intervals: bool,
+    /// Block buy in the last N seconds of the interval (0 = disabled). E.g. 30 blocks buys when &lt; 30s to close.
+    pub block_buy_last_seconds: u32,
     pub min_seconds_after_market_open: u32,
     pub min_seconds_after_buy_before_auto_sell: u32,
     pub take_profit_price_margin: Decimal,

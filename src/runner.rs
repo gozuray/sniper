@@ -1676,6 +1676,8 @@ pub async fn run() -> Result<()> {
         if can_buy {
             let in_window = state.config.no_window_all_intervals
                 || secs_to_close <= state.config.seconds_before_close as u64;
+            let in_blocked_zone = state.config.block_buy_last_seconds > 0
+                && secs_to_close <= state.config.block_buy_last_seconds as u64;
             let sec_since_start = 300u64.saturating_sub(secs_to_close);
             let min_after_open = state.config.min_seconds_after_market_open.max(3);
             let can_buy_after_open = sec_since_start >= min_after_open as u64;
@@ -1688,7 +1690,7 @@ pub async fn run() -> Result<()> {
                 }
             }
 
-            if in_window && can_buy_after_open {
+            if in_window && can_buy_after_open && !in_blocked_zone {
                 let min_order_size = CLOB_DEFAULT_MIN_ORDER_SIZE;
                 // GtcResting: trigger when best_bid touches range; place GTC limit at max_buy_price + 1 tick.
                 // Gtc: trigger when best_ask in range; place GTC limit at min_buy_price.
