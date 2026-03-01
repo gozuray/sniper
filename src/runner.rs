@@ -602,13 +602,139 @@ pub async fn run() -> Result<()> {
                             .flatten();
                         let size = effective_sell_size(position_size_real, available.clone());
                         if size < MIN_SELL_SIZE {
+                            // Balance puede estar bloqueado. Reintentar cada 50 ms hasta venta success,
+                            // fin de intervalo o best_bid > trigger (como TP, sin límite de intentos).
                             warn!(
-                                "[IntervalSniper] SL available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
-                                sl.token_id,
-                                available,
-                                size,
-                                MIN_SELL_SIZE
+                                "[IntervalSniper] SL available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={} — retrying every 50 ms until filled, interval end, or bid above trigger",
+                                sl.token_id, available, size, MIN_SELL_SIZE
                             );
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(SL_FOK_RETRY_DELAY_MS)).await;
+                                // Fin de intervalo: dejar de reintentar.
+                                let now_check = now_unix();
+                                if now_check >= market.close_time_unix
+                                    || current_5min_slug(config.interval_market) != market.slug
+                                {
+                                    info!(
+                                        "[IntervalSniper] SL available retry: interval ended, stopping and switching market"
+                                    );
+                                    break;
+                                }
+                                // Re-fetch book: si el precio subió por encima del SL, dejamos de intentar.
+                                let top_recheck = if let Some(ref ws) = state.ws_book {
+                                    ws.get_top_of_book().await
+                                } else {
+                                    match fetch_top_of_book(
+                                        &http,
+                                        &clob_host,
+                                        &market.token_id_up,
+                                        &market.token_id_down,
+                                    )
+                                    .await
+                                    {
+                                        Ok(t) => t,
+                                        Err(_) => continue,
+                                    }
+                                };
+                                let side_recheck = if is_up {
+                                    &top_recheck.token_id_up
+                                } else {
+                                    &top_recheck.token_id_down
+                                };
+                                let bid_recheck = side_recheck
+                                    .as_ref()
+                                    .and_then(|s| s.best_bid)
+                                    .unwrap_or(Decimal::ZERO);
+                                if bid_recheck > sl.trigger_price {
+                                    info!(
+                                        "[IntervalSniper] SL: price moved above trigger (bid {} > {}), will retry when bid <= trigger again",
+                                        fmt_price(Some(&bid_recheck)),
+                                        fmt_price(Some(&sl.trigger_price))
+                                    );
+                                    break;
+                                }
+                                let available_recheck = clob
+                                    .get_available_balance(&sl.token_id)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                let size_recheck =
+                                    effective_sell_size(position_size_real.clone(), available_recheck.clone());
+                                if size_recheck < MIN_SELL_SIZE {
+                                    continue;
+                                }
+                                if size_recheck < DUST_THRESHOLD {
+                                    info!(
+                                        "[IntervalSniper] SL dust remaining ({}, below {}), considering position closed",
+                                        size_recheck, DUST_THRESHOLD
+                                    );
+                                    state.stop_loss_placed = true;
+                                    state.auto_sell_placed = true;
+                                    state.re_entry_allowed_after_sl = true;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                    break;
+                                }
+                                let price_recheck = round_to_tick(bid_recheck);
+                                let result_recheck = clob
+                                    .place_sell_order(
+                                        &sl.token_id,
+                                        price_recheck,
+                                        size_recheck.clone(),
+                                        crate::types::SellOrderTimeInForce::Fok,
+                                    )
+                                    .await?;
+                                if result_recheck.success {
+                                    info!(
+                                        "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
+                                        fmt_price(Some(&price_recheck))
+                                    );
+                                    if let Some(ref mut log) = state.session_log {
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let _ = log.log_position_close(
+                                                &market.slug,
+                                                market.interval_start_unix,
+                                                market.close_time_unix,
+                                                buy.side,
+                                                buy.price,
+                                                price_recheck,
+                                                buy.timestamp_ms,
+                                                now_ms_u,
+                                                ExitType::StopLoss,
+                                                size_recheck.clone(),
+                                                state.interval_min_bid_up,
+                                                state.interval_max_bid_up,
+                                                state.interval_min_bid_down,
+                                                state.interval_max_bid_down,
+                                            );
+                                        }
+                                    }
+                                    state.stop_loss_placed = true;
+                                    state.auto_sell_placed = true;
+                                    state.re_entry_allowed_after_sl = true;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                    break;
+                                }
+                                if is_invalid_amounts_error(result_recheck.error_msg.as_deref()) {
+                                    info!(
+                                        "[IntervalSniper] SL: exchange rejected amount (dust/zero), considering position closed"
+                                    );
+                                    state.stop_loss_placed = true;
+                                    state.auto_sell_placed = true;
+                                    state.re_entry_allowed_after_sl = true;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                    break;
+                                }
+                                // No match u otro error: seguir reintentando en 50 ms.
+                            }
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
                         }
@@ -703,7 +829,7 @@ pub async fn run() -> Result<()> {
                                 if is_balance_error {
                                     info!("[IntervalSniper] stop loss: balance/allowance error, canceling open orders once and retrying with backoff");
                                 } else {
-                                    info!("[IntervalSniper] stop loss FOK no match, retrying at latest bid every 100 ms until filled");
+                                    info!("[IntervalSniper] stop loss FOK no match, retrying at latest bid every 50 ms until filled");
                                 }
                                 let mut filled = false;
                                 let mut canceled_once_for_balance = false;
@@ -727,7 +853,7 @@ pub async fn run() -> Result<()> {
                                             .copied()
                                             .unwrap_or(400)
                                     } else {
-                                        // First retry immediate (latest bid); then every 100 ms.
+                                        // First retry immediate (latest bid); then every 50 ms.
                                         if attempt == 1 {
                                             0
                                         } else {
@@ -767,6 +893,15 @@ pub async fn run() -> Result<()> {
                                     if bid <= Decimal::ZERO {
                                         continue;
                                     }
+                                    // Si el precio subió por encima del SL, dejamos de reintentar FOK.
+                                    if bid > sl.trigger_price {
+                                        info!(
+                                            "[IntervalSniper] SL retry: bid {} above trigger {}, stopping retries",
+                                            fmt_price(Some(&bid)),
+                                            fmt_price(Some(&sl.trigger_price))
+                                        );
+                                        break;
+                                    }
                                     let position_size_real = sl.size.clone();
                                     let available = clob
                                         .get_available_balance(&sl.token_id)
@@ -777,14 +912,14 @@ pub async fn run() -> Result<()> {
                                         effective_sell_size(position_size_real, available.clone());
                                     if size_retry < MIN_SELL_SIZE {
                                         warn!(
-                                            "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={}",
+                                            "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={} (retrying in 50 ms)",
                                             sl.token_id,
                                             attempt,
                                             available,
                                             size_retry,
                                             MIN_SELL_SIZE
                                         );
-                                        break;
+                                        continue;
                                     }
                                     if size_retry < DUST_THRESHOLD {
                                         info!(
