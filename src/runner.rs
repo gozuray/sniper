@@ -168,7 +168,11 @@ fn floor_to_decimals(x: Decimal, decimals: u32) -> Decimal {
     ((x * factor).trunc()) / factor
 }
 
-fn effective_sell_size(position_size: Decimal, available: Option<Decimal>) -> Decimal {
+fn effective_sell_size(
+    position_size: Decimal,
+    available: Option<Decimal>,
+    min_order_size: Decimal,
+) -> Decimal {
     let capped = available
         .map(|a| {
             // Leave 1 base unit headroom so encoded amount never exceeds balance after rounding
@@ -176,7 +180,17 @@ fn effective_sell_size(position_size: Decimal, available: Option<Decimal>) -> De
             position_size.min(safe)
         })
         .unwrap_or(position_size);
-    floor_to_decimals(capped, SELL_SIZE_DECIMALS)
+    let result = floor_to_decimals(capped, SELL_SIZE_DECIMALS);
+    // CLOB requires maker amount (sell size) with max 2 decimals; truncation can make e.g. 4.9999 → 4.99, below min 5.
+    // If we're just below min and balance allows, round up so the first attempt succeeds instead of failing then retrying.
+    if result < min_order_size
+        && result >= min_order_size - dec!(0.01)
+        && available.map_or(false, |a| a >= min_order_size)
+    {
+        min_order_size
+    } else {
+        result
+    }
 }
 
 fn fmt_price(p: Option<&Decimal>) -> String {
@@ -689,7 +703,7 @@ pub async fn run() -> Result<()> {
                             .await
                             .ok()
                             .flatten();
-                        let size = effective_sell_size(position_size_real, available.clone());
+                        let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                         if size < MIN_SELL_SIZE {
                             // Balance puede estar bloqueado. Reintentar cada 50 ms hasta venta success,
                             // fin de intervalo o best_bid > trigger (como TP, sin límite de intentos).
@@ -748,7 +762,7 @@ pub async fn run() -> Result<()> {
                                     .ok()
                                     .flatten();
                                 let size_recheck =
-                                    effective_sell_size(position_size_real.clone(), available_recheck.clone());
+                                    effective_sell_size(position_size_real.clone(), available_recheck.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                                 if size_recheck < MIN_SELL_SIZE {
                                     continue;
                                 }
@@ -1038,7 +1052,7 @@ pub async fn run() -> Result<()> {
                                         .ok()
                                         .flatten();
                                     let size_retry =
-                                        effective_sell_size(position_size_real, available.clone());
+                                        effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                                     if size_retry < MIN_SELL_SIZE {
                                         warn!(
                                             "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={} (retrying in 50 ms)",
@@ -1210,7 +1224,7 @@ pub async fn run() -> Result<()> {
                                 .await
                                 .ok()
                                 .flatten();
-                            let size = effective_sell_size(position_size_real, available.clone());
+                            let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                             if size < MIN_SELL_SIZE {
                                 warn!(
                                 "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
@@ -1395,6 +1409,7 @@ pub async fn run() -> Result<()> {
                                         let size_retry = effective_sell_size(
                                             position_size_real,
                                             available.clone(),
+                                            CLOB_DEFAULT_MIN_ORDER_SIZE,
                                         );
                                         if size_retry < MIN_SELL_SIZE {
                                             warn!(
