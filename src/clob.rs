@@ -18,7 +18,7 @@ const CONDITIONAL_BASE_DECIMALS: u32 = 6;
 const CONDITIONAL_BASE_FACTOR: Decimal = dec!(1000000);
 
 /// Order type for placement.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderType {
     Gtc,
     Gtd,

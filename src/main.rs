@@ -3,6 +3,7 @@
 
 mod clob;
 mod clob_ws_book;
+mod clob_ws_user;
 mod config;
 mod market;
 mod orderbook;
