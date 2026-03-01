@@ -654,8 +654,8 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Stop loss: if pending and best_bid <= trigger_price -> sell (FOK at best bid, retry every 100 ms at latest bid).
-        // Always use position.token_id; sell_size = min(position.size, available). FOK = 100% fill or nothing.
+        // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK at best bid, retry at latest bid).
+        // Always use position.token_id; sell_size = min(position.size, available). FAK = fill as much as possible or cancel.
         if state.config.enable_stop_loss {
             if let Some(ref mut sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
@@ -681,7 +681,7 @@ pub async fn run() -> Result<()> {
                         }
                         // Brief delay so CLOB/chain sees balance freed after cancel before we place sell.
                         tokio::time::sleep(Duration::from_millis(350)).await;
-                        // SELL FOK at best_bid (target for SL): 100% fill or cancel; price = best_bid so order matches.
+                        // SELL FAK at best_bid (aggressive crossing spread): fill as much as possible; price = best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
                         let available = clob
@@ -775,41 +775,56 @@ pub async fn run() -> Result<()> {
                                         &sl.token_id,
                                         price_recheck,
                                         size_recheck.clone(),
-                                        crate::types::SellOrderTimeInForce::Fok,
+                                        crate::types::SellOrderTimeInForce::Fak,
                                     )
                                     .await?;
                                 if result_recheck.success {
-                                    info!(
-                                        "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
-                                        fmt_price(Some(&price_recheck))
-                                    );
-                                    if let Some(ref mut log) = state.session_log {
-                                        if let Some(ref buy) = state.last_buy_order {
-                                            let _ = log.log_position_close(
-                                                &market.slug,
-                                                market.interval_start_unix,
-                                                market.close_time_unix,
-                                                buy.side,
-                                                buy.price,
-                                                price_recheck,
-                                                buy.timestamp_ms,
-                                                now_ms_u,
-                                                ExitType::StopLoss,
-                                                size_recheck.clone(),
-                                                state.interval_min_bid_up,
-                                                state.interval_max_bid_up,
-                                                state.interval_min_bid_down,
-                                                state.interval_max_bid_down,
-                                            );
+                                    let filled = result_recheck
+                                        .filled_size
+                                        .filter(|f| *f > Decimal::ZERO)
+                                        .unwrap_or(size_recheck.clone());
+                                    let remainder = size_recheck.clone() - filled.clone();
+                                    if remainder <= Decimal::ZERO || remainder < MIN_SELL_SIZE || remainder < DUST_THRESHOLD {
+                                        info!(
+                                            "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
+                                            fmt_price(Some(&price_recheck))
+                                        );
+                                        if let Some(ref mut log) = state.session_log {
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let _ = log.log_position_close(
+                                                    &market.slug,
+                                                    market.interval_start_unix,
+                                                    market.close_time_unix,
+                                                    buy.side,
+                                                    buy.price,
+                                                    price_recheck,
+                                                    buy.timestamp_ms,
+                                                    now_ms_u,
+                                                    ExitType::StopLoss,
+                                                    size_recheck.clone(),
+                                                    state.interval_min_bid_up,
+                                                    state.interval_max_bid_up,
+                                                    state.interval_min_bid_down,
+                                                    state.interval_max_bid_down,
+                                                );
+                                            }
                                         }
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                        break;
                                     }
-                                    state.stop_loss_placed = true;
-                                    state.auto_sell_placed = true;
-                                    state.re_entry_allowed_after_sl = true;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
+                                    sl.size = remainder.clone();
+                                    info!(
+                                        "[IntervalSniper] SL FAK partial fill {} @ {}, remaining {} — will keep selling while bid <= trigger",
+                                        fmt_decimal_2(&filled),
+                                        fmt_price(Some(&price_recheck)),
+                                        fmt_decimal_2(&remainder)
+                                    );
                                     break;
                                 }
                                 if is_invalid_amounts_error(result_recheck.error_msg.as_deref()) {
@@ -857,42 +872,57 @@ pub async fn run() -> Result<()> {
                                 &sl.token_id,
                                 price,
                                 size.clone(),
-                                crate::types::SellOrderTimeInForce::Fok,
+                                crate::types::SellOrderTimeInForce::Fak,
                             )
                             .await?;
                         if result.success {
-                            // FOK success = 100% filled; position closed.
-                            info!(
-                                "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
-                                fmt_price(Some(&price))
-                            );
-                            if let Some(ref mut log) = state.session_log {
-                                if let Some(ref buy) = state.last_buy_order {
-                                    let _ = log.log_position_close(
-                                        &market.slug,
-                                        market.interval_start_unix,
-                                        market.close_time_unix,
-                                        buy.side,
-                                        buy.price,
-                                        price,
-                                        buy.timestamp_ms,
-                                        now_ms_u,
-                                        ExitType::StopLoss,
-                                        size.clone(),
-                                        state.interval_min_bid_up,
-                                        state.interval_max_bid_up,
-                                        state.interval_min_bid_down,
-                                        state.interval_max_bid_down,
-                                    );
+                            // FAK success: full or partial fill. Retry until all bought in this interval is sold while bid <= trigger.
+                            let filled = result
+                                .filled_size
+                                .filter(|f| *f > Decimal::ZERO)
+                                .unwrap_or(size.clone());
+                            let remainder = size.clone() - filled.clone();
+                            if remainder <= Decimal::ZERO || remainder < MIN_SELL_SIZE || remainder < DUST_THRESHOLD {
+                                info!(
+                                    "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
+                                    fmt_price(Some(&price))
+                                );
+                                if let Some(ref mut log) = state.session_log {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let _ = log.log_position_close(
+                                            &market.slug,
+                                            market.interval_start_unix,
+                                            market.close_time_unix,
+                                            buy.side,
+                                            buy.price,
+                                            price,
+                                            buy.timestamp_ms,
+                                            now_ms_u,
+                                            ExitType::StopLoss,
+                                            size.clone(),
+                                            state.interval_min_bid_up,
+                                            state.interval_max_bid_up,
+                                            state.interval_min_bid_down,
+                                            state.interval_max_bid_down,
+                                        );
+                                    }
                                 }
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO; // re-entry can use full size again
+                            } else {
+                                sl.size = remainder.clone();
+                                info!(
+                                    "[IntervalSniper] SL FAK partial fill {} @ {}, remaining {} — will keep selling while bid <= trigger",
+                                    fmt_decimal_2(&filled),
+                                    fmt_price(Some(&price)),
+                                    fmt_decimal_2(&remainder)
+                                );
                             }
-                            state.stop_loss_placed = true;
-                            state.auto_sell_placed = true;
-                            state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
-                            state.pending_auto_sell = None;
-                            state.pending_stop_loss = None;
-                            state.last_buy_order = None;
-                            state.total_shares_this_interval = Decimal::ZERO; // re-entry can use full size again
                         } else {
                             if result.http_status == Some(400) {
                                 let ba = clob
@@ -928,7 +958,7 @@ pub async fn run() -> Result<()> {
                                 if is_balance_error {
                                     info!("[IntervalSniper] stop loss: balance/allowance error, canceling open orders once and retrying with backoff");
                                 } else {
-                                    info!("[IntervalSniper] stop loss FOK no match, retrying at latest bid every 50 ms until filled");
+                                    info!("[IntervalSniper] stop loss FAK no match, retrying at latest bid every 50 ms until filled");
                                 }
                                 let mut filled = false;
                                 let mut canceled_once_for_balance = false;
@@ -1043,43 +1073,57 @@ pub async fn run() -> Result<()> {
                                             &sl.token_id,
                                             price_retry,
                                             size_retry.clone(),
-                                            crate::types::SellOrderTimeInForce::Fok,
+                                            crate::types::SellOrderTimeInForce::Fak,
                                         )
                                         .await?;
                                     if result_retry.success {
-                                        // FOK success = 100% filled; position closed.
-                                        info!(
-                                            "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
-                                            fmt_price(Some(&price_retry))
-                                        );
-                                        if let Some(ref mut log) = state.session_log {
-                                            if let Some(ref buy) = state.last_buy_order {
-                                                let _ = log.log_position_close(
-                                                    &market.slug,
-                                                    market.interval_start_unix,
-                                                    market.close_time_unix,
-                                                    buy.side,
-                                                    buy.price,
-                                                    price_retry,
-                                                    buy.timestamp_ms,
-                                                    now_ms_u,
-                                                    ExitType::StopLoss,
-                                                    size_retry.clone(),
-                                                    state.interval_min_bid_up,
-                                                    state.interval_max_bid_up,
-                                                    state.interval_min_bid_down,
-                                                    state.interval_max_bid_down,
-                                                );
+                                        let filled_amt = result_retry
+                                            .filled_size
+                                            .filter(|f| *f > Decimal::ZERO)
+                                            .unwrap_or(size_retry.clone());
+                                        let remainder = size_retry.clone() - filled_amt.clone();
+                                        if remainder <= Decimal::ZERO || remainder < MIN_SELL_SIZE || remainder < DUST_THRESHOLD {
+                                            info!(
+                                                "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
+                                                fmt_price(Some(&price_retry))
+                                            );
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        buy.side,
+                                                        buy.price,
+                                                        price_retry,
+                                                        buy.timestamp_ms,
+                                                        now_ms_u,
+                                                        ExitType::StopLoss,
+                                                        size_retry.clone(),
+                                                        state.interval_min_bid_up,
+                                                        state.interval_max_bid_up,
+                                                        state.interval_min_bid_down,
+                                                        state.interval_max_bid_down,
+                                                    );
+                                                }
                                             }
+                                            state.stop_loss_placed = true;
+                                            state.auto_sell_placed = true;
+                                            state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                            filled = true;
+                                            break;
                                         }
-                                        state.stop_loss_placed = true;
-                                        state.auto_sell_placed = true;
-                                        state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
-                                        state.pending_auto_sell = None;
-                                        state.pending_stop_loss = None;
-                                        state.last_buy_order = None;
-                                        state.total_shares_this_interval = Decimal::ZERO;
-                                        filled = true;
+                                        sl.size = remainder.clone();
+                                        info!(
+                                            "[IntervalSniper] SL FAK partial fill {} @ {}, remaining {} — will keep selling while bid <= trigger",
+                                            fmt_decimal_2(&filled_amt),
+                                            fmt_price(Some(&price_retry)),
+                                            fmt_decimal_2(&remainder)
+                                        );
                                         break;
                                     }
                                     // Balance/allowance: we already canceled once; just backoff and retry with position.size (no re-cancel).
