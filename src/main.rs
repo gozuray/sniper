@@ -6,6 +6,7 @@ mod clob_ws_book;
 mod config;
 mod market;
 mod orderbook;
+mod redeem;
 mod runner;
 mod session_log;
 mod signing;

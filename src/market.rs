@@ -45,6 +45,35 @@ pub async fn fetch_market_by_slug(
     parse_gamma_market(&m, slug)
 }
 
+/// Fetch condition IDs for the last N closed 5-min intervals (for redeem). Skips 404/fail.
+pub async fn fetch_resolved_condition_ids(
+    client: &Client,
+    base_url: &str,
+    asset: crate::types::IntervalMarketAsset,
+    last_n_intervals: u32,
+) -> Vec<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let current_start = (now / FIVE_MIN_SECONDS) * FIVE_MIN_SECONDS;
+    let prefix = crate::config::slug_prefix(asset);
+    let mut out = Vec::with_capacity(last_n_intervals as usize);
+    for i in 1..=last_n_intervals {
+        let interval_start = current_start.saturating_sub((i as u64) * FIVE_MIN_SECONDS);
+        let slug = format!("{}-{}", prefix, interval_start);
+        match fetch_market_by_slug(client, base_url, &slug).await {
+            Ok(market) => {
+                if !market.condition_id.is_empty() {
+                    out.push(market.condition_id);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    out
+}
+
 fn parse_gamma_market(m: &GammaMarket, slug: &str) -> Result<ResolvedMarket> {
     let condition_id = m
         .condition_id
