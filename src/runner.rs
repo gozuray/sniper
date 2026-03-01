@@ -664,18 +664,21 @@ pub async fn run() -> Result<()> {
                                     continue;
                                 }
                                 if size_recheck < DUST_THRESHOLD {
-                                    info!(
+                                    if position_size_real < DUST_THRESHOLD {
+                                        info!(
                                         "[IntervalSniper] SL dust remaining ({}, below {}), considering position closed",
                                         size_recheck, DUST_THRESHOLD
                                     );
-                                    state.stop_loss_placed = true;
-                                    state.auto_sell_placed = true;
-                                    state.re_entry_allowed_after_sl = true;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
-                                    break;
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                        break;
+                                    }
+                                    // Position size is real (e.g. second entry); low available = balance not updated — keep retrying.
                                 }
                                 let price_recheck = round_to_tick(bid_recheck);
                                 let result_recheck = clob
@@ -739,17 +742,24 @@ pub async fn run() -> Result<()> {
                             continue;
                         }
                         if size < DUST_THRESHOLD {
-                            info!(
+                            if position_size_real < DUST_THRESHOLD {
+                                info!(
                                 "[IntervalSniper] SL dust remaining ({}, below {}), considering position closed",
                                 size, DUST_THRESHOLD
                             );
-                            state.stop_loss_placed = true;
-                            state.auto_sell_placed = true;
-                            state.re_entry_allowed_after_sl = true;
-                            state.pending_auto_sell = None;
-                            state.pending_stop_loss = None;
-                            state.last_buy_order = None;
-                            state.total_shares_this_interval = Decimal::ZERO;
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.re_entry_allowed_after_sl = true;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                            } else {
+                                warn!(
+                                    "[IntervalSniper] SL available too low to sell: token_id={} available_shares={:?} effective_sell_size={} position_size={} (retrying, balance may update)",
+                                    sl.token_id, available, size, position_size_real
+                                );
+                            }
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
                         }
@@ -922,18 +932,21 @@ pub async fn run() -> Result<()> {
                                         continue;
                                     }
                                     if size_retry < DUST_THRESHOLD {
-                                        info!(
+                                        if sl.size < DUST_THRESHOLD {
+                                            info!(
                                             "[IntervalSniper] SL retry dust remaining ({}), considering position closed",
                                             size_retry
                                         );
-                                        state.stop_loss_placed = true;
-                                        state.auto_sell_placed = true;
-                                        state.re_entry_allowed_after_sl = true;
-                                        state.pending_auto_sell = None;
-                                        state.pending_stop_loss = None;
-                                        state.last_buy_order = None;
-                                        state.total_shares_this_interval = Decimal::ZERO;
-                                        break;
+                                            state.stop_loss_placed = true;
+                                            state.auto_sell_placed = true;
+                                            state.re_entry_allowed_after_sl = true;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                            break;
+                                        }
+                                        // Position size is real (e.g. second entry); low available = balance not updated — keep retrying.
                                     }
                                     let price_retry = round_to_tick(bid);
                                     let result_retry = clob
@@ -1077,17 +1090,25 @@ pub async fn run() -> Result<()> {
                                 continue;
                             }
                             if size < DUST_THRESHOLD {
-                                info!(
+                                if position_size_real < DUST_THRESHOLD {
+                                    info!(
                                     "[IntervalSniper] TP dust remaining ({}, below {}), considering position closed",
                                     size, DUST_THRESHOLD
                                 );
-                                state.auto_sell_placed = true;
-                                state.stop_loss_placed = true;
-                                state.re_entry_allowed_after_sl = false;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.last_buy_order = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
+                                    state.auto_sell_placed = true;
+                                    state.stop_loss_placed = true;
+                                    state.re_entry_allowed_after_sl = false;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                } else {
+                                    // Position size is real (e.g. second entry); low available = balance not updated yet — retry like first entry.
+                                    warn!(
+                                        "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} position_size={} (retrying, balance may update)",
+                                        tp.token_id, available, size, position_size_real
+                                    );
+                                }
                                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                                 continue;
                             }
@@ -1254,18 +1275,21 @@ pub async fn run() -> Result<()> {
                                             break;
                                         }
                                         if size_retry < DUST_THRESHOLD {
-                                            info!(
+                                            if tp.size < DUST_THRESHOLD {
+                                                info!(
                                                 "[IntervalSniper] TP retry dust remaining ({}), considering position closed",
                                                 size_retry
                                             );
-                                            state.auto_sell_placed = true;
-                                            state.stop_loss_placed = true;
-                                            state.re_entry_allowed_after_sl = false;
-                                            state.pending_auto_sell = None;
-                                            state.pending_stop_loss = None;
-                                            state.last_buy_order = None;
-                                            state.total_shares_this_interval = Decimal::ZERO;
-                                            break;
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                                state.re_entry_allowed_after_sl = false;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.last_buy_order = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
+                                                break;
+                                            }
+                                            // Position size is real (e.g. second entry); low available = balance not updated — keep retrying.
                                         }
                                         let price_retry = round_to_tick(bid);
                                         let result_retry = clob
