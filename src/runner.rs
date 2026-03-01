@@ -25,7 +25,7 @@ const LOG_BOOK_EVERY_TICKS: u64 = 10;
 /// Delay between FAK retries when no match (ms). Kept low for near-instant retries.
 const FAK_RETRY_DELAY_MS: u64 = 30;
 /// Delay between SL FOK retries (ms). Each retry uses latest best bid.
-const SL_FOK_RETRY_DELAY_MS: u64 = 100;
+const SL_FOK_RETRY_DELAY_MS: u64 = 50;
 /// Backoff delays (ms) when 400 not enough balance/allowance: cancel once then retry with these delays.
 const BALANCE_RETRY_BACKOFF_MS: &[u64] = &[100, 200, 400];
 /// When API returns success but no filled_size (e.g. FAK response missing makingAmount/takingAmount), wait this long for balance to update before reading remaining.
@@ -491,10 +491,8 @@ pub async fn run() -> Result<()> {
                         if result.success {
                             // FOK success = 100% filled; position closed.
                             info!(
-                                "[IntervalSniper]  SELL  SL   @ {}   (stop loss) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
-                                fmt_price(Some(&price)),
-                                state.trades_this_interval,
-                                MAX_TRADES_PER_INTERVAL
+                                "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
+                                fmt_price(Some(&price))
                             );
                             state.stop_loss_placed = true;
                             state.auto_sell_placed = true;
@@ -566,7 +564,7 @@ pub async fn run() -> Result<()> {
                                         if attempt == 1 {
                                             0
                                         } else {
-                                            SL_FOK_RETRY_DELAY_MS
+                                            SL_FOK_RETRY_DELAY_MS   
                                         }
                                     };
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -647,11 +645,8 @@ pub async fn run() -> Result<()> {
                                     if result_retry.success {
                                         // FOK success = 100% filled; position closed.
                                         info!(
-                                            "[IntervalSniper]  SELL  SL   @ {}   (attempt {}) — position closed, re-entry allowed if price in range (trades this interval: {}/{})",
-                                            fmt_price(Some(&price_retry)),
-                                            attempt,
-                                            state.trades_this_interval,
-                                            MAX_TRADES_PER_INTERVAL
+                                            "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed)",
+                                            fmt_price(Some(&price_retry))
                                         );
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
@@ -791,10 +786,8 @@ pub async fn run() -> Result<()> {
                                 .await?;
                             if result.success {
                                 info!(
-                                    "[IntervalSniper]  SELL  TP   @ {}   (take profit) — position closed (trades this interval: {}/{})",
-                                    fmt_price(Some(&price)),
-                                    state.trades_this_interval,
-                                    MAX_TRADES_PER_INTERVAL
+                                    "[IntervalSniper] ✓ TP filled @ {} — position closed",
+                                    fmt_price(Some(&price))
                                 );
                                 state.auto_sell_placed = true;
                                 state.stop_loss_placed = true;
@@ -942,13 +935,10 @@ pub async fn run() -> Result<()> {
                                             )
                                             .await?;
                                         if result_retry.success {
-                                            info!(
-                                                "[IntervalSniper]  SELL  TP   @ {}   (attempt {}) — position closed (trades this interval: {}/{})",
-                                                fmt_price(Some(&price_retry)),
-                                                attempt,
-                                                state.trades_this_interval,
-                                                MAX_TRADES_PER_INTERVAL
-                                            );
+                                                info!(
+                                                    "[IntervalSniper] ✓ TP filled @ {} — position closed",
+                                                    fmt_price(Some(&price_retry))
+                                                );
                                             state.auto_sell_placed = true;
                                             state.stop_loss_placed = true;
                                             state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
