@@ -670,6 +670,8 @@ pub async fn run() -> Result<()> {
 
         // Stop loss: if pending and best_bid <= trigger_price -> sell (FAK at best bid, retry at latest bid).
         // Always use position.token_id; sell_size = min(position.size, available). FAK = fill as much as possible or cancel.
+        let mut close_sl_available_dust = false;
+        let mut close_sl_retry_dust = false;
         if state.config.enable_stop_loss {
             if let Some(ref mut sl) = state.pending_stop_loss {
                 if !state.stop_loss_placed {
@@ -873,6 +875,24 @@ pub async fn run() -> Result<()> {
                                 state.last_buy_order = None;
                                 state.total_shares_this_interval = Decimal::ZERO;
                             } else {
+                                // Sync position size to available when exchange balance is much lower (e.g. first order filled most).
+                                if let Some(ref a) = available {
+                                    if *a <= DUST_THRESHOLD {
+                                        info!(
+                                            "[IntervalSniper] SL available dust ({}, below {}), considering position closed",
+                                            a, DUST_THRESHOLD
+                                        );
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true;
+                                        state.pending_auto_sell = None;
+                                        state.last_buy_order = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                        close_sl_available_dust = true;
+                                    } else if *a < sl.size {
+                                        sl.size = a.clone();
+                                    }
+                                }
                                 warn!(
                                     "[IntervalSniper] SL available too low to sell: token_id={} available_shares={:?} effective_sell_size={} position_size={} (retrying, balance may update)",
                                     sl.token_id, available, size, position_size_real
@@ -936,6 +956,9 @@ pub async fn run() -> Result<()> {
                                     fmt_price(Some(&price)),
                                     fmt_decimal_2(&remainder)
                                 );
+                                // Cancel the resting FAK order so balance is freed; next iteration will place one order for remainder.
+                                let _ = clob.cancel_orders_for_token(&sl.token_id).await;
+                                tokio::time::sleep(Duration::from_millis(350)).await;
                             }
                         } else {
                             if result.http_status == Some(400) {
@@ -1054,6 +1077,25 @@ pub async fn run() -> Result<()> {
                                     let size_retry =
                                         effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                                     if size_retry < MIN_SELL_SIZE {
+                                        // Sync position size to available when exchange balance is much lower (e.g. first order filled most).
+                                        if let Some(ref a) = available {
+                                            if *a <= DUST_THRESHOLD {
+                                                info!(
+                                                    "[IntervalSniper] SL retry: available dust ({}, below {}), considering position closed",
+                                                    a, DUST_THRESHOLD
+                                                );
+                                                state.stop_loss_placed = true;
+                                                state.auto_sell_placed = true;
+                                                state.re_entry_allowed_after_sl = true;
+                                                state.pending_auto_sell = None;
+                                                state.last_buy_order = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
+                                                close_sl_retry_dust = true;
+                                                break;
+                                            } else if *a < sl.size {
+                                                sl.size = a.clone();
+                                            }
+                                        }
                                         warn!(
                                             "[IntervalSniper] SL available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={} (retrying in 50 ms)",
                                             sl.token_id,
@@ -1186,6 +1228,9 @@ pub async fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        if close_sl_available_dust || close_sl_retry_dust {
+            state.pending_stop_loss = None;
         }
 
         // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid until filled).
