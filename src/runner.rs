@@ -1853,13 +1853,17 @@ pub async fn run() -> Result<()> {
                             let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
                             let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                             if size < MIN_SELL_SIZE {
-                                warn!(
+                                let is_dust =
+                                    size < DUST_THRESHOLD || available.map_or(false, |a| a < DUST_THRESHOLD);
+                                if !is_dust {
+                                    warn!(
                                 "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
                                 tp.token_id,
                                 available,
                                 size,
                                 MIN_SELL_SIZE
                             );
+                                }
                                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                                 continue;
                             }
@@ -1876,12 +1880,33 @@ pub async fn run() -> Result<()> {
                                     state.pending_stop_loss = None;
                                     state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
                                     state.total_shares_this_interval = Decimal::ZERO;
+                                } else if available.map_or(false, |a| a < position_size_real * dec!(0.1))
+                                    && size < CLOB_DEFAULT_MIN_ORDER_SIZE
+                                {
+                                    // Available << position_size: position was likely closed elsewhere (e.g. SL)
+                                    // and balance already reflects it. Clear state so we don't block forever and
+                                    // so a second buy can run when allowed (only after SL + no pending balance).
+                                    info!(
+                                        "[IntervalSniper] TP: available ({:?}) << position_size ({}), considering position closed",
+                                        available, position_size_real
+                                    );
+                                    state.auto_sell_placed = true;
+                                    state.stop_loss_placed = true;
+                                    state.re_entry_allowed_after_sl = false;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
                                 } else {
                                     // Position size is real (e.g. second entry); low available = balance not updated yet — retry like first entry.
-                                    warn!(
+                                    let is_dust =
+                                        size < DUST_THRESHOLD || available.map_or(false, |a| a < DUST_THRESHOLD);
+                                    if !is_dust {
+                                        warn!(
                                         "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} position_size={} (retrying, balance may update)",
                                         tp.token_id, available, size, position_size_real
                                     );
+                                    }
                                 }
                                 tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                                 continue;
@@ -2034,7 +2059,10 @@ pub async fn run() -> Result<()> {
                                             CLOB_DEFAULT_MIN_ORDER_SIZE,
                                         );
                                         if size_retry < MIN_SELL_SIZE {
-                                            warn!(
+                                            let is_dust = size_retry < DUST_THRESHOLD
+                                                || available.map_or(false, |a| a < DUST_THRESHOLD);
+                                            if !is_dust {
+                                                warn!(
                                                 "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={} (retrying until balance available or interval closes)",
                                                 tp.token_id,
                                                 attempt,
@@ -2042,6 +2070,7 @@ pub async fn run() -> Result<()> {
                                                 size_retry,
                                                 MIN_SELL_SIZE
                                             );
+                                            }
                                             continue;
                                         }
                                         if size_retry < DUST_THRESHOLD {
@@ -2050,6 +2079,22 @@ pub async fn run() -> Result<()> {
                                                 "[IntervalSniper] TP retry dust remaining ({}), considering position closed",
                                                 size_retry
                                             );
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                                state.re_entry_allowed_after_sl = false;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
+                                                break;
+                                            }
+                                            if available.map_or(false, |a| a < position_size_real * dec!(0.1))
+                                                && size_retry < CLOB_DEFAULT_MIN_ORDER_SIZE
+                                            {
+                                                info!(
+                                                    "[IntervalSniper] TP retry: available ({:?}) << position_size ({}), considering position closed",
+                                                    available, position_size_real
+                                                );
                                                 state.auto_sell_placed = true;
                                                 state.stop_loss_placed = true;
                                                 state.re_entry_allowed_after_sl = false;
@@ -2238,6 +2283,16 @@ pub async fn run() -> Result<()> {
                         EntrySide::Up => &market.token_id_up,
                         EntrySide::Down => &market.token_id_down,
                     };
+                    // Second buy only when first was SL and no pending balance (so we don't add to dust).
+                    let is_second_buy = state.trades_this_interval == 1 && state.re_entry_allowed_after_sl;
+                    if is_second_buy {
+                        let balance = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, token_id).await;
+                        if balance.map_or(false, |b| b > DUST_THRESHOLD) {
+                            // Pending balance: wait until it's settled (sold or dust) before re-entry.
+                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                            continue;
+                        }
+                    }
                     let effective_price = limit_price;
                     let shares_left = state.config.size_shares - state.total_shares_this_interval;
                     // Cap at shares_left so we never order more than configured size (e.g. exactly 7 shares).
