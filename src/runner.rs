@@ -882,8 +882,12 @@ pub async fn run() -> Result<()> {
                     .as_ref()
                     .cloned()
                     .unwrap_or(Decimal::ZERO);
-                let filled = filled_size.min(requested);
-                if filled >= MIN_SELL_SIZE
+                let filled = filled_size.min(requested.clone());
+                // Only treat as filled when order is fully (or nearly) filled, so we don't set TP/SL
+                // on a partial and never place a second order while the first is still filling.
+                let is_full_fill = filled >= requested.clone() * dec!(0.99);
+                if is_full_fill
+                    && filled >= MIN_SELL_SIZE
                     && state.pending_gtc_token_id.is_some()
                     && state.pending_gtc_side.is_some()
                     && state.pending_gtc_price.is_some()
@@ -2114,8 +2118,10 @@ pub async fn run() -> Result<()> {
         // Buy path: up to MAX_TRADES_PER_INTERVAL per interval; re-entry only after SL (not after TP).
         // Require !ordered_this_interval for first slot so we don't double-buy when first order
         // returns success=false but actually filled on the exchange.
+        // Never place while a GTC order is resting (waiting for fill) so we don't send a second order.
         let no_open_position = state.pending_auto_sell.is_none() && state.pending_stop_loss.is_none();
         let can_buy = no_open_position
+            && state.pending_gtc_order_id.is_none()
             && (state.trades_this_interval == 0 && !state.ordered_this_interval
                 || (state.trades_this_interval == 1 && state.re_entry_allowed_after_sl));
         if can_buy {
