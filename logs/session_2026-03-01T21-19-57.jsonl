@@ -1,0 +1,2 @@
+{"close_time_unix":1772400000,"event":"interval_summary","interval_start_unix":1772399700,"max_bid_down":null,"max_bid_up":"0.9909999971685706","min_bid_down":null,"min_bid_up":"0.99","ranged_01_99_down":false,"ranged_01_99_up":false,"slug":"btc-updown-5m-1772399700"}
+{"close_time_unix":1772400300,"event":"interval_summary","interval_start_unix":1772400000,"max_bid_down":"0.59","max_bid_up":"0.9909997333155544","min_bid_down":"0.01","min_bid_up":"0.4","ranged_01_99_down":false,"ranged_01_99_up":false,"slug":"btc-updown-5m-1772400000"}
