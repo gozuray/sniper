@@ -2286,9 +2286,25 @@ pub async fn run() -> Result<()> {
                     // Second buy only when first was SL and no pending balance (so we don't add to dust).
                     let is_second_buy = state.trades_this_interval == 1 && state.re_entry_allowed_after_sl;
                     if is_second_buy {
-                        let balance = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, token_id).await;
-                        if balance.map_or(false, |b| b > DUST_THRESHOLD) {
-                            // Pending balance: wait until it's settled (sold or dust) before re-entry.
+                        // Use min order size (not DUST_THRESHOLD) to decide if there's a meaningful open position.
+                        // On this CLOB, balances below the minimum order size are effectively unsellable "dust" and
+                        // should not block the SL re-entry forever.
+                        let bal_up = get_available_for_sell(
+                            clob.as_ref().as_ref(),
+                            ws_user_ref,
+                            &market.token_id_up,
+                        )
+                        .await;
+                        let bal_down = get_available_for_sell(
+                            clob.as_ref().as_ref(),
+                            ws_user_ref,
+                            &market.token_id_down,
+                        )
+                        .await;
+                        let has_sellable_balance = bal_up.map_or(false, |b| b >= CLOB_DEFAULT_MIN_ORDER_SIZE)
+                            || bal_down.map_or(false, |b| b >= CLOB_DEFAULT_MIN_ORDER_SIZE);
+                        if has_sellable_balance {
+                            // Pending sellable balance: wait until it's settled before re-entry.
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
                         }
