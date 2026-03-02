@@ -123,6 +123,8 @@ pub enum EntrySide {
 /// Last buy order (after fill) for TP/SL.
 #[derive(Debug, Clone)]
 pub struct LastBuyOrder {
+    /// Exchange order id (when available). Useful for logging official execution data.
+    pub order_id: Option<String>,
     pub token_id: String,
     pub side: EntrySide,
     pub size: Decimal,

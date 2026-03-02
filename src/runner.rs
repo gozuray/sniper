@@ -736,6 +736,10 @@ pub async fn run() -> Result<()> {
                             };
                         let exit_price = state.last_best_bid_for_position.unwrap_or(Decimal::ZERO);
                         if size > Decimal::ZERO {
+                            let entry_order_id = state
+                                .last_buy_order
+                                .as_ref()
+                                .and_then(|b| b.order_id.as_deref());
                             let _ = log.log_position_close(
                                 &old_market.slug,
                                 old_market.interval_start_unix,
@@ -747,6 +751,9 @@ pub async fn run() -> Result<()> {
                                 now_ms_u,
                                 ExitType::MarketClose,
                                 size,
+                                None,
+                                entry_order_id,
+                                None,
                                 state.interval_min_bid_up,
                                 state.interval_max_bid_up,
                                 state.interval_min_bid_down,
@@ -927,6 +934,7 @@ pub async fn run() -> Result<()> {
                     && state.pending_gtc_side.is_some()
                     && state.pending_gtc_price.is_some()
                 {
+                    let order_id_full = order_id.clone();
                     let token_id = state.pending_gtc_token_id.as_ref().unwrap().clone();
                     let entry_side = state.pending_gtc_side.unwrap();
                     let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
@@ -934,12 +942,24 @@ pub async fn run() -> Result<()> {
                     state.trades_this_interval += 1;
                     state.total_shares_this_interval += filled.clone();
                     state.last_buy_order = Some(LastBuyOrder {
+                        order_id: Some(order_id_full.clone()),
                         token_id: token_id.clone(),
                         side: entry_side,
                         size: filled.clone(),
                         price: entry_price.clone(),
                         timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
                     });
+                    if let Some(ref mut log) = state.session_log {
+                        let _ = log.log_order_filled(
+                            &market.slug,
+                            market.interval_start_unix,
+                            market.close_time_unix,
+                            now_ms_u,
+                            &order_id_full,
+                            filled.clone(),
+                            "ws_user",
+                        );
+                    }
                     let target_price = if state.config.auto_sell_at_max_price {
                         dec!(0.99)
                     } else {
@@ -1024,12 +1044,24 @@ pub async fn run() -> Result<()> {
                             state.trades_this_interval += 1;
                             state.total_shares_this_interval += filled.clone();
                             state.last_buy_order = Some(LastBuyOrder {
+                                order_id: Some(order_id.clone()),
                                 token_id: token_id.clone(),
                                 side: entry_side,
                                 size: filled.clone(),
                                 price: entry_price.clone(),
                                 timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
                             });
+                            if let Some(ref mut log) = state.session_log {
+                                let _ = log.log_order_filled(
+                                    &market.slug,
+                                    market.interval_start_unix,
+                                    market.close_time_unix,
+                                    now_ms_u,
+                                    order_id,
+                                    filled.clone(),
+                                    "rest_balance",
+                                );
+                            }
                             let target_price = if state.config.auto_sell_at_max_price {
                                 dec!(0.99)
                             } else {
@@ -1115,17 +1147,30 @@ pub async fn run() -> Result<()> {
                     let threshold = (requested.clone() * dec!(0.99)).max(requested.clone() - dec!(0.01));
                     if av >= threshold && av >= MIN_SELL_SIZE {
                         let filled = av.min(requested);
+                        let order_id = state.pending_gtc_order_id.as_ref().cloned();
                         let entry_side = state.pending_gtc_side.unwrap();
                         let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
                         state.trades_this_interval += 1;
                         state.total_shares_this_interval += filled.clone();
                         state.last_buy_order = Some(LastBuyOrder {
+                            order_id: order_id.clone(),
                             token_id: token_id.clone(),
                             side: entry_side,
                             size: filled.clone(),
                             price: entry_price.clone(),
                             timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
                         });
+                        if let (Some(log), Some(oid)) = (state.session_log.as_mut(), order_id.as_deref()) {
+                            let _ = log.log_order_filled(
+                                &market.slug,
+                                market.interval_start_unix,
+                                market.close_time_unix,
+                                now_ms_u,
+                                oid,
+                                filled.clone(),
+                                "rest_balance",
+                            );
+                        }
                         let target_price = if state.config.auto_sell_at_max_price {
                             dec!(0.99)
                         } else {
@@ -1371,11 +1416,42 @@ pub async fn run() -> Result<()> {
                                         crate::types::SellOrderTimeInForce::Fak,
                                     )
                                     .await?;
+                                if let Some(ref mut log) = state.session_log {
+                                    let _ = log.log_order_submitted(
+                                        &market.slug,
+                                        market.interval_start_unix,
+                                        market.close_time_unix,
+                                        now_ms_u,
+                                        &sl.token_id,
+                                        "SELL",
+                                        "FAK",
+                                        price_recheck,
+                                        size_recheck.clone(),
+                                        result_recheck.order_id.as_deref(),
+                                        result_recheck.http_status,
+                                        result_recheck.success,
+                                        result_recheck.error_msg.as_deref(),
+                                    );
+                                }
                                 if result_recheck.success {
                                     let filled = result_recheck
                                         .filled_size
                                         .filter(|f| *f > Decimal::ZERO)
                                         .unwrap_or(size_recheck.clone());
+                                    if let (Some(log), Some(oid)) = (
+                                        state.session_log.as_mut(),
+                                        result_recheck.order_id.as_deref(),
+                                    ) {
+                                        let _ = log.log_order_filled(
+                                            &market.slug,
+                                            market.interval_start_unix,
+                                            market.close_time_unix,
+                                            now_ms_u,
+                                            oid,
+                                            filled.clone(),
+                                            "api_response",
+                                        );
+                                    }
                                     let remainder = size_recheck.clone() - filled.clone();
                                     if remainder <= Decimal::ZERO || remainder < MIN_SELL_SIZE || remainder < DUST_THRESHOLD {
                                         info!(
@@ -1394,7 +1470,10 @@ pub async fn run() -> Result<()> {
                                                     buy.timestamp_ms,
                                                     now_ms_u,
                                                     ExitType::StopLoss,
-                                                    size_recheck.clone(),
+                                                    filled.clone(),
+                                                    Some(size_recheck.clone()),
+                                                    buy.order_id.as_deref(),
+                                                    result_recheck.order_id.as_deref(),
                                                     state.interval_min_bid_up,
                                                     state.interval_max_bid_up,
                                                     state.interval_min_bid_down,
@@ -1486,12 +1565,42 @@ pub async fn run() -> Result<()> {
                                 crate::types::SellOrderTimeInForce::Fak,
                             )
                             .await?;
+                        if let Some(ref mut log) = state.session_log {
+                            let _ = log.log_order_submitted(
+                                &market.slug,
+                                market.interval_start_unix,
+                                market.close_time_unix,
+                                now_ms_u,
+                                &sl.token_id,
+                                "SELL",
+                                "FAK",
+                                price,
+                                size.clone(),
+                                result.order_id.as_deref(),
+                                result.http_status,
+                                result.success,
+                                result.error_msg.as_deref(),
+                            );
+                        }
                         if result.success {
                             // FAK success: full or partial fill. Retry until all bought in this interval is sold while bid <= trigger.
                             let filled = result
                                 .filled_size
                                 .filter(|f| *f > Decimal::ZERO)
                                 .unwrap_or(size.clone());
+                            if let (Some(log), Some(oid)) =
+                                (state.session_log.as_mut(), result.order_id.as_deref())
+                            {
+                                let _ = log.log_order_filled(
+                                    &market.slug,
+                                    market.interval_start_unix,
+                                    market.close_time_unix,
+                                    now_ms_u,
+                                    oid,
+                                    filled.clone(),
+                                    "api_response",
+                                );
+                            }
                             let remainder = size.clone() - filled.clone();
                             if remainder <= Decimal::ZERO || remainder < MIN_SELL_SIZE || remainder < DUST_THRESHOLD {
                                 info!(
@@ -1510,7 +1619,10 @@ pub async fn run() -> Result<()> {
                                             buy.timestamp_ms,
                                             now_ms_u,
                                             ExitType::StopLoss,
-                                            size.clone(),
+                                            filled.clone(),
+                                            Some(size.clone()),
+                                            buy.order_id.as_deref(),
+                                            result.order_id.as_deref(),
                                             state.interval_min_bid_up,
                                             state.interval_max_bid_up,
                                             state.interval_min_bid_down,
@@ -1926,7 +2038,46 @@ pub async fn run() -> Result<()> {
                                     state.config.take_profit_time_in_force,
                                 )
                                 .await?;
+                            if let Some(ref mut log) = state.session_log {
+                                let tif_str = match state.config.take_profit_time_in_force {
+                                    crate::types::SellOrderTimeInForce::Gtc => "GTC",
+                                    crate::types::SellOrderTimeInForce::Fok => "FOK",
+                                    crate::types::SellOrderTimeInForce::Fak => "FAK",
+                                };
+                                let _ = log.log_order_submitted(
+                                    &market.slug,
+                                    market.interval_start_unix,
+                                    market.close_time_unix,
+                                    now_ms_u,
+                                    &tp.token_id,
+                                    "SELL",
+                                    tif_str,
+                                    price,
+                                    size.clone(),
+                                    result.order_id.as_deref(),
+                                    result.http_status,
+                                    result.success,
+                                    result.error_msg.as_deref(),
+                                );
+                            }
                             if result.success {
+                                let filled = result
+                                    .filled_size
+                                    .filter(|f| *f > Decimal::ZERO)
+                                    .unwrap_or(size.clone());
+                                if let (Some(log), Some(oid)) =
+                                    (state.session_log.as_mut(), result.order_id.as_deref())
+                                {
+                                    let _ = log.log_order_filled(
+                                        &market.slug,
+                                        market.interval_start_unix,
+                                        market.close_time_unix,
+                                        now_ms_u,
+                                        oid,
+                                        filled.clone(),
+                                        "api_response",
+                                    );
+                                }
                                 info!(
                                     "[IntervalSniper] ✓ TP filled @ {} — position closed",
                                     fmt_price(Some(&price))
@@ -1943,7 +2094,10 @@ pub async fn run() -> Result<()> {
                                             buy.timestamp_ms,
                                             now_ms_u,
                                             ExitType::TakeProfit,
-                                            size.clone(),
+                                            filled.clone(),
+                                            Some(size.clone()),
+                                            buy.order_id.as_deref(),
+                                            result.order_id.as_deref(),
                                             state.interval_min_bid_up,
                                             state.interval_max_bid_up,
                                             state.interval_min_bid_down,
@@ -2115,7 +2269,42 @@ pub async fn run() -> Result<()> {
                                                 crate::types::SellOrderTimeInForce::Fak,
                                             )
                                             .await?;
+                                        if let Some(ref mut log) = state.session_log {
+                                            let _ = log.log_order_submitted(
+                                                &market.slug,
+                                                market.interval_start_unix,
+                                                market.close_time_unix,
+                                                now_ms_u,
+                                                &tp.token_id,
+                                                "SELL",
+                                                "FAK",
+                                                price_retry,
+                                                size_retry.clone(),
+                                                result_retry.order_id.as_deref(),
+                                                result_retry.http_status,
+                                                result_retry.success,
+                                                result_retry.error_msg.as_deref(),
+                                            );
+                                        }
                                         if result_retry.success {
+                                                let filled_amt = result_retry
+                                                    .filled_size
+                                                    .filter(|f| *f > Decimal::ZERO)
+                                                    .unwrap_or(size_retry.clone());
+                                                if let (Some(log), Some(oid)) = (
+                                                    state.session_log.as_mut(),
+                                                    result_retry.order_id.as_deref(),
+                                                ) {
+                                                    let _ = log.log_order_filled(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        now_ms_u,
+                                                        oid,
+                                                        filled_amt.clone(),
+                                                        "api_response",
+                                                    );
+                                                }
                                                 info!(
                                                     "[IntervalSniper] ✓ TP filled @ {} — position closed",
                                                     fmt_price(Some(&price_retry))
@@ -2132,7 +2321,10 @@ pub async fn run() -> Result<()> {
                                                         buy.timestamp_ms,
                                                         now_ms_u,
                                                         ExitType::TakeProfit,
-                                                        size_retry.clone(),
+                                                        filled_amt.clone(),
+                                                        Some(size_retry.clone()),
+                                                        buy.order_id.as_deref(),
+                                                        result_retry.order_id.as_deref(),
                                                         state.interval_min_bid_up,
                                                         state.interval_max_bid_up,
                                                         state.interval_min_bid_down,
@@ -2346,6 +2538,29 @@ pub async fn run() -> Result<()> {
                             state.config.max_buy_price
                         );
                         let result = clob.place_limit_order(params, order_type).await?;
+                        if let Some(ref mut log) = state.session_log {
+                            let order_type_str = match order_type {
+                                OrderType::Gtc => "GTC",
+                                OrderType::Gtd => "GTD",
+                                OrderType::Fok => "FOK",
+                                OrderType::Fak => "FAK",
+                            };
+                            let _ = log.log_order_submitted(
+                                &market.slug,
+                                market.interval_start_unix,
+                                market.close_time_unix,
+                                now_ms_u,
+                                token_id,
+                                "BUY",
+                                order_type_str,
+                                effective_price.clone(),
+                                size.clone(),
+                                result.order_id.as_deref(),
+                                result.http_status,
+                                result.success,
+                                result.error_msg.as_deref(),
+                            );
+                        }
                         // Mark that we attempted a buy this interval (prevents second buy if first
                         // returned success=false but filled on exchange; re-entry only after SL).
                         state.ordered_this_interval = true;
@@ -2384,12 +2599,26 @@ pub async fn run() -> Result<()> {
                                 let entry_price = effective_price;
                                 let entry_side = side;
                                 state.last_buy_order = Some(LastBuyOrder {
+                                    order_id: result.order_id.clone(),
                                     token_id: token_id.to_string(),
                                     side: entry_side,
                                     size: filled.clone(),
                                     price: entry_price.clone(),
                                     timestamp_ms: now_ms_u,
                                 });
+                                if let (Some(log), Some(oid)) =
+                                    (state.session_log.as_mut(), result.order_id.as_deref())
+                                {
+                                    let _ = log.log_order_filled(
+                                        &market.slug,
+                                        market.interval_start_unix,
+                                        market.close_time_unix,
+                                        now_ms_u,
+                                        oid,
+                                        filled.clone(),
+                                        "api_response",
+                                    );
+                                }
                                 let target_price = if state.config.auto_sell_at_max_price {
                                     dec!(0.99)
                                 } else {

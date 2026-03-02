@@ -84,6 +84,68 @@ impl SessionLog {
         Ok(())
     }
 
+    /// Log an order submission attempt. This is the official request/ack data from the exchange API
+    /// (order_id, http_status, success/error). The eventual fill may arrive seconds later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_order_submitted(
+        &mut self,
+        slug: &str,
+        interval_start_unix: u64,
+        close_time_unix: u64,
+        timestamp_ms: u64,
+        token_id: &str,
+        side: &str,      // "BUY" | "SELL"
+        order_type: &str, // "GTC" | "FOK" | "FAK" | ...
+        price: Decimal,
+        requested_size: Decimal,
+        order_id: Option<&str>,
+        http_status: Option<u16>,
+        success: bool,
+        error_msg: Option<&str>,
+    ) -> Result<()> {
+        let obj = serde_json::json!({
+            "event": "order_submitted",
+            "slug": slug,
+            "interval_start_unix": interval_start_unix,
+            "close_time_unix": close_time_unix,
+            "timestamp_ms": timestamp_ms,
+            "token_id": token_id,
+            "side": side,
+            "order_type": order_type,
+            "price": price.to_string(),
+            "requested_size": requested_size.to_string(),
+            "order_id": order_id,
+            "http_status": http_status,
+            "success": success,
+            "error_msg": error_msg,
+        });
+        self.write_line(&obj)
+    }
+
+    /// Log an order fill (official executed size) once known.
+    pub fn log_order_filled(
+        &mut self,
+        slug: &str,
+        interval_start_unix: u64,
+        close_time_unix: u64,
+        timestamp_ms: u64,
+        order_id: &str,
+        filled_size: Decimal,
+        source: &str, // "api_response" | "ws_user" | "rest_balance"
+    ) -> Result<()> {
+        let obj = serde_json::json!({
+            "event": "order_filled",
+            "slug": slug,
+            "interval_start_unix": interval_start_unix,
+            "close_time_unix": close_time_unix,
+            "timestamp_ms": timestamp_ms,
+            "order_id": order_id,
+            "filled_size": filled_size.to_string(),
+            "source": source,
+        });
+        self.write_line(&obj)
+    }
+
     /// Log a position close (TP, SL, or MARKET_CLOSE). Updates internal counts and PnL.
     #[allow(clippy::too_many_arguments)]
     pub fn log_position_close(
@@ -97,14 +159,17 @@ impl SessionLog {
         entry_time_ms: u64,
         exit_time_ms: u64,
         exit_type: ExitType,
-        size: Decimal,
+        executed_size: Decimal,
+        requested_exit_size: Option<Decimal>,
+        entry_order_id: Option<&str>,
+        exit_order_id: Option<&str>,
         min_bid_up: Option<Decimal>,
         max_bid_up: Option<Decimal>,
         min_bid_down: Option<Decimal>,
         max_bid_down: Option<Decimal>,
     ) -> Result<()> {
         let duration_sec = (exit_time_ms.saturating_sub(entry_time_ms)) / 1000;
-        let pnl = size * (exit_price - entry_price);
+        let pnl = executed_size * (exit_price - entry_price);
 
         match exit_type {
             ExitType::TakeProfit => self.tp_count += 1,
@@ -133,7 +198,10 @@ impl SessionLog {
             "entry_time_ms": entry_time_ms,
             "exit_time_ms": exit_time_ms,
             "exit_type": exit_type_str(exit_type),
-            "size": size.to_string(),
+            "size": executed_size.to_string(),
+            "requested_exit_size": dec_opt(requested_exit_size),
+            "entry_order_id": entry_order_id,
+            "exit_order_id": exit_order_id,
             "pnl_usd": pnl.to_string(),
             "duration_sec": duration_sec,
             "min_bid_up": dec_opt(min_bid_up),
