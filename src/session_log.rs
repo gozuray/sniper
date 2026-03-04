@@ -167,8 +167,6 @@ impl SessionLog {
         max_bid_up: Option<Decimal>,
         min_bid_down: Option<Decimal>,
         max_bid_down: Option<Decimal>,
-        entry_order_id: Option<&str>,
-        exit_order_id: Option<&str>,
         max_bid_at_exit: Option<Decimal>,
     ) -> Result<()> {
         let duration_sec = (exit_time_ms.saturating_sub(entry_time_ms)) / 1000;

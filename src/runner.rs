@@ -759,8 +759,6 @@ pub async fn run() -> Result<()> {
                                 state.interval_min_bid_down,
                                 state.interval_max_bid_down,
                                 None,
-                                None,
-                                None,
                             );
                         }
                     }
@@ -874,48 +872,7 @@ pub async fn run() -> Result<()> {
         let ws_user_ref = ws_user_arc.as_ref().map(|a| a.as_ref());
         let _ = log_clob_balance_if_due(clob.as_ref().as_ref(), &market, &mut state, now_ms_u, ws_user_ref).await;
 
-        // Top of book: WebSocket (instant) when connected, else REST. Fallback to REST if WS has no data yet.
-        let top = if let Some(ref ws) = state.ws_book {
-            let t = ws.get_top_of_book().await;
-            if top_has_book_data(&t) {
-                t
-            } else {
-                fetch_top_of_book(
-                    &http,
-                    &clob_host,
-                    &market.token_id_up,
-                    &market.token_id_down,
-                )
-                .await
-                .unwrap_or(t)
-            }
-        } else {
-            match fetch_top_of_book(
-                &http,
-                &clob_host,
-                &market.token_id_up,
-                &market.token_id_down,
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("[IntervalSniper] order book fetch failed: {}", e);
-                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                    continue;
-                }
-            }
-        };
-
-        let token_id_up = market.token_id_up.clone();
-        let token_id_down = market.token_id_down.clone();
-        update_interval_bids(&mut state, &token_id_up, &token_id_down, &top);
-        let market = state
-            .market
-            .as_ref()
-            .expect("market set after need_new_market check");
-
-        // If we placed a GTC buy and are waiting for fill from user WebSocket, check now.
+        // Poll GTC fill every loop_ms: check user WS first, then REST balance, until one detects fill (never skip this when pending).
         if let (Some(ref order_id), Some(ws_user)) = (
             state.pending_gtc_order_id.as_ref(),
             state.ws_user.as_ref().map(|a| a.as_ref()),
@@ -945,13 +902,12 @@ pub async fn run() -> Result<()> {
                     state.trades_this_interval += 1;
                     state.total_shares_this_interval += filled.clone();
                     state.last_buy_order = Some(LastBuyOrder {
-                        order_id: Some(order_id_full.clone()),
+                        order_id: state.pending_gtc_order_id.clone(),
                         token_id: token_id.clone(),
                         side: entry_side,
                         size: filled.clone(),
                         price: entry_price.clone(),
                         timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
-                        order_id: state.pending_gtc_order_id.clone(),
                     });
                     if let Some(ref mut log) = state.session_log {
                         let _ = log.log_order_filled(
@@ -1029,7 +985,7 @@ pub async fn run() -> Result<()> {
                     .await;
                 }
             } else {
-                // Use both: check REST balance after short delay (WS checked every tick above).
+                // REST fallback: check balance every tick when WS has not reported fill yet.
                 let waited_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(0));
                 if waited_ms >= PENDING_GTC_REST_CHECK_MS
                     && state.pending_gtc_token_id.is_some()
@@ -1048,13 +1004,12 @@ pub async fn run() -> Result<()> {
                             state.trades_this_interval += 1;
                             state.total_shares_this_interval += filled.clone();
                             state.last_buy_order = Some(LastBuyOrder {
-                                order_id: Some(order_id.clone()),
+                                order_id: state.pending_gtc_order_id.clone(),
                                 token_id: token_id.clone(),
                                 side: entry_side,
                                 size: filled.clone(),
                                 price: entry_price.clone(),
                                 timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
-                                order_id: state.pending_gtc_order_id.clone(),
                             });
                             if let Some(ref mut log) = state.session_log {
                                 let _ = log.log_order_filled(
@@ -1136,7 +1091,7 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // When pending GTC but no WS user channel, use REST balance after short delay to detect fill.
+        // When pending GTC but no WS user channel, use REST balance every tick to detect fill.
         if state.pending_gtc_order_id.is_some()
             && state.ws_user.is_none()
             && state.pending_gtc_token_id.is_some()
@@ -1158,13 +1113,12 @@ pub async fn run() -> Result<()> {
                         state.trades_this_interval += 1;
                         state.total_shares_this_interval += filled.clone();
                         state.last_buy_order = Some(LastBuyOrder {
-                            order_id: order_id.clone(),
+                            order_id: state.pending_gtc_order_id.clone(),
                             token_id: token_id.clone(),
                             side: entry_side,
                             size: filled.clone(),
                             price: entry_price.clone(),
                             timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
-                            order_id: state.pending_gtc_order_id.clone(),
                         });
                         if let (Some(log), Some(oid)) = (state.session_log.as_mut(), order_id.as_deref()) {
                             let _ = log.log_order_filled(
@@ -1244,6 +1198,47 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
+
+        // Top of book: WebSocket (instant) when connected, else REST. Fallback to REST if WS has no data yet.
+        let top = if let Some(ref ws) = state.ws_book {
+            let t = ws.get_top_of_book().await;
+            if top_has_book_data(&t) {
+                t
+            } else {
+                fetch_top_of_book(
+                    &http,
+                    &clob_host,
+                    &market.token_id_up,
+                    &market.token_id_down,
+                )
+                .await
+                .unwrap_or(t)
+            }
+        } else {
+            match fetch_top_of_book(
+                &http,
+                &clob_host,
+                &market.token_id_up,
+                &market.token_id_down,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("[IntervalSniper] order book fetch failed: {}", e);
+                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                    continue;
+                }
+            }
+        };
+
+        let token_id_up = market.token_id_up.clone();
+        let token_id_down = market.token_id_down.clone();
+        update_interval_bids(&mut state, &token_id_up, &token_id_down, &top);
+        let market = state
+            .market
+            .as_ref()
+            .expect("market set after need_new_market check");
 
         // Periodic log: order book scan (real-time visibility) — debug only so terminal shows only buy/sell events
         if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
@@ -1485,8 +1480,6 @@ pub async fn run() -> Result<()> {
                                                     state.interval_min_bid_down,
                                                     state.interval_max_bid_down,
                                                     None,
-                                                    None,
-                                                    None,
                                                 );
                                             }
                                         }
@@ -1632,19 +1625,17 @@ pub async fn run() -> Result<()> {
                                             Some(size.clone()),
                                             buy.order_id.as_deref(),
                                             result.order_id.as_deref(),
-                                            state.interval_min_bid_up,
-                                            state.interval_max_bid_up,
-                                            state.interval_min_bid_down,
-                                            state.interval_max_bid_down,
-                                            None,
-                                            None,
-                                            None,
-                                        );
-                                    }
-                                }
-                                state.stop_loss_placed = true;
-                                state.auto_sell_placed = true;
-                                state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
+                                                    state.interval_min_bid_up,
+                                                    state.interval_max_bid_up,
+                                                    state.interval_min_bid_down,
+                                                    state.interval_max_bid_down,
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                        state.stop_loss_placed = true;
+                                        state.auto_sell_placed = true;
+                                        state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
                                 state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1851,12 +1842,13 @@ pub async fn run() -> Result<()> {
                                                         now_ms_u,
                                                         ExitType::StopLoss,
                                                         size_retry.clone(),
+                                                        None,
+                                                        buy.order_id.as_deref(),
+                                                        None,
                                                         state.interval_min_bid_up,
                                                         state.interval_max_bid_up,
                                                         state.interval_min_bid_down,
                                                         state.interval_max_bid_down,
-                                                        None,
-                                                        None,
                                                         None,
                                                     );
                                                 }
@@ -2118,8 +2110,6 @@ pub async fn run() -> Result<()> {
                                             state.interval_min_bid_down,
                                             state.interval_max_bid_down,
                                             None,
-                                            None,
-                                            None,
                                         );
                                     }
                                 }
@@ -2347,8 +2337,6 @@ pub async fn run() -> Result<()> {
                                                         state.interval_max_bid_up,
                                                         state.interval_min_bid_down,
                                                         state.interval_max_bid_down,
-                                                        None,
-                                                        None,
                                                         None,
                                                     );
                                                 }
@@ -2626,7 +2614,6 @@ pub async fn run() -> Result<()> {
                                     size: filled.clone(),
                                     price: entry_price.clone(),
                                     timestamp_ms: now_ms_u,
-                                    order_id: result.order_id.clone(),
                                 });
                                 if let (Some(log), Some(oid)) =
                                     (state.session_log.as_mut(), result.order_id.as_deref())

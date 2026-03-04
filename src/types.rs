@@ -123,15 +123,13 @@ pub enum EntrySide {
 /// Last buy order (after fill) for TP/SL.
 #[derive(Debug, Clone)]
 pub struct LastBuyOrder {
-    /// Exchange order id (when available). Useful for logging official execution data.
+    /// CLOB order ID when available (e.g. from place_limit_order result or GTC pending). Useful for logging.
     pub order_id: Option<String>,
     pub token_id: String,
     pub side: EntrySide,
     pub size: Decimal,
     pub price: Decimal,
     pub timestamp_ms: u64,
-    /// CLOB order ID when available (e.g. from place_limit_order result or GTC pending).
-    pub order_id: Option<String>,
 }
 
 /// Pending take profit: sell when best_bid >= target_price.
