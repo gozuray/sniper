@@ -202,12 +202,9 @@ impl ClobWsUser {
                     let key = normalize_order_id(&oid);
                     let mut map = state.write().await;
                     if let Some(existing) = map.get_mut(&key) {
-                        // If entry came from an "order" event, size_matched is already canonical; don't add again (avoids double-count when both order and trade events arrive).
-                        let new_matched = if existing.order_type == "TRADE" {
-                            existing.size_matched + trade_size
-                        } else {
-                            existing.size_matched.max(trade_size)
-                        };
+                        // Never add: use max so duplicate trade events for the same fill don't double-count.
+                        // (Exchange may send multiple "trade" events for one fill; we want at most the fill size once per order.)
+                        let new_matched = existing.size_matched.max(trade_size);
                         existing.size_matched = new_matched;
                     } else {
                         map.insert(key.clone(), UserOrderState {
