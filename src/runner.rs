@@ -280,9 +280,7 @@ async fn get_available_for_sell(
     clob.get_available_balance(token_id).await.ok().flatten()
 }
 
-/// Log balance immediately after a buy (for fast feedback; uses WS when available).
-/// Source label is "WS" only when both balances came from WS; otherwise "REST".
-/// If buy_timestamp_ms is Some, logs delay from buy to balance visible only when bought-side balance > 0.2 (once, no spam).
+/// Log balance immediately after a buy (debug level; primary fill/balance is from WS and logged elsewhere).
 async fn log_balance_after_buy(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
@@ -336,7 +334,7 @@ async fn log_balance_after_buy(
         .as_ref()
         .map(fmt_decimal_2)
         .unwrap_or_else(|| "-".to_string());
-    info!(
+    debug!(
         "[IntervalSniper] Balance after buy ({}):  Up={}  Down={}",
         source, up_str, down_str
     );
@@ -348,7 +346,7 @@ async fn log_balance_after_buy(
     if let Some(ts) = buy_timestamp_ms {
         if bought_balance.map_or(false, |b| b > dec!(0.2)) {
             let delay_ms = now_ms().saturating_sub(ts);
-            info!(
+            debug!(
                 "[IntervalSniper] delay desde compra hasta balance visible: {} ms",
                 delay_ms
             );
@@ -356,9 +354,8 @@ async fn log_balance_after_buy(
     }
 }
 
-/// Fetch CLOB balance for both tokens, optionally detect when balance reflected the last buy, and log every BALANCE_LOG_INTERVAL_MS.
-/// When ws_user is Some, uses WS-derived balance (from order fills) for tokens we have data for; falls back to REST otherwise.
-/// Logs: balance Up/Down and, when known, "delay desde compra hasta que se reflejó en CLOB: X ms".
+/// Fetch CLOB balance for both tokens and log every BALANCE_LOG_INTERVAL_MS when holding a position.
+/// When balance is from WS: logs "[IntervalSniper] WS balance after fill: Up=X Down=Y (0ms)". When from REST: logs CLOB balance and delay until reflected.
 async fn log_clob_balance_if_due(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
@@ -445,13 +442,20 @@ async fn log_clob_balance_if_due(
         .as_ref()
         .map(fmt_decimal_2)
         .unwrap_or_else(|| "-".to_string());
-    let source = if balance_from_ws { " (WS)" } else { " (REST)" };
     let balance_changed = up != state.last_logged_balance_up || down != state.last_logged_balance_down;
     if balance_changed {
-        info!(
-            "[IntervalSniper] CLOB balance{}  Up={}  Down={}",
-            source, up_str, down_str
-        );
+        if balance_from_ws {
+            info!(
+                "[IntervalSniper] WS balance after fill:  Up={}  Down={}  (0ms)",
+                up_str, down_str
+            );
+            state.balance_delay_clob_logged = true;
+        } else {
+            info!(
+                "[IntervalSniper] CLOB balance (REST)  Up={}  Down={}",
+                up_str, down_str
+            );
+        }
         state.last_logged_balance_up = up;
         state.last_logged_balance_down = down;
     }
@@ -467,10 +471,12 @@ async fn log_clob_balance_if_due(
             });
             if available.map_or(false, |a| a > MIN_BALANCE_FOR_DELAY_LOG) {
                 let delay_ms = reflected_ms.saturating_sub(buy.timestamp_ms);
-                info!(
-                    "[IntervalSniper] delay desde compra hasta que se reflejó en CLOB: {} ms",
-                    delay_ms
-                );
+                if !balance_from_ws {
+                    info!(
+                        "[IntervalSniper] delay desde compra hasta que se reflejó en CLOB: {} ms",
+                        delay_ms
+                    );
+                }
                 state.balance_delay_clob_logged = true;
             }
         }
