@@ -167,6 +167,9 @@ impl SessionLog {
         max_bid_up: Option<Decimal>,
         min_bid_down: Option<Decimal>,
         max_bid_down: Option<Decimal>,
+        entry_order_id: Option<&str>,
+        exit_order_id: Option<&str>,
+        max_bid_at_exit: Option<Decimal>,
     ) -> Result<()> {
         let duration_sec = (exit_time_ms.saturating_sub(entry_time_ms)) / 1000;
         let pnl = executed_size * (exit_price - entry_price);
@@ -208,6 +211,9 @@ impl SessionLog {
             "max_bid_up": dec_opt(max_bid_up),
             "min_bid_down": dec_opt(min_bid_down),
             "max_bid_down": dec_opt(max_bid_down),
+            "entry_order_id": entry_order_id,
+            "exit_order_id": exit_order_id,
+            "max_bid_at_exit": dec_opt(max_bid_at_exit),
             "ranged_01_99_up": ranged_01_99_up,
             "ranged_01_99_down": ranged_01_99_down,
         });

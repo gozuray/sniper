@@ -758,6 +758,9 @@ pub async fn run() -> Result<()> {
                                 state.interval_max_bid_up,
                                 state.interval_min_bid_down,
                                 state.interval_max_bid_down,
+                                None,
+                                None,
+                                None,
                             );
                         }
                     }
@@ -948,6 +951,7 @@ pub async fn run() -> Result<()> {
                         size: filled.clone(),
                         price: entry_price.clone(),
                         timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
+                        order_id: state.pending_gtc_order_id.clone(),
                     });
                     if let Some(ref mut log) = state.session_log {
                         let _ = log.log_order_filled(
@@ -1050,6 +1054,7 @@ pub async fn run() -> Result<()> {
                                 size: filled.clone(),
                                 price: entry_price.clone(),
                                 timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
+                                order_id: state.pending_gtc_order_id.clone(),
                             });
                             if let Some(ref mut log) = state.session_log {
                                 let _ = log.log_order_filled(
@@ -1159,6 +1164,7 @@ pub async fn run() -> Result<()> {
                             size: filled.clone(),
                             price: entry_price.clone(),
                             timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
+                            order_id: state.pending_gtc_order_id.clone(),
                         });
                         if let (Some(log), Some(oid)) = (state.session_log.as_mut(), order_id.as_deref()) {
                             let _ = log.log_order_filled(
@@ -1478,6 +1484,9 @@ pub async fn run() -> Result<()> {
                                                     state.interval_max_bid_up,
                                                     state.interval_min_bid_down,
                                                     state.interval_max_bid_down,
+                                                    None,
+                                                    None,
+                                                    None,
                                                 );
                                             }
                                         }
@@ -1627,6 +1636,9 @@ pub async fn run() -> Result<()> {
                                             state.interval_max_bid_up,
                                             state.interval_min_bid_down,
                                             state.interval_max_bid_down,
+                                            None,
+                                            None,
+                                            None,
                                         );
                                     }
                                 }
@@ -1843,6 +1855,9 @@ pub async fn run() -> Result<()> {
                                                         state.interval_max_bid_up,
                                                         state.interval_min_bid_down,
                                                         state.interval_max_bid_down,
+                                                        None,
+                                                        None,
+                                                        None,
                                                     );
                                                 }
                                             }
@@ -2102,6 +2117,9 @@ pub async fn run() -> Result<()> {
                                             state.interval_max_bid_up,
                                             state.interval_min_bid_down,
                                             state.interval_max_bid_down,
+                                            None,
+                                            None,
+                                            None,
                                         );
                                     }
                                 }
@@ -2329,6 +2347,9 @@ pub async fn run() -> Result<()> {
                                                         state.interval_max_bid_up,
                                                         state.interval_min_bid_down,
                                                         state.interval_max_bid_down,
+                                                        None,
+                                                        None,
+                                                        None,
                                                     );
                                                 }
                                             }
@@ -2605,6 +2626,7 @@ pub async fn run() -> Result<()> {
                                     size: filled.clone(),
                                     price: entry_price.clone(),
                                     timestamp_ms: now_ms_u,
+                                    order_id: result.order_id.clone(),
                                 });
                                 if let (Some(log), Some(oid)) =
                                     (state.session_log.as_mut(), result.order_id.as_deref())
