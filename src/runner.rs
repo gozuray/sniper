@@ -878,7 +878,15 @@ pub async fn run() -> Result<()> {
                     {
                         let token_id = state.pending_gtc_token_id.as_ref().unwrap().clone();
                         let requested = state.pending_gtc_requested_size.as_ref().unwrap().clone();
-                        if let Ok(Some(av)) = clob.as_ref().get_available_balance(&token_id).await {
+                        // Prefer WS balance (instant after fill event) before falling back to REST.
+                        let ws_bal = ws_user.get_balance_for_token(&token_id).await;
+                        let (av_opt, bal_source) = if let Some(b) = ws_bal {
+                            (Some(b), "REST, balance from WS")
+                        } else {
+                            let rest = clob.as_ref().get_available_balance(&token_id).await.ok().flatten();
+                            (rest, "REST, balance from REST")
+                        };
+                        if let Some(av) = av_opt {
                             let threshold = (requested.clone() * dec!(0.99)).max(requested.clone() - dec!(0.01));
                             if av >= threshold && av >= MIN_SELL_SIZE {
                                 let filled = av.min(requested);
@@ -902,7 +910,7 @@ pub async fn run() -> Result<()> {
                                         now_ms_u,
                                         order_id,
                                         filled.clone(),
-                                        "rest_balance",
+                                        bal_source,
                                     );
                                 }
                                 let target_price = if state.config.auto_sell_at_max_price {
@@ -951,10 +959,11 @@ pub async fn run() -> Result<()> {
                                     EntrySide::Down => "Down",
                                 };
                                 info!(
-                                    "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: REST)   TP size={} ({}%)   SL size={} ({}%)",
+                                    "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: {})   TP size={} ({}%)   SL size={} ({}%)",
                                     side_str,
                                     fmt_decimal_2(&entry_price),
                                     fmt_decimal_2(&filled),
+                                    bal_source,
                                     fmt_decimal_2(&tp_size),
                                     state.config.auto_sell_quantity_percent,
                                     fmt_decimal_2(&sl_size),
