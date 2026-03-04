@@ -181,9 +181,41 @@ impl ClobWsUser {
                 map.insert(key, entry);
             }
         } else if event_type == "trade" {
-            // Trade: optional order id linkage; we may get size/price here too.
-            // For simplicity we rely on order UPDATE for size_matched; trade can confirm.
-            let _ = value;
+            // Trade events often arrive before the order UPDATE with size_matched.
+            // Process them immediately so get_balance_for_token reflects fills faster.
+            let trade_size = value.get("size").and_then(parse_decimal_value).unwrap_or(Decimal::ZERO);
+            if trade_size > Decimal::ZERO {
+                let asset_id = value.get("asset_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let side = value.get("side")
+                    .or_else(|| value.get("trader_side"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+
+                // Try taker_order_id first (our FAK/FOK orders), then maker_order_id (our GTC orders).
+                let order_id = value.get("taker_order_id")
+                    .or_else(|| value.get("maker_order_id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                if let Some(oid) = order_id {
+                    let key = normalize_order_id(&oid);
+                    let mut map = state.write().await;
+                    if let Some(existing) = map.get_mut(&key) {
+                        let new_matched = existing.size_matched + trade_size;
+                        existing.size_matched = new_matched;
+                    } else {
+                        map.insert(key.clone(), UserOrderState {
+                            order_id: key,
+                            asset_id,
+                            side,
+                            original_size: trade_size,
+                            size_matched: trade_size,
+                            order_type: "TRADE".to_string(),
+                        });
+                    }
+                }
+            }
         }
 
         Ok(())
