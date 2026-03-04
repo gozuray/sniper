@@ -1,4 +1,17 @@
-/target
+# Rust
+target/
+
+# env
 .env
-# Session logs (JSONL); la carpeta logs/ se conserva con .gitkeep
-#logs/*.jsonl
+
+# logs
+logs/
+*.jsonl
+*.csv
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
