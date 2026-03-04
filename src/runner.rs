@@ -775,8 +775,8 @@ pub async fn run() -> Result<()> {
             }
             match fetch_market_by_slug(&http, &config.gamma_base_url, &current_slug).await {
                 Ok(market) => {
-                    state.ws_book = None; // drop previous WS before creating new
-                    state.ws_user = None;
+                    state.ws_book = None; // drop previous WS before creating new (per-market)
+                    // ws_user is persistent: connect once with empty markets to receive all fills (no race on interval switch)
                     let ws_url = ClobWsBook::ws_url_from_rest_host(&clob_host);
                     match ClobWsBook::connect(&ws_url, &market.token_id_up, &market.token_id_down)
                         .await
@@ -792,13 +792,13 @@ pub async fn run() -> Result<()> {
                             );
                         }
                     }
-                    if !state.config.dry_run {
+                    if !state.config.dry_run && state.ws_user.is_none() {
                         let ws_user_url = ClobWsUser::ws_url_from_rest_host(&clob_host);
-                        match ClobWsUser::connect(&ws_user_url, &[market.condition_id.clone()]).await
-                        {
+                        // Empty markets = receive events for all markets (Polymarket API); avoids race with subscription delay
+                        match ClobWsUser::connect(&ws_user_url, &[]).await {
                             Ok(ws_u) => {
                                 state.ws_user = Some(Arc::new(ws_u));
-                                info!("[IntervalSniper] WebSocket user channel connected (order/trade updates)");
+                                info!("[IntervalSniper] WebSocket user channel connected (order/trade updates, all markets)");
                             }
                             Err(e) => {
                                 warn!(

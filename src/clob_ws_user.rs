@@ -58,8 +58,9 @@ pub struct ClobWsUser {
 }
 
 impl ClobWsUser {
-    /// Connect to the user WebSocket, authenticate, subscribe to the given condition_id(s),
-    /// and start the receive + ping loop. Uses API_KEY, SECRET, PASSPHRASE from env.
+    /// Connect to the user WebSocket, authenticate, and start the receive + ping loop.
+    /// Pass empty `condition_ids` to receive events for all markets (recommended for persistent connection).
+    /// Uses API_KEY, SECRET, PASSPHRASE from env.
     pub async fn connect(ws_url: &str, condition_ids: &[String]) -> Result<Self> {
         let api_key = std::env::var("API_KEY").context("API_KEY required for user WebSocket")?;
         let secret = std::env::var("SECRET")
