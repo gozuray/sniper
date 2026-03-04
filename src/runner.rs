@@ -123,6 +123,8 @@ struct RunnerState {
     stop_loss_placed: bool,
     /// Order ID of the GTC TP limit order when placed (cancel when price drops to entry).
     tp_limit_order_id: Option<String>,
+    /// Consecutive TP limit placement failures due to balance/allowance errors.
+    tp_limit_balance_retries: u32,
     interval_switch_wall_time_ms: Option<u64>,
     /// Session log (JSONL) when MM_SESSION_LOG=true.
     session_log: Option<SessionLog>,
@@ -710,6 +712,7 @@ pub async fn run() -> Result<()> {
         auto_sell_placed: false,
         stop_loss_placed: false,
         tp_limit_order_id: None,
+        tp_limit_balance_retries: 0,
         interval_switch_wall_time_ms: None,
         session_log: None,
         interval_min_bid_up: None,
@@ -1228,6 +1231,7 @@ pub async fn run() -> Result<()> {
                     state.auto_sell_placed = false;
                     state.stop_loss_placed = false;
                     state.tp_limit_order_id = None;
+                    state.tp_limit_balance_retries = 0;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
                     state.interval_min_bid_up = None;
                     state.interval_max_bid_up = None;
@@ -1397,6 +1401,7 @@ pub async fn run() -> Result<()> {
                             _ => {}
                         }
                         state.tp_limit_order_id = None;
+                        state.tp_limit_balance_retries = 0;
 
                         let sl_token_id = sl.token_id.clone();
                         let sl_trigger = sl.trigger_price;
@@ -1404,6 +1409,7 @@ pub async fn run() -> Result<()> {
                         let mut sl_done = false;
                         let mut sl_attempt: u32 = 0;
                         let mut canceled_for_balance = false;
+                        let mut balance_error_retries: u32 = 0;
                         let mut total_filled = Decimal::ZERO;
                         let mut last_sell_order_id: Option<String> = None; // updated on each fill
 
@@ -1555,11 +1561,19 @@ pub async fn run() -> Result<()> {
                             }
 
                             if is_position_closed_error(result.error_msg.as_deref()) {
+                                balance_error_retries += 1;
                                 if !canceled_for_balance {
                                     warn!("[IntervalSniper] SL: balance/allowance error, canceling once and retrying");
                                     let _ = clob.cancel_orders_for_token(&sl_token_id).await;
                                     canceled_for_balance = true;
                                     tokio::time::sleep(Duration::from_millis(50)).await;
+                                } else if balance_error_retries >= 200 {
+                                    warn!(
+                                        "[IntervalSniper] SL: balance/allowance error persisted for {} retries (~10s), treating position as closed",
+                                        balance_error_retries
+                                    );
+                                    sl_done = true;
+                                    break;
                                 } else {
                                     tokio::time::sleep(Duration::from_millis(50)).await;
                                 }
@@ -1593,6 +1607,7 @@ pub async fn run() -> Result<()> {
                             state.auto_sell_placed = true;
                             state.re_entry_allowed_after_sl = true;
                             state.tp_limit_order_id = None;
+                            state.tp_limit_balance_retries = 0;
                             state.pending_auto_sell = None;
                             state.pending_stop_loss = None;
                             state.last_buy_order = None;
@@ -1657,6 +1672,7 @@ pub async fn run() -> Result<()> {
                             if best_bid > Decimal::ZERO && best_bid <= entry_price {
                                 let _ = clob.cancel_orders_for_token(&tp.token_id).await;
                                 state.tp_limit_order_id = None;
+                                state.tp_limit_balance_retries = 0;
                                 trace!(
                                     "[IntervalSniper] TP limit canceled (price at entry {}), waiting for target again",
                                     fmt_price(Some(&entry_price))
@@ -1697,6 +1713,7 @@ pub async fn run() -> Result<()> {
                                         state.stop_loss_placed = true;
                                         state.re_entry_allowed_after_sl = false;
                                         state.tp_limit_order_id = None;
+                                        state.tp_limit_balance_retries = 0;
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
                                         state.last_buy_order = None;
@@ -1752,11 +1769,83 @@ pub async fn run() -> Result<()> {
                                     }
                                     if result.success {
                                         state.tp_limit_order_id = result.order_id.clone();
+                                        state.tp_limit_balance_retries = 0;
                                         trace!(
                                             "[IntervalSniper] TP limit placed @ {} (cancel if price drops to entry {})",
                                             fmt_price(Some(&price)),
                                             fmt_price(Some(&entry_price))
                                         );
+                                    } else if is_position_closed_error(result.error_msg.as_deref()) {
+                                        state.tp_limit_balance_retries += 1;
+                                        if state.tp_limit_balance_retries == 1 {
+                                            warn!(
+                                                "[IntervalSniper] TP limit balance/allowance error, canceling orders and retrying"
+                                            );
+                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                        } else if state.tp_limit_balance_retries >= 10 {
+                                            warn!(
+                                                "[IntervalSniper] TP limit failed {} times with balance/allowance error — attempting FOK market sell",
+                                                state.tp_limit_balance_retries
+                                            );
+                                            let fok_price = round_to_tick(best_bid);
+                                            let fok_result = clob
+                                                .place_sell_order(
+                                                    &tp.token_id,
+                                                    fok_price,
+                                                    size.clone(),
+                                                    crate::types::SellOrderTimeInForce::Fok,
+                                                )
+                                                .await?;
+                                            if fok_result.success {
+                                                info!(
+                                                    "[IntervalSniper] ✓ TP emergency FOK sell filled @ {} — position closed",
+                                                    fmt_price(Some(&fok_price))
+                                                );
+                                                if let Some(ref mut log) = state.session_log {
+                                                    if let Some(ref buy) = state.last_buy_order {
+                                                        let _ = log.log_position_close(
+                                                            &market.slug,
+                                                            market.interval_start_unix,
+                                                            market.close_time_unix,
+                                                            buy.side,
+                                                            buy.price,
+                                                            fok_price,
+                                                            buy.timestamp_ms,
+                                                            now_ms_u,
+                                                            ExitType::TakeProfit,
+                                                            size.clone(),
+                                                            Some(tp.size.clone()),
+                                                            buy.order_id.as_deref(),
+                                                            fok_result.order_id.as_deref(),
+                                                            state.interval_min_bid_up,
+                                                            state.interval_max_bid_up,
+                                                            state.interval_min_bid_down,
+                                                            state.interval_max_bid_down,
+                                                            None,
+                                                        );
+                                                    }
+                                                }
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                                state.re_entry_allowed_after_sl = false;
+                                                state.tp_limit_order_id = None;
+                                                state.tp_limit_balance_retries = 0;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.last_buy_order = None;
+                                                state.balance_reflected_at_ms = None;
+                                                state.balance_delay_clob_logged = false;
+                                                state.last_logged_balance_up = None;
+                                                state.last_logged_balance_down = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
+                                            } else {
+                                                warn!(
+                                                    "[IntervalSniper] TP emergency FOK also failed: {:?} — SL remains active",
+                                                    fok_result.error_msg
+                                                );
+                                                state.tp_limit_balance_retries = 0;
+                                            }
+                                        }
                                     } else if let Some(ref msg) = result.error_msg {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
                                     }
