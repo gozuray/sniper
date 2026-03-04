@@ -47,8 +47,8 @@ const DUST_THRESHOLD: Decimal = dec!(0.01);
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
 const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
-/// When WS is present, check REST balance every tick from buy (0 = no delay, WS + REST in parallel).
-const PENDING_GTC_REST_CHECK_MS: u64 = 0;
+/// When WS is present, wait this long before using REST to detect fill (give user WS time to report; WS is ~1–2 s).
+const PENDING_GTC_REST_CHECK_MS: u64 = 2000;
 /// When no WS user channel, check REST balance every tick from buy (0 = no delay).
 const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 0;
 
