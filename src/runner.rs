@@ -47,8 +47,8 @@ const DUST_THRESHOLD: Decimal = dec!(0.01);
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
 const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
-/// When WS is present, wait this long before using REST to detect fill (give user WS time to report; WS is ~1–2 s).
-const PENDING_GTC_REST_CHECK_MS: u64 = 2000;
+/// When WS is present, check REST every tick too (0). Fill check runs from order place until fill or interval change; we use both WS and REST and log which arrived first.
+const PENDING_GTC_REST_CHECK_MS: u64 = 0;
 /// When no WS user channel, check REST balance every tick from buy (0 = no delay).
 const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 0;
 
@@ -872,7 +872,7 @@ pub async fn run() -> Result<()> {
         let ws_user_ref = ws_user_arc.as_ref().map(|a| a.as_ref());
         let _ = log_clob_balance_if_due(clob.as_ref().as_ref(), &market, &mut state, now_ms_u, ws_user_ref).await;
 
-        // Poll GTC fill every loop_ms: check user WS first, then REST balance, until one detects fill (never skip this when pending).
+        // Poll GTC fill every loop_ms from order place until fill or interval change: check user WS and REST each tick, use whichever detects fill first and log which arrived first.
         if let (Some(ref order_id), Some(ws_user)) = (
             state.pending_gtc_order_id.as_ref(),
             state.ws_user.as_ref().map(|a| a.as_ref()),
@@ -966,7 +966,7 @@ pub async fn run() -> Result<()> {
                         EntrySide::Down => "Down",
                     };
                     info!(
-                        "[IntervalSniper]  BUY   {}  @ {}   size={} (fill from WS)   TP size={} ({}%)   SL size={} ({}%)",
+                        "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: user WS)   TP size={} ({}%)   SL size={} ({}%)",
                         side_str,
                         fmt_decimal_2(&entry_price),
                         fmt_decimal_2(&filled),
@@ -985,7 +985,7 @@ pub async fn run() -> Result<()> {
                     .await;
                 }
             } else {
-                // REST fallback: check balance every tick when WS has not reported fill yet.
+                // REST: check balance every tick when WS has not reported fill yet; whichever detects first is logged.
                 let waited_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(0));
                 if waited_ms >= PENDING_GTC_REST_CHECK_MS
                     && state.pending_gtc_token_id.is_some()
@@ -1068,7 +1068,7 @@ pub async fn run() -> Result<()> {
                                 EntrySide::Down => "Down",
                             };
                             info!(
-                                "[IntervalSniper]  BUY   {}  @ {}   size={} (fill from REST fallback)   TP size={} ({}%)   SL size={} ({}%)",
+                                "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: REST)   TP size={} ({}%)   SL size={} ({}%)",
                                 side_str,
                                 fmt_decimal_2(&entry_price),
                                 fmt_decimal_2(&filled),
@@ -1177,7 +1177,7 @@ pub async fn run() -> Result<()> {
                             EntrySide::Down => "Down",
                         };
                         info!(
-                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill from REST, no WS)   TP size={} ({}%)   SL size={} ({}%)",
+                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: REST, no WS)   TP size={} ({}%)   SL size={} ({}%)",
                             side_str,
                             fmt_decimal_2(&entry_price),
                             fmt_decimal_2(&filled),
