@@ -131,6 +131,8 @@ struct RunnerState {
     pending_stop_loss: Option<PendingStopLoss>,
     auto_sell_placed: bool,
     stop_loss_placed: bool,
+    /// Order ID of the GTC TP limit order when placed (cancel when price drops to entry).
+    tp_limit_order_id: Option<String>,
     interval_switch_wall_time_ms: Option<u64>,
     /// Session log (JSONL) when MM_SESSION_LOG=true.
     session_log: Option<SessionLog>,
@@ -280,15 +282,54 @@ async fn get_available_for_sell(
     clob.get_available_balance(token_id).await.ok().flatten()
 }
 
-/// Log balance immediately after a buy (debug level; primary fill/balance is from WS and logged elsewhere).
+/// Log balance immediately after a buy (debug level).
+/// When `known_fill` is Some, use that size for the bought side instead of querying WS/REST — eliminates post-fill balance query and logs "fill (instant)".
 async fn log_balance_after_buy(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
     ws_user: Option<&ClobWsUser>,
     buy_timestamp_ms: Option<u64>,
     bought_side: Option<EntrySide>,
+    known_fill: Option<(EntrySide, Decimal)>,
 ) {
-    let (up, down, source) = if let Some(ws) = ws_user {
+    let (up, down, source) = if let Some((side, size)) = known_fill {
+        // Use the fill size we already have — no query for the bought side.
+        let up = if side == EntrySide::Up {
+            Some(size)
+        } else {
+            let from_ws = if let Some(ws) = ws_user {
+                ws.get_balance_for_token(&market.token_id_up).await
+            } else {
+                None
+            };
+            if from_ws.is_some() {
+                from_ws
+            } else {
+                clob.get_available_balance(&market.token_id_up)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let down = if side == EntrySide::Down {
+            Some(size)
+        } else {
+            let from_ws = if let Some(ws) = ws_user {
+                ws.get_balance_for_token(&market.token_id_down).await
+            } else {
+                None
+            };
+            if from_ws.is_some() {
+                from_ws
+            } else {
+                clob.get_available_balance(&market.token_id_down)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        (up, down, "fill (instant)")
+    } else if let Some(ws) = ws_user {
         let up_ws = ws.get_balance_for_token(&market.token_id_up).await;
         let down_ws = ws.get_balance_for_token(&market.token_id_down).await;
         let up = if up_ws.is_some() {
@@ -376,11 +417,25 @@ async fn log_clob_balance_if_due(
         return Ok(());
     }
 
-    let (up, down, balance_from_ws) = if let Some(ws) = ws_user {
+    // Prefer known fill from last_buy_order for position token when WS has no data yet — avoids REST fallback for logging.
+    let position_token_id = state
+        .pending_auto_sell
+        .as_ref()
+        .map(|t| t.token_id.as_str())
+        .or_else(|| state.pending_stop_loss.as_ref().map(|s| s.token_id.as_str()));
+    let known_fill_for_position = state
+        .last_buy_order
+        .as_ref()
+        .filter(|b| position_token_id == Some(b.token_id.as_str()))
+        .map(|b| b.size.clone());
+
+    let (up, down, balance_from_ws, balance_from_fill_instant) = if let Some(ws) = ws_user {
         let up_ws = ws.get_balance_for_token(&market.token_id_up).await;
         let down_ws = ws.get_balance_for_token(&market.token_id_down).await;
         let up = if up_ws.is_some() {
             up_ws
+        } else if known_fill_for_position.as_ref().zip(position_token_id).map_or(false, |(_, tid)| tid == market.token_id_up) {
+            known_fill_for_position.clone()
         } else {
             clob.get_available_balance(&market.token_id_up)
                 .await
@@ -389,25 +444,36 @@ async fn log_clob_balance_if_due(
         };
         let down = if down_ws.is_some() {
             down_ws
+        } else if known_fill_for_position.as_ref().zip(position_token_id).map_or(false, |(_, tid)| tid == market.token_id_down) {
+            known_fill_for_position.clone()
         } else {
             clob.get_available_balance(&market.token_id_down)
                 .await
                 .ok()
                 .flatten()
         };
-        (up, down, up_ws.is_some() || down_ws.is_some())
+        let from_fill_instant = (up_ws.is_none() && position_token_id == Some(market.token_id_up.as_str()) && known_fill_for_position.is_some())
+            || (down_ws.is_none() && position_token_id == Some(market.token_id_down.as_str()) && known_fill_for_position.is_some());
+        (up, down, up_ws.is_some() || down_ws.is_some(), from_fill_instant)
     } else {
-        let up = clob
-            .get_available_balance(&market.token_id_up)
-            .await
-            .ok()
-            .flatten();
-        let down = clob
-            .get_available_balance(&market.token_id_down)
-            .await
-            .ok()
-            .flatten();
-        (up, down, false)
+        let up = if known_fill_for_position.as_ref().zip(position_token_id).map_or(false, |(_, tid)| tid == market.token_id_up) {
+            known_fill_for_position.clone()
+        } else {
+            clob.get_available_balance(&market.token_id_up)
+                .await
+                .ok()
+                .flatten()
+        };
+        let down = if known_fill_for_position.as_ref().zip(position_token_id).map_or(false, |(_, tid)| tid == market.token_id_down) {
+            known_fill_for_position.clone()
+        } else {
+            clob.get_available_balance(&market.token_id_down)
+                .await
+                .ok()
+                .flatten()
+        };
+        let from_fill_instant = known_fill_for_position.is_some();
+        (up, down, false, from_fill_instant)
     };
 
     // If we have open position and haven't recorded "balance reflected" yet, check now.
@@ -424,8 +490,8 @@ async fn log_clob_balance_if_due(
         if let (Some(tid), Some(ref exp)) = (token_id, expected) {
             let available = if tid == market.token_id_up { up } else { down };
             let threshold = (exp.clone() * dec!(0.99)).max(exp.clone() - dec!(0.01));
-            if balance_from_ws {
-                // Balance from WS: we knew it when we got the fill event, so use buy time → delay 0.
+            if balance_from_ws || balance_from_fill_instant {
+                // Balance from WS or from known fill: we knew it at fill time → delay 0.
                 state.balance_reflected_at_ms = state
                     .balance_reflected_at_ms
                     .or_else(|| state.last_buy_order.as_ref().map(|b| b.timestamp_ms));
@@ -450,6 +516,12 @@ async fn log_clob_balance_if_due(
                 up_str, down_str
             );
             state.balance_delay_clob_logged = true;
+        } else if balance_from_fill_instant {
+            info!(
+                "[IntervalSniper] Balance from fill (instant)  Up={}  Down={}  (0ms)",
+                up_str, down_str
+            );
+            state.balance_delay_clob_logged = true;
         } else {
             info!(
                 "[IntervalSniper] CLOB balance (REST)  Up={}  Down={}",
@@ -471,7 +543,7 @@ async fn log_clob_balance_if_due(
             });
             if available.map_or(false, |a| a > MIN_BALANCE_FOR_DELAY_LOG) {
                 let delay_ms = reflected_ms.saturating_sub(buy.timestamp_ms);
-                if !balance_from_ws {
+                if !balance_from_ws && !balance_from_fill_instant {
                     info!(
                         "[IntervalSniper] delay desde compra hasta que se reflejó en CLOB: {} ms",
                         delay_ms
@@ -647,6 +719,7 @@ pub async fn run() -> Result<()> {
         pending_stop_loss: None,
         auto_sell_placed: false,
         stop_loss_placed: false,
+        tp_limit_order_id: None,
         interval_switch_wall_time_ms: None,
         session_log: None,
         interval_min_bid_up: None,
@@ -791,6 +864,7 @@ pub async fn run() -> Result<()> {
                             Some(ws_user),
                             state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
                             state.last_buy_order.as_ref().map(|b| b.side),
+                            Some((entry_side, filled.clone())),
                         )
                         .await;
                     }
@@ -892,6 +966,7 @@ pub async fn run() -> Result<()> {
                                     Some(ws_user),
                                     state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
                                     state.last_buy_order.as_ref().map(|b| b.side),
+                                    Some((entry_side, filled.clone())),
                                 )
                                 .await;
                             }
@@ -999,6 +1074,7 @@ pub async fn run() -> Result<()> {
                                 None,
                                 state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
                                 state.last_buy_order.as_ref().map(|b| b.side),
+                                Some((entry_side, filled.clone())),
                             )
                             .await;
                         }
@@ -1152,6 +1228,7 @@ pub async fn run() -> Result<()> {
                     state.pending_stop_loss = None;
                     state.auto_sell_placed = false;
                     state.stop_loss_placed = false;
+                    state.tp_limit_order_id = None;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
                     state.interval_min_bid_up = None;
                     state.interval_max_bid_up = None;
@@ -1263,9 +1340,9 @@ pub async fn run() -> Result<()> {
                         &top.token_id_down
                     };
                     debug!(
-                        "[IntervalSniper]  POS   TP   target={}  best_bid={}  (sell when bid >= target)",
+                        "[IntervalSniper]  POS   TP   target={}  best_ask={}  (place limit at target when ask <= target; cancel if bid <= entry)",
                         fmt_price(Some(&tp.target_price)),
-                        fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
+                        fmt_price(side_book.as_ref().and_then(|s| s.best_ask.as_ref()))
                     );
                 }
             }
@@ -1401,6 +1478,7 @@ pub async fn run() -> Result<()> {
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
                                         state.re_entry_allowed_after_sl = true;
+                                        state.tp_limit_order_id = None;
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
                                         state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1487,6 +1565,7 @@ pub async fn run() -> Result<()> {
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
                                         state.re_entry_allowed_after_sl = true;
+                                        state.tp_limit_order_id = None;
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
                                         state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1509,6 +1588,7 @@ pub async fn run() -> Result<()> {
                                     state.stop_loss_placed = true;
                                     state.auto_sell_placed = true;
                                     state.re_entry_allowed_after_sl = true;
+                                    state.tp_limit_order_id = None;
                                     state.pending_auto_sell = None;
                                     state.pending_stop_loss = None;
                                     state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1529,6 +1609,7 @@ pub async fn run() -> Result<()> {
                                 state.stop_loss_placed = true;
                                 state.auto_sell_placed = true;
                                 state.re_entry_allowed_after_sl = true;
+                                state.tp_limit_order_id = None;
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
                                 state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1544,6 +1625,7 @@ pub async fn run() -> Result<()> {
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
                                         state.re_entry_allowed_after_sl = true;
+                                        state.tp_limit_order_id = None;
                                         state.pending_auto_sell = None;
                                         state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
                                         state.total_shares_this_interval = Decimal::ZERO;
@@ -1637,6 +1719,7 @@ pub async fn run() -> Result<()> {
                                         state.stop_loss_placed = true;
                                         state.auto_sell_placed = true;
                                         state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
+                                state.tp_limit_order_id = None;
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
                                 state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1670,6 +1753,7 @@ pub async fn run() -> Result<()> {
                                 state.stop_loss_placed = true;
                                 state.auto_sell_placed = true;
                                 state.re_entry_allowed_after_sl = true;
+                                state.tp_limit_order_id = None;
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
                                 state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1774,6 +1858,7 @@ pub async fn run() -> Result<()> {
                                                 state.stop_loss_placed = true;
                                                 state.auto_sell_placed = true;
                                                 state.re_entry_allowed_after_sl = true;
+                                                state.tp_limit_order_id = None;
                                                 state.pending_auto_sell = None;
                                                 state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
                                                 state.total_shares_this_interval = Decimal::ZERO;
@@ -1802,6 +1887,7 @@ pub async fn run() -> Result<()> {
                                             state.stop_loss_placed = true;
                                             state.auto_sell_placed = true;
                                             state.re_entry_allowed_after_sl = true;
+                                            state.tp_limit_order_id = None;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1857,6 +1943,7 @@ pub async fn run() -> Result<()> {
                                             state.stop_loss_placed = true;
                                             state.auto_sell_placed = true;
                                             state.re_entry_allowed_after_sl = true; // allow second trade this interval only after SL
+                                            state.tp_limit_order_id = None;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1900,6 +1987,7 @@ pub async fn run() -> Result<()> {
                                             state.stop_loss_placed = true;
                                             state.auto_sell_placed = true;
                                             state.re_entry_allowed_after_sl = true;
+                                            state.tp_limit_order_id = None;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
@@ -1924,15 +2012,18 @@ pub async fn run() -> Result<()> {
             state.pending_stop_loss = None;
         }
 
-        // Take profit: if pending and best_bid >= target_price -> sell (FAK, retry at latest best_bid until filled).
-        // Always use position.token_id (the token we bought); sell_size = min(position.size, available).
-        // Re-fetch book here so we use current best_bid; the main-loop `top` may be stale after SL/other work.
+        // Take profit: when target is reached (best_ask at target), place GTC limit at target.
+        // If price drops back to entry, cancel the TP limit and wait for target again.
         if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
-            if let Some(ref tp) = state.pending_auto_sell {
+            if let Some(tp) = state.pending_auto_sell.clone() {
                 if !state.auto_sell_placed {
+                    let entry_price = state
+                        .pending_stop_loss
+                        .as_ref()
+                        .map(|s| s.entry_price)
+                        .unwrap_or(Decimal::ZERO);
                     let elapsed_sec = (now_ms_u - tp.placed_at_ms) / 1000;
                     if elapsed_sec >= state.config.min_seconds_after_buy_before_auto_sell as u64 {
-                        // Fresh book for TP decision so we don't miss the level when price is there.
                         let top_tp = if let Some(ref ws) = state.ws_book {
                             ws.get_top_of_book().await
                         } else {
@@ -1948,7 +2039,6 @@ pub async fn run() -> Result<()> {
                                 Err(_) => top.clone(),
                             }
                         };
-                        // Use book only for best_bid; token to sell is always position.token_id.
                         let is_up = tp.token_id == market.token_id_up;
                         let side_book = if is_up {
                             &top_tp.token_id_up
@@ -1959,442 +2049,121 @@ pub async fn run() -> Result<()> {
                             .as_ref()
                             .and_then(|s| s.best_bid)
                             .unwrap_or(Decimal::ZERO);
-                        let target = tp.target_price - state.config.take_profit_price_margin;
-                        if best_bid >= target {
-                            // Cancel any open orders for this token so balance is not locked (e.g. by a GTC SL order).
-                            match clob.cancel_orders_for_token(&tp.token_id).await {
-                                Err(e) => warn!("[IntervalSniper] cancel orders before TP failed: {} (continuing with sell)", e),
-                                Ok(res) if !res.not_canceled.is_empty() => {
-                                    warn!("[IntervalSniper] cancel before TP: {} order(s) not canceled, balance may still be locked", res.not_canceled.len());
-                                }
-                                _ => {}
-                            }
-                            let position_size_real = tp.size.clone();
-                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
-                            let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
-                            if size < MIN_SELL_SIZE {
-                                let is_dust =
-                                    size < DUST_THRESHOLD || available.map_or(false, |a| a < DUST_THRESHOLD);
-                                if !is_dust {
-                                    warn!(
-                                "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} min_sell_size={}",
-                                tp.token_id,
-                                available,
-                                size,
-                                MIN_SELL_SIZE
-                            );
-                                }
-                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                continue;
-                            }
-                            if size < DUST_THRESHOLD {
-                                if position_size_real < DUST_THRESHOLD {
-                                    info!(
-                                    "[IntervalSniper] TP dust remaining ({}, below {}), considering position closed",
-                                    size, DUST_THRESHOLD
+                        let best_ask = side_book
+                            .as_ref()
+                            .and_then(|s| s.best_ask)
+                            .unwrap_or(Decimal::ZERO);
+                        let target = round_to_tick(tp.target_price);
+
+                        // 1) If we have a TP limit order resting: cancel when price drops to entry, or detect fill via ws_user.
+                        if let Some(ref oid) = state.tp_limit_order_id {
+                            if best_bid > Decimal::ZERO && best_bid <= entry_price {
+                                let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                state.tp_limit_order_id = None;
+                                info!(
+                                    "[IntervalSniper] TP limit canceled (price at entry {}), waiting for target again",
+                                    fmt_price(Some(&entry_price))
                                 );
-                                    state.auto_sell_placed = true;
-                                    state.stop_loss_placed = true;
-                                    state.re_entry_allowed_after_sl = false;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
-                                } else if available.map_or(false, |a| a < position_size_real * dec!(0.1))
-                                    && size < CLOB_DEFAULT_MIN_ORDER_SIZE
-                                {
-                                    // Available << position_size: position was likely closed elsewhere (e.g. SL)
-                                    // and balance already reflects it. Clear state so we don't block forever and
-                                    // so a second buy can run when allowed (only after SL + no pending balance).
-                                    info!(
-                                        "[IntervalSniper] TP: available ({:?}) << position_size ({}), considering position closed",
-                                        available, position_size_real
-                                    );
-                                    state.auto_sell_placed = true;
-                                    state.stop_loss_placed = true;
-                                    state.re_entry_allowed_after_sl = false;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
-                                } else {
-                                    // Position size is real (e.g. second entry); low available = balance not updated yet — retry like first entry.
-                                    let is_dust =
-                                        size < DUST_THRESHOLD || available.map_or(false, |a| a < DUST_THRESHOLD);
-                                    if !is_dust {
-                                        warn!(
-                                        "[IntervalSniper] TP available too low to sell: token_id={} available_shares={:?} effective_sell_size={} position_size={} (retrying, balance may update)",
-                                        tp.token_id, available, size, position_size_real
-                                    );
+                            } else if let Some(ws) = ws_user_ref {
+                                if let Some(filled) = ws.get_order_filled_size(oid).await {
+                                    if filled >= tp.size * dec!(0.99) {
+                                        info!(
+                                            "[IntervalSniper] ✓ TP limit filled @ {} — position closed",
+                                            fmt_price(Some(&target))
+                                        );
+                                        if let Some(ref mut log) = state.session_log {
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let _ = log.log_position_close(
+                                                    &market.slug,
+                                                    market.interval_start_unix,
+                                                    market.close_time_unix,
+                                                    buy.side,
+                                                    buy.price,
+                                                    target,
+                                                    buy.timestamp_ms,
+                                                    now_ms_u,
+                                                    ExitType::TakeProfit,
+                                                    filled.clone(),
+                                                    Some(tp.size.clone()),
+                                                    buy.order_id.as_deref(),
+                                                    Some(oid.as_str()),
+                                                    state.interval_min_bid_up,
+                                                    state.interval_max_bid_up,
+                                                    state.interval_min_bid_down,
+                                                    state.interval_max_bid_down,
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                        state.auto_sell_placed = true;
+                                        state.stop_loss_placed = true;
+                                        state.re_entry_allowed_after_sl = false;
+                                        state.tp_limit_order_id = None;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.last_buy_order = None;
+                                        state.balance_reflected_at_ms = None;
+                                        state.balance_delay_clob_logged = false;
+                                        state.last_logged_balance_up = None;
+                                        state.last_logged_balance_down = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
                                     }
                                 }
-                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                                continue;
                             }
-                            // SELL FAK must cross: use best_bid so order matches; avoid posting above bid.
-                            let price = match state.config.take_profit_time_in_force {
-                                crate::types::SellOrderTimeInForce::Fak => round_to_tick(best_bid),
-                                _ => round_to_tick(
-                                    best_bid.min(target + state.config.take_profit_price_margin),
-                                ),
-                            };
-                            let result = clob
-                                .place_sell_order(
-                                    &tp.token_id,
-                                    price,
-                                    size.clone(),
-                                    state.config.take_profit_time_in_force,
-                                )
-                                .await?;
-                            if let Some(ref mut log) = state.session_log {
-                                let tif_str = match state.config.take_profit_time_in_force {
-                                    crate::types::SellOrderTimeInForce::Gtc => "GTC",
-                                    crate::types::SellOrderTimeInForce::Fok => "FOK",
-                                    crate::types::SellOrderTimeInForce::Fak => "FAK",
-                                };
-                                let _ = log.log_order_submitted(
-                                    &market.slug,
-                                    market.interval_start_unix,
-                                    market.close_time_unix,
-                                    now_ms_u,
-                                    &tp.token_id,
-                                    "SELL",
-                                    tif_str,
-                                    price,
-                                    size.clone(),
-                                    result.order_id.as_deref(),
-                                    result.http_status,
-                                    result.success,
-                                    result.error_msg.as_deref(),
+                        }
+
+                        // 2) Place GTC limit at target when best_ask is at target (or we can post there) and we don't have one yet.
+                        if state.tp_limit_order_id.is_none() {
+                            let target_reached = best_ask <= target || best_bid >= target;
+                            if target_reached {
+                                let position_size_real = tp.size.clone();
+                                let available =
+                                    get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
+                                let size = effective_sell_size(
+                                    position_size_real,
+                                    available.clone(),
+                                    CLOB_DEFAULT_MIN_ORDER_SIZE,
                                 );
-                            }
-                            if result.success {
-                                let filled = result
-                                    .filled_size
-                                    .filter(|f| *f > Decimal::ZERO)
-                                    .unwrap_or(size.clone());
-                                if let (Some(log), Some(oid)) =
-                                    (state.session_log.as_mut(), result.order_id.as_deref())
-                                {
-                                    let _ = log.log_order_filled(
-                                        &market.slug,
-                                        market.interval_start_unix,
-                                        market.close_time_unix,
-                                        now_ms_u,
-                                        oid,
-                                        filled.clone(),
-                                        "api_response",
-                                    );
-                                }
-                                info!(
-                                    "[IntervalSniper] ✓ TP filled @ {} — position closed",
-                                    fmt_price(Some(&price))
-                                );
-                                if let Some(ref mut log) = state.session_log {
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let _ = log.log_position_close(
+                                if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
+                                    let price = target;
+                                    let result = clob
+                                        .place_sell_order(
+                                            &tp.token_id,
+                                            price,
+                                            size.clone(),
+                                            crate::types::SellOrderTimeInForce::Gtc,
+                                        )
+                                        .await?;
+                                    if let Some(ref mut log) = state.session_log {
+                                        let _ = log.log_order_submitted(
                                             &market.slug,
                                             market.interval_start_unix,
                                             market.close_time_unix,
-                                            buy.side,
-                                            buy.price,
-                                            price,
-                                            buy.timestamp_ms,
                                             now_ms_u,
-                                            ExitType::TakeProfit,
-                                            filled.clone(),
-                                            Some(size.clone()),
-                                            buy.order_id.as_deref(),
+                                            &tp.token_id,
+                                            "SELL",
+                                            "GTC",
+                                            price,
+                                            size.clone(),
                                             result.order_id.as_deref(),
-                                            state.interval_min_bid_up,
-                                            state.interval_max_bid_up,
-                                            state.interval_min_bid_down,
-                                            state.interval_max_bid_down,
-                                            None,
+                                            result.http_status,
+                                            result.success,
+                                            result.error_msg.as_deref(),
                                         );
                                     }
-                                }
-                                state.auto_sell_placed = true;
-                                state.stop_loss_placed = true;
-                                state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
-                            } else {
-                                if result.http_status == Some(400) {
-                                    let ba = clob
-                                        .get_balance_allowance(&tp.token_id)
-                                        .await
-                                        .unwrap_or_else(|e| format!("error: {}", e));
-                                    info!(
-                                        "[IntervalSniper] TP 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                        tp.token_id, size, ba
-                                    );
-                                }
-                                if is_invalid_amounts_error(result.error_msg.as_deref()) {
-                                    info!(
-                                        "[IntervalSniper] TP: exchange rejected amount (dust/zero), considering position closed"
-                                    );
-                                    state.auto_sell_placed = true;
-                                    state.stop_loss_placed = true;
-                                    state.re_entry_allowed_after_sl = false;
-                                    state.pending_auto_sell = None;
-                                    state.pending_stop_loss = None;
-                                    state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                    state.total_shares_this_interval = Decimal::ZERO;
-                                } else {
-                                let is_no_match = result.error_msg.as_deref().map_or(false, |m| {
-                                    m.contains("no orders found to match")
-                                        || m.contains("FAK")
-                                        || m.contains("FOK")
-                                });
-                                let is_balance_error =
-                                    is_position_closed_error(result.error_msg.as_deref());
-                                if is_no_match || is_balance_error {
-                                    if is_balance_error {
-                                        info!("[IntervalSniper] take profit: balance/allowance error, canceling open orders once and retrying with backoff");
-                                    } else {
-                                        info!("[IntervalSniper] take profit no match, retrying FAK at latest bid until liquidated");
-                                    }
-                                    let mut filled = false;
-                                    let mut canceled_once_for_balance = false;
-                                    let mut attempt: u32 = 0;
-                                    loop {
-                                        attempt += 1;
-                                        // If interval changed (new 5-min market), stop retrying and let main loop switch market.
-                                        let now_check = now_unix();
-                                        if now_check >= market.close_time_unix
-                                            || current_5min_slug(config.interval_market) != market.slug
-                                        {
-                                            info!(
-                                                "[IntervalSniper] interval changed during TP retry (attempt {}), stopping retries and switching market",
-                                                attempt
-                                            );
-                                            break;
-                                        }
-                                        let delay_ms = if is_balance_error {
-                                            BALANCE_RETRY_BACKOFF_MS
-                                                .get((attempt as usize).saturating_sub(1))
-                                                .copied()
-                                                .unwrap_or(BALANCE_POLL_MS)
-                                        } else {
-                                            FAK_RETRY_DELAY_MS
-                                        };
-                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                        if is_balance_error && !canceled_once_for_balance {
-                                            let _ =
-                                                clob.cancel_orders_for_token(&tp.token_id).await;
-                                            canceled_once_for_balance = true;
-                                        }
-                                        let top_retry = if let Some(ref ws) = state.ws_book {
-                                            ws.get_top_of_book().await
-                                        } else {
-                                            match fetch_top_of_book(
-                                                &http,
-                                                &clob_host,
-                                                &market.token_id_up,
-                                                &market.token_id_down,
-                                            )
-                                            .await
-                                            {
-                                                Ok(t) => t,
-                                                Err(_) => continue,
-                                            }
-                                        };
-                                        let side_retry = if is_up {
-                                            &top_retry.token_id_up
-                                        } else {
-                                            &top_retry.token_id_down
-                                        };
-                                        let bid = side_retry
-                                            .as_ref()
-                                            .and_then(|s| s.best_bid)
-                                            .unwrap_or(Decimal::ZERO);
-                                        if bid < target {
-                                            continue;
-                                        }
-                                        let position_size_real = tp.size.clone();
-                                        let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
-                                        let size_retry = effective_sell_size(
-                                            position_size_real,
-                                            available.clone(),
-                                            CLOB_DEFAULT_MIN_ORDER_SIZE,
+                                    if result.success {
+                                        state.tp_limit_order_id = result.order_id.clone();
+                                        info!(
+                                            "[IntervalSniper] TP limit placed @ {} (cancel if price drops to entry {})",
+                                            fmt_price(Some(&price)),
+                                            fmt_price(Some(&entry_price))
                                         );
-                                        if size_retry < MIN_SELL_SIZE {
-                                            let is_dust = size_retry < DUST_THRESHOLD
-                                                || available.map_or(false, |a| a < DUST_THRESHOLD);
-                                            if !is_dust {
-                                                warn!(
-                                                "[IntervalSniper] TP available too low to sell on retry: token_id={} attempt={} available_shares={:?} effective_sell_size={} min_sell_size={} (retrying until balance available or interval closes)",
-                                                tp.token_id,
-                                                attempt,
-                                                available,
-                                                size_retry,
-                                                MIN_SELL_SIZE
-                                            );
-                                            }
-                                            continue;
-                                        }
-                                        if size_retry < DUST_THRESHOLD {
-                                            if tp.size < DUST_THRESHOLD {
-                                                info!(
-                                                "[IntervalSniper] TP retry dust remaining ({}), considering position closed",
-                                                size_retry
-                                            );
-                                                state.auto_sell_placed = true;
-                                                state.stop_loss_placed = true;
-                                                state.re_entry_allowed_after_sl = false;
-                                                state.pending_auto_sell = None;
-                                                state.pending_stop_loss = None;
-                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                                state.total_shares_this_interval = Decimal::ZERO;
-                                                break;
-                                            }
-                                            if available.map_or(false, |a| a < position_size_real * dec!(0.1))
-                                                && size_retry < CLOB_DEFAULT_MIN_ORDER_SIZE
-                                            {
-                                                info!(
-                                                    "[IntervalSniper] TP retry: available ({:?}) << position_size ({}), considering position closed",
-                                                    available, position_size_real
-                                                );
-                                                state.auto_sell_placed = true;
-                                                state.stop_loss_placed = true;
-                                                state.re_entry_allowed_after_sl = false;
-                                                state.pending_auto_sell = None;
-                                                state.pending_stop_loss = None;
-                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                                state.total_shares_this_interval = Decimal::ZERO;
-                                                break;
-                                            }
-                                            // Position size is real (e.g. second entry); low available = balance not updated — keep retrying.
-                                        }
-                                        let price_retry = round_to_tick(bid);
-                                        let result_retry = clob
-                                            .place_sell_order(
-                                                &tp.token_id,
-                                                price_retry,
-                                                size_retry.clone(),
-                                                crate::types::SellOrderTimeInForce::Fak,
-                                            )
-                                            .await?;
-                                        if let Some(ref mut log) = state.session_log {
-                                            let _ = log.log_order_submitted(
-                                                &market.slug,
-                                                market.interval_start_unix,
-                                                market.close_time_unix,
-                                                now_ms_u,
-                                                &tp.token_id,
-                                                "SELL",
-                                                "FAK",
-                                                price_retry,
-                                                size_retry.clone(),
-                                                result_retry.order_id.as_deref(),
-                                                result_retry.http_status,
-                                                result_retry.success,
-                                                result_retry.error_msg.as_deref(),
-                                            );
-                                        }
-                                        if result_retry.success {
-                                                let filled_amt = result_retry
-                                                    .filled_size
-                                                    .filter(|f| *f > Decimal::ZERO)
-                                                    .unwrap_or(size_retry.clone());
-                                                if let (Some(log), Some(oid)) = (
-                                                    state.session_log.as_mut(),
-                                                    result_retry.order_id.as_deref(),
-                                                ) {
-                                                    let _ = log.log_order_filled(
-                                                        &market.slug,
-                                                        market.interval_start_unix,
-                                                        market.close_time_unix,
-                                                        now_ms_u,
-                                                        oid,
-                                                        filled_amt.clone(),
-                                                        "api_response",
-                                                    );
-                                                }
-                                                info!(
-                                                    "[IntervalSniper] ✓ TP filled @ {} — position closed",
-                                                    fmt_price(Some(&price_retry))
-                                                );
-                                            if let Some(ref mut log) = state.session_log {
-                                                if let Some(ref buy) = state.last_buy_order {
-                                                    let _ = log.log_position_close(
-                                                        &market.slug,
-                                                        market.interval_start_unix,
-                                                        market.close_time_unix,
-                                                        buy.side,
-                                                        buy.price,
-                                                        price_retry,
-                                                        buy.timestamp_ms,
-                                                        now_ms_u,
-                                                        ExitType::TakeProfit,
-                                                        filled_amt.clone(),
-                                                        Some(size_retry.clone()),
-                                                        buy.order_id.as_deref(),
-                                                        result_retry.order_id.as_deref(),
-                                                        state.interval_min_bid_up,
-                                                        state.interval_max_bid_up,
-                                                        state.interval_min_bid_down,
-                                                        state.interval_max_bid_down,
-                                                        None,
-                                                    );
-                                                }
-                                            }
-                                            state.auto_sell_placed = true;
-                                            state.stop_loss_placed = true;
-                                            state.re_entry_allowed_after_sl = false; // no re-entry after TP, only after SL
-                                            state.pending_auto_sell = None;
-                                            state.pending_stop_loss = None;
-                                            state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                            state.total_shares_this_interval = Decimal::ZERO;
-                                            filled = true;
-                                            break;
-                                        }
-                                        if is_position_closed_error(
-                                            result_retry.error_msg.as_deref(),
-                                        ) {
-                                            warn!("[IntervalSniper] take profit retry attempt {}: balance/allowance error (cancel already done), retrying with backoff", attempt);
-                                            continue;
-                                        }
-                                        if result_retry.http_status == Some(400) {
-                                            let ba = clob
-                                                .get_balance_allowance(&tp.token_id)
-                                                .await
-                                                .unwrap_or_else(|e| format!("error: {}", e));
-                                            info!(
-                                                "[IntervalSniper] TP retry 400 — token_id={} intento_sell_size={} balance_allowance (CONDITIONAL)={}",
-                                                tp.token_id, size_retry, ba
-                                            );
-                                        }
-                                        if result_retry.error_msg.as_deref().map_or(true, |m| {
-                                            !m.contains("no orders found to match")
-                                        }) {
-                                            if is_invalid_amounts_error(result_retry.error_msg.as_deref()) {
-                                                info!(
-                                                    "[IntervalSniper] TP retry: exchange rejected amount (dust/zero), considering position closed"
-                                                );
-                                                state.auto_sell_placed = true;
-                                                state.stop_loss_placed = true;
-                                                state.re_entry_allowed_after_sl = false;
-                                                state.pending_auto_sell = None;
-                                                state.pending_stop_loss = None;
-                                                state.last_buy_order = None; state.balance_reflected_at_ms = None; state.balance_delay_clob_logged = false; state.last_logged_balance_up = None; state.last_logged_balance_down = None;
-                                                state.total_shares_this_interval = Decimal::ZERO;
-                                            }
-                                            if let Some(msg) = result_retry.error_msg {
-                                                warn!("[IntervalSniper]  FAIL  TP    {}", msg);
-                                            }
-                                            break;
-                                        }
+                                    } else if let Some(ref msg) = result.error_msg {
+                                        warn!("[IntervalSniper] TP limit place failed: {}", msg);
                                     }
-                                } else if let Some(msg) = result.error_msg {
-                                    warn!("[IntervalSniper]  FAIL  TP    {}", msg);
-                                }
-                                }
                                 }
                             }
+                        }
                     }
                 }
             }
@@ -2687,6 +2456,7 @@ pub async fn run() -> Result<()> {
                                     w.as_ref().map(|a| a.as_ref()),
                                     state.last_buy_order.as_ref().map(|b| b.timestamp_ms),
                                     state.last_buy_order.as_ref().map(|b| b.side),
+                                    state.last_buy_order.as_ref().map(|b| (b.side, b.size.clone())),
                                 )
                                 .await;
                             }
