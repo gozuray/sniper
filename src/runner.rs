@@ -1651,6 +1651,7 @@ pub async fn run() -> Result<()> {
                         let target = round_to_tick(tp.target_price);
                         let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
+                        let mut tp_filled_this_iteration = false;
                         // 1) If we have a TP limit order resting: cancel when price drops to entry, or detect fill via ws_user.
                         if let Some(ref oid) = state.tp_limit_order_id {
                             if best_bid > Decimal::ZERO && best_bid <= entry_price {
@@ -1663,6 +1664,7 @@ pub async fn run() -> Result<()> {
                             } else if let Some(ws) = ws_user_ref {
                                 if let Some(filled) = ws.get_order_filled_size(oid).await {
                                     if filled >= tp.size * dec!(0.99) {
+                                        tp_filled_this_iteration = true;
                                         info!(
                                             "[IntervalSniper] ✓ TP limit filled @ {} — position closed",
                                             fmt_price(Some(&target))
@@ -1709,7 +1711,8 @@ pub async fn run() -> Result<()> {
                         }
 
                         // 2) Place GTC limit at target only when price has touched TP - 0.01; cancel if it drops back to entry.
-                        if state.tp_limit_order_id.is_none() {
+                        // Skip if we just detected TP fill this iteration (position already closed; avoid "not enough balance").
+                        if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() {
                             let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
                                 let position_size_real = tp.size.clone();
