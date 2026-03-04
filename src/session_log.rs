@@ -209,8 +209,6 @@ impl SessionLog {
             "max_bid_up": dec_opt(max_bid_up),
             "min_bid_down": dec_opt(min_bid_down),
             "max_bid_down": dec_opt(max_bid_down),
-            "entry_order_id": entry_order_id,
-            "exit_order_id": exit_order_id,
             "max_bid_at_exit": dec_opt(max_bid_at_exit),
             "ranged_01_99_up": ranged_01_99_up,
             "ranged_01_99_down": ranged_01_99_down,

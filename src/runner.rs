@@ -894,7 +894,7 @@ pub async fn run() -> Result<()> {
                     && state.pending_gtc_side.is_some()
                     && state.pending_gtc_price.is_some()
                 {
-                    let order_id_full = order_id.clone();
+                    let order_id_full = order_id.to_string();
                     let token_id = state.pending_gtc_token_id.as_ref().unwrap().clone();
                     let entry_side = state.pending_gtc_side.unwrap();
                     let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
