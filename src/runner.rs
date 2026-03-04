@@ -1399,7 +1399,12 @@ pub async fn run() -> Result<()> {
                         .unwrap_or(Decimal::ZERO);
                     if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
                         // Cancel any open orders for this token so balance is not locked (e.g. by a GTC TP order).
-                        match clob.cancel_orders_for_token(&sl.token_id).await {
+                        // Run cancel and balance check concurrently — they are independent; saves one RTT.
+                        let (cancel_result, available) = tokio::join!(
+                            clob.cancel_orders_for_token(&sl.token_id),
+                            get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id),
+                        );
+                        match cancel_result {
                             Err(e) => warn!("[IntervalSniper] cancel orders before SL failed: {} (continuing with sell)", e),
                             Ok(res) if !res.not_canceled.is_empty() => {
                                 warn!("[IntervalSniper] cancel before SL: {} order(s) not canceled, balance may still be locked", res.not_canceled.len());
@@ -1409,7 +1414,6 @@ pub async fn run() -> Result<()> {
                         // SELL FAK at best_bid (aggressive crossing spread): fill as much as possible; price = best_bid so order matches.
                         let price = round_to_tick(best_bid);
                         let position_size_real = sl.size.clone();
-                        let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id).await;
                         let size = effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                         if size < MIN_SELL_SIZE {
                             // Balance puede estar bloqueado. Reintentar cada 50 ms hasta venta success,
@@ -1803,10 +1807,23 @@ pub async fn run() -> Result<()> {
                                         }
                                     };
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    if is_balance_error && !canceled_once_for_balance {
-                                        let _ = clob.cancel_orders_for_token(&sl.token_id).await;
+                                    let available = if is_balance_error && !canceled_once_for_balance {
+                                        let (cancel_res, av) = tokio::join!(
+                                            clob.cancel_orders_for_token(&sl.token_id),
+                                            get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id),
+                                        );
+                                        match cancel_res {
+                                            Err(e) => warn!("[IntervalSniper] cancel orders before SL retry failed: {} (continuing)", e),
+                                            Ok(res) if !res.not_canceled.is_empty() => {
+                                                warn!("[IntervalSniper] cancel before SL retry: {} order(s) not canceled", res.not_canceled.len());
+                                            }
+                                            _ => {}
+                                        }
                                         canceled_once_for_balance = true;
-                                    }
+                                        av
+                                    } else {
+                                        get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id).await
+                                    };
                                     let top_retry = if let Some(ref ws) = state.ws_book {
                                         ws.get_top_of_book().await
                                     } else {
@@ -1844,7 +1861,6 @@ pub async fn run() -> Result<()> {
                                         break;
                                     }
                                     let position_size_real = sl.size.clone();
-                                    let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl.token_id).await;
                                     let size_retry =
                                         effective_sell_size(position_size_real, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
                                     if size_retry < MIN_SELL_SIZE {
