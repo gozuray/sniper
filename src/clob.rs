@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 const CONDITIONAL_BASE_DECIMALS: u32 = 6;
 const CONDITIONAL_BASE_FACTOR: Decimal = dec!(1000000);
@@ -501,7 +501,7 @@ impl ClobClient for LiveClob {
             .post_order(order_type_str, &order_json, params.side, Some(params.price))
             .await?;
         if result.success {
-            info!("[LiveClob] order placed order_id={:?}", result.order_id);
+            trace!("[LiveClob] order placed order_id={:?}", result.order_id);
         } else if let Some(ref msg) = result.error_msg {
             info!("[LiveClob] order failed: {}", msg);
         }
@@ -555,7 +555,7 @@ impl ClobClient for LiveClob {
             })
             .unwrap_or_default();
         if !canceled.is_empty() {
-            info!(
+            trace!(
                 "[LiveClob] canceled {} open order(s) for token to free balance",
                 canceled.len()
             );

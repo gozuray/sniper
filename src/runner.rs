@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
@@ -2054,13 +2054,14 @@ pub async fn run() -> Result<()> {
                             .and_then(|s| s.best_ask)
                             .unwrap_or(Decimal::ZERO);
                         let target = round_to_tick(tp.target_price);
+                        let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
                         // 1) If we have a TP limit order resting: cancel when price drops to entry, or detect fill via ws_user.
                         if let Some(ref oid) = state.tp_limit_order_id {
                             if best_bid > Decimal::ZERO && best_bid <= entry_price {
                                 let _ = clob.cancel_orders_for_token(&tp.token_id).await;
                                 state.tp_limit_order_id = None;
-                                info!(
+                                trace!(
                                     "[IntervalSniper] TP limit canceled (price at entry {}), waiting for target again",
                                     fmt_price(Some(&entry_price))
                                 );
@@ -2112,9 +2113,9 @@ pub async fn run() -> Result<()> {
                             }
                         }
 
-                        // 2) Place GTC limit at target when best_ask is at target (or we can post there) and we don't have one yet.
+                        // 2) Place GTC limit at target only when price has touched TP - 0.01; cancel if it drops back to entry.
                         if state.tp_limit_order_id.is_none() {
-                            let target_reached = best_ask <= target || best_bid >= target;
+                            let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
                                 let position_size_real = tp.size.clone();
                                 let available =
@@ -2153,7 +2154,7 @@ pub async fn run() -> Result<()> {
                                     }
                                     if result.success {
                                         state.tp_limit_order_id = result.order_id.clone();
-                                        info!(
+                                        trace!(
                                             "[IntervalSniper] TP limit placed @ {} (cancel if price drops to entry {})",
                                             fmt_price(Some(&price)),
                                             fmt_price(Some(&entry_price))
