@@ -342,4 +342,12 @@ impl ClobWsUser {
         let map = self.state.read().await;
         map.get(&key).cloned()
     }
+
+    /// Remove all order state entries for a given asset_id.
+    /// Call this when switching intervals so accumulated fills from previous
+    /// intervals do not distort balance calculations for the new interval.
+    pub async fn clear_token_state(&self, asset_id: &str) {
+        let mut map = self.state.write().await;
+        map.retain(|_, v| v.asset_id != asset_id);
+    }
 }

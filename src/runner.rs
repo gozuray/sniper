@@ -1303,6 +1303,14 @@ pub async fn run() -> Result<()> {
                             }
                         }
                     }
+                    // Clear accumulated WS fill state for old tokens so balance
+                    // calculations start fresh for the new interval.
+                    if let Some(ref old_market) = state.market {
+                        if let Some(ref ws) = state.ws_user {
+                            ws.clear_token_state(&old_market.token_id_up).await;
+                            ws.clear_token_state(&old_market.token_id_down).await;
+                        }
+                    }
                     state.market = Some(market.clone());
                     if !config.dry_run {
                         let has_position = state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some();
@@ -1522,8 +1530,20 @@ pub async fn run() -> Result<()> {
                         }
                         state.tp_limit_order_id = None;
                         state.tp_limit_balance_retries = 0;
+                        state.allowance_cache = None;
 
+                        // Wait up to 300ms for the exchange to free balance after cancel.
+                        // Poll REST balance directly (bypass WS which may lag) up to 6 times x 50ms.
                         let sl_token_id = sl.token_id.clone();
+                        for _ in 0..6 {
+                            let freed = clob.get_available_balance(&sl_token_id).await.ok().flatten();
+                            if freed.map_or(false, |a| a >= sl.size * dec!(0.90)) {
+                                break; // Balance is available, proceed immediately
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        // Always reset cache so the SL loop reads fresh balance on first attempt.
+                        state.allowance_cache = None;
                         let sl_trigger = sl.trigger_price;
                         let mut remaining = sl.size;
                         let mut sl_done = false;
