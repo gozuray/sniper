@@ -70,82 +70,107 @@ impl ClobWsUser {
             .or_else(|_| std::env::var("API_PASSPHRASE"))
             .context("PASSPHRASE required")?;
 
-        let url = if ws_url.is_empty() {
-            DEFAULT_WS_USER_URL
+        let url: String = if ws_url.is_empty() {
+            DEFAULT_WS_USER_URL.to_string()
         } else {
-            ws_url
+            ws_url.to_string()
         };
-        let (ws_stream, _) = connect_async(url)
-            .await
-            .context("CLOB user WebSocket connect")?;
-
-        let (mut write, mut read) = ws_stream.split();
+        let condition_ids = condition_ids.to_vec();
         let state: Arc<RwLock<HashMap<String, UserOrderState>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let state_recv = Arc::clone(&state);
 
-        let sub = serde_json::json!({
-            "auth": {
-                "apiKey": api_key,
-                "secret": secret,
-                "passphrase": passphrase
-            },
-            "markets": condition_ids,
-            "type": "user"
-        });
-        write
-            .send(Message::Text(sub.to_string()))
-            .await
-            .context("send user subscribe")?;
-
         let join = tokio::spawn(async move {
-            let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
-            ping_interval.tick().await;
-            let mut last_msg_at = std::time::Instant::now();
-            let mut heartbeat = interval(Duration::from_secs(30));
-            heartbeat.tick().await;
-
+            let mut attempt = 0u32;
             loop {
-                tokio::select! {
-                    _ = ping_interval.tick() => {
-                        if write.send(Message::Ping(vec![])).await.is_err() {
-                            tracing::warn!("[ClobWsUser] ping failed — connection lost, fills will degrade to REST");
-                            break;
+                let connect_result = async {
+                    let (ws_stream, _) = connect_async(&url).await?;
+                    anyhow::Ok(ws_stream)
+                }
+                .await;
+
+                let ws_stream = match connect_result {
+                    Ok(s) => {
+                        let succeeded_attempt = attempt + 1;
+                        attempt = 0;
+                        if succeeded_attempt > 1 {
+                            tracing::info!("[ClobWsUser] reconnected (attempt {})", succeeded_attempt);
                         }
+                        s
                     }
-                    msg = read.next() => {
-                        let Some(Ok(msg)) = msg else {
-                            tracing::warn!("[ClobWsUser] connection closed — fills will degrade to REST fallback");
-                            break;
-                        };
-                        match msg {
-                            Message::Text(text) => {
-                                if let Err(e) = Self::apply_message(&state_recv, &text).await {
-                                    let event_type = serde_json::from_str::<serde_json::Value>(&text)
-                                        .ok()
-                                        .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
-                                        .unwrap_or_default();
-                                    if event_type.is_empty() {
-                                        tracing::debug!("ClobWsUser parse: {} | payload: {}", e, text.chars().take(300).collect::<String>());
-                                    } else {
-                                        tracing::warn!("ClobWsUser parse error [{}]: {}", event_type, e);
+                    Err(e) => {
+                        attempt += 1;
+                        let delay_ms = (500u64 * 2u64.pow(attempt.min(6))).min(30_000);
+                        tracing::warn!(
+                            "[ClobWsUser] reconnect attempt {} failed: {} — retrying in {}ms",
+                            attempt,
+                            e,
+                            delay_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                };
+
+                let (mut write, mut read) = ws_stream.split();
+
+                let sub = serde_json::json!({
+                    "auth": { "apiKey": api_key.clone(), "secret": secret.clone(), "passphrase": passphrase.clone() },
+                    "markets": condition_ids.clone(),
+                    "type": "user"
+                });
+                if write.send(Message::Text(sub.to_string())).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+
+                let mut last_msg_at = std::time::Instant::now();
+                let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+                ping_interval.tick().await;
+                let mut heartbeat = interval(Duration::from_secs(30));
+                heartbeat.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = ping_interval.tick() => {
+                            if write.send(Message::Ping(vec![])).await.is_err() {
+                                tracing::warn!("[ClobWsUser] ping failed — reconnecting...");
+                                break;
+                            }
+                        }
+                        msg = read.next() => {
+                            let Some(Ok(msg)) = msg else {
+                                tracing::warn!("[ClobWsUser] connection closed — fills will degrade to REST fallback");
+                                break;
+                            };
+                            last_msg_at = std::time::Instant::now();
+                            match msg {
+                                Message::Text(text) => {
+                                    if let Err(e) = Self::apply_message(&state_recv, &text).await {
+                                        let event_type = serde_json::from_str::<serde_json::Value>(&text)
+                                            .ok()
+                                            .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
+                                            .unwrap_or_default();
+                                        if event_type.is_empty() {
+                                            tracing::debug!("ClobWsUser parse: {} | payload: {}", e, text.chars().take(300).collect::<String>());
+                                        } else {
+                                            tracing::warn!("ClobWsUser parse error [{}]: {}", event_type, e);
+                                        }
                                     }
                                 }
-                                last_msg_at = std::time::Instant::now();
+                                Message::Pong(_) => {}
+                                _ => {}
                             }
-                            Message::Pong(_) => {
-                                last_msg_at = std::time::Instant::now();
-                            }
-                            _ => {}
                         }
-                    }
-                    _ = heartbeat.tick() => {
-                        let silent_secs = last_msg_at.elapsed().as_secs();
-                        if silent_secs > 30 {
-                            tracing::warn!("[ClobWsUser] no messages in {}s — possible silent disconnect", silent_secs);
+                        _ = heartbeat.tick() => {
+                            let silent_secs = last_msg_at.elapsed().as_secs();
+                            if silent_secs > 30 {
+                                tracing::warn!("[ClobWsUser] no messages in {}s — possible silent disconnect", silent_secs);
+                            }
                         }
                     }
                 }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         });
 
