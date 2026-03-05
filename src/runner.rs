@@ -1724,52 +1724,53 @@ pub async fn run() -> Result<()> {
                             if result.success {
                                 let size_matched = result.filled_size.filter(|f| *f > Decimal::ZERO);
                                 if size_matched.is_none() || size_matched.as_ref().map_or(true, |s| *s == Decimal::ZERO) {
-                                    // Success but no fill reported: reconcile with actual available.
-                                    let fresh_available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache).await;
-                                    if let Some(ref a) = fresh_available {
-                                        if *a <= DUST_THRESHOLD {
-                                            remaining = Decimal::ZERO;
-                                            let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                            let exit_price = if best_bid_at_fill > Decimal::ZERO { best_bid_at_fill } else { bid };
-                                            info!(
-                                                "[IntervalSniper] SL success but 0 fill — available dust ({}), position closed ({}ms elapsed)",
-                                                a, elapsed
-                                            );
-                                            if total_filled > Decimal::ZERO {
-                                                if let Some(ref buy) = state.last_buy_order {
-                                                    let pnl = (exit_price - buy.price) * total_filled.clone();
-                                                    let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
-                                                    let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                                    info!(
-                                                        "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
-                                                        fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                                        sl_attempt, elapsed
-                                                    );
-                                                }
+                                    // API reported 0 fill — but exchange may have filled silently (FAK quirk).
+                                    // Reconcile: check WS user channel first (fastest), then REST balance.
+                                    let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
+
+                                    // Force cache refresh so we get real current balance
+                                    state.allowance_cache = None;
+                                    let fresh_available = get_available_for_sell(
+                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache
+                                    ).await;
+
+                                    let filled_by_reconciliation = match fresh_available {
+                                        Some(a) if a <= DUST_THRESHOLD => {
+                                            // Balance is now dust/zero — the FAK filled silently
+                                            let implied_fill = remaining - a;
+                                            if implied_fill > DUST_THRESHOLD {
+                                                implied_fill
+                                            } else {
+                                                remaining // assume full fill
                                             }
-                                            if let Some(ref mut log) = state.session_log {
-                                                if let Some(ref buy) = state.last_buy_order {
-                                                    let _ = log.log_position_close(
-                                                        &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                        buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_loop,
-                                                        ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
-                                                        buy.order_id.as_deref(), result.order_id.as_deref(),
-                                                        state.interval_min_bid_up, state.interval_max_bid_up,
-                                                        state.interval_min_bid_down, state.interval_max_bid_down,
-                                                        None,
-                                                    );
-                                                }
-                                            }
+                                        }
+                                        Some(a) if a < remaining => {
+                                            // Partial fill happened silently
+                                            remaining - a
+                                        }
+                                        _ => Decimal::ZERO,
+                                    };
+
+                                    if filled_by_reconciliation > Decimal::ZERO {
+                                        // Treat as real fill
+                                        total_filled += filled_by_reconciliation;
+                                        last_sell_order_id = result.order_id.clone();
+                                        remaining = remaining - filled_by_reconciliation;
+                                        info!(
+                                            "[IntervalSniper] SL reconciled fill {} @ {} (API reported 0, WS/REST balance showed fill), remaining={}",
+                                            fmt_decimal_2(&filled_by_reconciliation), fmt_price(Some(&price)), fmt_decimal_2(&remaining)
+                                        );
+                                        if remaining <= DUST_THRESHOLD {
                                             sl_done = true;
                                             break;
                                         }
-                                        if *a < remaining {
-                                            remaining = *a;
-                                        }
+                                        continue;
                                     }
-                                    // No fill this round; retry after brief yield.
+
+                                    // Truly no fill — update remaining from available and retry
+                                    if let Some(a) = fresh_available {
+                                        if a < remaining { remaining = a; }
+                                    }
                                     tokio::time::sleep(Duration::from_millis(5)).await;
                                     continue;
                                 }
@@ -1834,20 +1835,32 @@ pub async fn run() -> Result<()> {
 
                             // Error handling.
                             if is_invalid_amounts_error(result.error_msg.as_deref()) {
-                                if total_filled > Decimal::ZERO {
+                                // "invalid amounts" often means position already filled by previous order.
+                                // Reconcile before treating as closed.
+                                state.allowance_cache = None;
+                                let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
+                                let fresh = get_available_for_sell(
+                                    clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache
+                                ).await;
+                                let actual_remaining = fresh.unwrap_or(Decimal::ZERO);
+                                if actual_remaining <= DUST_THRESHOLD && total_filled == Decimal::ZERO {
+                                    // Position was filled by a previous order the API didn't report
+                                    total_filled = remaining; // best estimate
+                                    info!("[IntervalSniper] SL: invalid amounts + balance=dust → position was filled silently, size={}",
+                                        fmt_decimal_2(&total_filled));
+                                } else if total_filled > Decimal::ZERO {
                                     info!("[IntervalSniper] SL: exchange rejected amount (dust/zero), position closed");
-                                    sl_done = true;
-                                    break;
-                                } else {
-                                    // Got invalid amounts but sold nothing yet — cache is stale or TP order still locking balance.
-                                    // Cancel again, reset cache, and retry immediately.
-                                    warn!("[IntervalSniper] SL: invalid amounts but total_filled=0 — canceling again and resetting cache");
+                                } else if actual_remaining > DUST_THRESHOLD {
+                                    // Still have balance but got invalid amounts — cancel and retry
+                                    warn!("[IntervalSniper] SL: invalid amounts but balance={} remaining — canceling and retrying",
+                                        fmt_decimal_2(&actual_remaining));
                                     let _ = clob.cancel_orders_for_token(&sl_token_id).await;
                                     state.allowance_cache = None;
-                                    canceled_for_balance = false;
-                                    balance_error_retries = 0;
+                                    remaining = actual_remaining;
                                     continue;
                                 }
+                                sl_done = true;
+                                break;
                             }
 
                             if is_position_closed_error(result.error_msg.as_deref()) {
