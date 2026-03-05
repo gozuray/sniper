@@ -1806,10 +1806,6 @@ pub async fn run() -> Result<()> {
                                 if let Some(filled) = ws.get_order_filled_size(oid).await {
                                     if filled >= tp.size * dec!(0.99) {
                                         tp_filled_this_iteration = true;
-                                        info!(
-                                            "[IntervalSniper] ✓ TP limit filled @ {} — position closed",
-                                            fmt_price(Some(&target))
-                                        );
                                         if let Some(ref buy) = state.last_buy_order {
                                             let pnl = (target - buy.price) * filled.clone();
                                             let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
@@ -1821,6 +1817,10 @@ pub async fn run() -> Result<()> {
                                                 fmt_decimal_2(&filled), pnl, roi_pct, held_sec
                                             );
                                         }
+                                        info!(
+                                            "[IntervalSniper] ✓ TP limit filled @ {} — position closed",
+                                            fmt_price(Some(&target))
+                                        );
                                         if let Some(ref mut log) = state.session_log {
                                             if let Some(ref buy) = state.last_buy_order {
                                                 let _ = log.log_position_close(
@@ -1946,10 +1946,6 @@ pub async fn run() -> Result<()> {
                                                 )
                                                 .await?;
                                             if fok_result.success {
-                                                info!(
-                                                    "[IntervalSniper] ✓ TP emergency FOK sell filled @ {} — position closed",
-                                                    fmt_price(Some(&fok_price))
-                                                );
                                                 if let Some(ref buy) = state.last_buy_order {
                                                     let pnl = (fok_price - buy.price) * size.clone();
                                                     let roi_pct = ((fok_price / buy.price) - Decimal::ONE) * dec!(100);
@@ -1961,6 +1957,10 @@ pub async fn run() -> Result<()> {
                                                         fmt_decimal_2(&size), pnl, roi_pct, held_sec
                                                     );
                                                 }
+                                                info!(
+                                                    "[IntervalSniper] ✓ TP emergency FOK sell filled @ {} — position closed",
+                                                    fmt_price(Some(&fok_price))
+                                                );
                                                 if let Some(ref mut log) = state.session_log {
                                                     if let Some(ref buy) = state.last_buy_order {
                                                         let _ = log.log_position_close(
