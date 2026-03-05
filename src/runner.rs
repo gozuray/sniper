@@ -885,6 +885,7 @@ pub async fn run() -> Result<()> {
                             trigger_price: round_to_tick(state.config.stop_loss_price),
                             placed_at_ms: now_ms_u,
                         });
+                        state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
                         state.pending_gtc_order_id = None;
@@ -996,6 +997,7 @@ pub async fn run() -> Result<()> {
                                     trigger_price: round_to_tick(state.config.stop_loss_price),
                                     placed_at_ms: now_ms_u,
                                 });
+                                state.allowance_cache = None;
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;
                                 state.pending_gtc_order_id = None;
@@ -1105,6 +1107,7 @@ pub async fn run() -> Result<()> {
                                 trigger_price: round_to_tick(state.config.stop_loss_price),
                                 placed_at_ms: now_ms_u,
                             });
+                            state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
                             state.pending_gtc_order_id = None;
@@ -2349,6 +2352,7 @@ pub async fn run() -> Result<()> {
                                     trigger_price,
                                     placed_at_ms: now_ms_u,
                                 });
+                                state.allowance_cache = None;
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;
                                 let http_ms = t_order_start.elapsed().as_millis();
