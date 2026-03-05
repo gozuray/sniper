@@ -1575,21 +1575,75 @@ pub async fn run() -> Result<()> {
                             let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache).await;
 
                             if remaining < DUST_THRESHOLD {
+                                let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
                                 info!(
                                     "[IntervalSniper] SL loop: remaining dust ({} < {}), position closed ({}ms elapsed)",
-                                    fmt_decimal_2(&remaining), DUST_THRESHOLD,
-                                    now_ms_loop.saturating_sub(sl_start_ms)
+                                    fmt_decimal_2(&remaining), DUST_THRESHOLD, elapsed
                                 );
+                                let exit_price = if best_bid_at_fill > Decimal::ZERO { best_bid_at_fill } else { bid };
+                                if total_filled > Decimal::ZERO {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let pnl = (exit_price - buy.price) * total_filled.clone();
+                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                        let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
+                                        info!(
+                                            "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
+                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                            fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
+                                            sl_attempt, elapsed
+                                        );
+                                    }
+                                }
+                                if let Some(ref mut log) = state.session_log {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let _ = log.log_position_close(
+                                            &market.slug, market.interval_start_unix, market.close_time_unix,
+                                            buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_loop,
+                                            ExitType::StopLoss, total_filled.clone(), None,
+                                            buy.order_id.as_deref(), last_sell_order_id.as_deref(),
+                                            state.interval_min_bid_up, state.interval_max_bid_up,
+                                            state.interval_min_bid_down, state.interval_max_bid_down,
+                                            None,
+                                        );
+                                    }
+                                }
                                 sl_done = true;
                                 break;
                             }
                             if let Some(ref a) = available {
                                 if *a <= DUST_THRESHOLD && total_filled > Decimal::ZERO {
+                                    let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
                                     info!(
                                         "[IntervalSniper] SL loop: available dust ({} <= {}), position closed ({}ms elapsed)",
-                                        a, DUST_THRESHOLD,
-                                        now_ms_loop.saturating_sub(sl_start_ms)
+                                        a, DUST_THRESHOLD, elapsed
                                     );
+                                    let exit_price = if best_bid_at_fill > Decimal::ZERO { best_bid_at_fill } else { bid };
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let pnl = (exit_price - buy.price) * total_filled.clone();
+                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                        let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
+                                        info!(
+                                            "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
+                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                            fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
+                                            sl_attempt, elapsed
+                                        );
+                                    }
+                                    if let Some(ref mut log) = state.session_log {
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let _ = log.log_position_close(
+                                                &market.slug, market.interval_start_unix, market.close_time_unix,
+                                                buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_loop,
+                                                ExitType::StopLoss, total_filled.clone(), None,
+                                                buy.order_id.as_deref(), last_sell_order_id.as_deref(),
+                                                state.interval_min_bid_up, state.interval_max_bid_up,
+                                                state.interval_min_bid_down, state.interval_max_bid_down,
+                                                None,
+                                            );
+                                        }
+                                    }
                                     sl_done = true;
                                     break;
                                 }
@@ -1626,7 +1680,58 @@ pub async fn run() -> Result<()> {
                             }
 
                             if result.success {
-                                let filled = result.filled_size.filter(|f| *f > Decimal::ZERO).unwrap_or(size.clone());
+                                let size_matched = result.filled_size.filter(|f| *f > Decimal::ZERO);
+                                if size_matched.is_none() || size_matched.as_ref().map_or(true, |s| *s == Decimal::ZERO) {
+                                    // Success but no fill reported: reconcile with actual available.
+                                    let fresh_available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache).await;
+                                    if let Some(ref a) = fresh_available {
+                                        if *a <= DUST_THRESHOLD {
+                                            remaining = Decimal::ZERO;
+                                            let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
+                                            let exit_price = if best_bid_at_fill > Decimal::ZERO { best_bid_at_fill } else { bid };
+                                            info!(
+                                                "[IntervalSniper] SL success but 0 fill — available dust ({}), position closed ({}ms elapsed)",
+                                                a, elapsed
+                                            );
+                                            if total_filled > Decimal::ZERO {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let pnl = (exit_price - buy.price) * total_filled.clone();
+                                                    let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                                    let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
+                                                    info!(
+                                                        "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
+                                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                                        fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
+                                                        sl_attempt, elapsed
+                                                    );
+                                                }
+                                            }
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug, market.interval_start_unix, market.close_time_unix,
+                                                        buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_loop,
+                                                        ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
+                                                        buy.order_id.as_deref(), result.order_id.as_deref(),
+                                                        state.interval_min_bid_up, state.interval_max_bid_up,
+                                                        state.interval_min_bid_down, state.interval_max_bid_down,
+                                                        None,
+                                                    );
+                                                }
+                                            }
+                                            sl_done = true;
+                                            break;
+                                        }
+                                        if *a < remaining {
+                                            remaining = *a;
+                                        }
+                                    }
+                                    // No fill this round; retry after brief yield.
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                    continue;
+                                }
+                                let filled = size_matched.unwrap();
                                 if let (Some(log), Some(oid)) = (state.session_log.as_mut(), result.order_id.as_deref()) {
                                     let _ = log.log_order_filled(
                                         &market.slug, market.interval_start_unix, market.close_time_unix,
