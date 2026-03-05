@@ -1535,6 +1535,7 @@ pub async fn run() -> Result<()> {
                         let mut last_sell_order_id: Option<String> = None; // updated on each fill
                         #[allow(unused_assignments)]
                         let mut best_bid_at_fill = Decimal::ZERO;
+                        let mut no_match_retries: u32 = 0;
 
                         loop {
                             sl_attempt += 1;
@@ -1681,8 +1682,25 @@ pub async fn run() -> Result<()> {
                                 continue;
                             }
 
-                            best_bid_at_fill = bid;
-                            let price = round_to_tick(bid);
+                            // For SL: use bid from book but if no-match occurred before,
+                            // drop price aggressively to find real liquidity.
+                            // After 1 no-match: drop to bid - 0.05
+                            // After 3 no-matches: drop to bid - 0.10
+                            // After 5 no-matches: sell at 0.01 (accept any price to exit)
+                            let price = if no_match_retries == 0 {
+                                round_to_tick(bid)
+                            } else if no_match_retries < 3 {
+                                round_to_tick((bid - dec!(0.05)).max(dec!(0.01)))
+                            } else if no_match_retries < 5 {
+                                round_to_tick((bid - dec!(0.10)).max(dec!(0.01)))
+                            } else {
+                                dec!(0.01) // accept any price, just exit
+                            };
+                            best_bid_at_fill = price;
+                            if no_match_retries > 0 {
+                                info!("[IntervalSniper] SL no-match retry {}: selling at {} (bid={})",
+                                    no_match_retries, fmt_price(Some(&price)), fmt_price(Some(&bid)));
+                            }
                             let result = clob
                                 .place_sell_order(&sl_token_id, price, size.clone(), crate::types::SellOrderTimeInForce::Fak)
                                 .await?;
@@ -1694,6 +1712,13 @@ pub async fn run() -> Result<()> {
                                     result.order_id.as_deref(), result.http_status, result.success,
                                     result.error_msg.as_deref(),
                                 );
+                            }
+
+                            let is_no_match = result.error_msg.as_deref()
+                                .map_or(false, |m| m.contains("no orders found"));
+                            if is_no_match {
+                                no_match_retries += 1;
+                                continue;
                             }
 
                             if result.success {
