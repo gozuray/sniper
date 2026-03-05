@@ -308,9 +308,23 @@ impl ClobWsUser {
                 continue;
             }
             if s.side == "BUY" {
+                // Only count actual fills, not resting placements
                 buy_sum += s.size_matched;
             } else if s.side == "SELL" {
-                sell_sum += s.size_matched;
+                // Only count SELL fills that actually executed.
+                // Ignore resting GTC SELL orders (PLACEMENT with size_matched=0 or
+                // orders where size_matched == original_size but order_type is still PLACEMENT).
+                // A SELL is "executed" only if it has a real trade behind it.
+                // We detect this by requiring order_type == "TRADE" or order_type == "UPDATE"
+                // (Polymarket sends UPDATE when a GTC order partially or fully fills).
+                // PLACEMENT events with size_matched > 0 are stale state from previous sessions
+                // or phantom fills — exclude them.
+                let is_executed = s.order_type == "TRADE"
+                    || s.order_type == "UPDATE"
+                    || s.order_type == "CANCELLATION"; // cancelled orders: size_matched is real fills before cancel
+                if is_executed && s.size_matched > Decimal::ZERO {
+                    sell_sum += s.size_matched;
+                }
             }
         }
         let net = buy_sum - sell_sum;
