@@ -1555,12 +1555,15 @@ pub async fn run() -> Result<()> {
                             }
 
                             if bid > sl_trigger {
-                                info!(
-                                    "[IntervalSniper] SL loop: bid {} recovered above trigger {}, stopping ({}ms elapsed)",
-                                    fmt_price(Some(&bid)), fmt_price(Some(&sl_trigger)),
-                                    now_ms_loop.saturating_sub(sl_start_ms)
-                                );
-                                break;
+                                if total_filled > Decimal::ZERO {
+                                    info!(
+                                        "[IntervalSniper] SL loop: bid {} recovered above trigger {}, stopping ({}ms elapsed)",
+                                        fmt_price(Some(&bid)), fmt_price(Some(&sl_trigger)),
+                                        now_ms_loop.saturating_sub(sl_start_ms)
+                                    );
+                                    break;
+                                }
+                                // bid recovered but nothing sold yet — keep trying
                             }
 
                             // Available balance: WS user fills (instant) then REST fallback.
@@ -1687,19 +1690,11 @@ pub async fn run() -> Result<()> {
                             if is_position_closed_error(result.error_msg.as_deref()) {
                                 balance_error_retries += 1;
                                 if !canceled_for_balance {
-                                    warn!("[IntervalSniper] SL: balance/allowance error, canceling once and retrying");
-                                    let _ = clob.cancel_orders_for_token(&sl_token_id).await;
                                     canceled_for_balance = true;
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                } else if balance_error_retries >= 200 {
-                                    warn!(
-                                        "[IntervalSniper] SL: balance/allowance error persisted for {} retries (~10s), treating position as closed",
-                                        balance_error_retries
-                                    );
-                                    sl_done = true;
-                                    break;
-                                } else {
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    let _ = clob.cancel_orders_for_token(&sl_token_id).await;
+                                    warn!("[IntervalSniper] SL: balance/allowance error, canceling once and retrying");
+                                } else if balance_error_retries % 5 == 0 {
+                                    canceled_for_balance = false;
                                 }
                                 continue;
                             }
