@@ -1302,6 +1302,7 @@ pub async fn run() -> Result<()> {
                     }
                     state.market = Some(market.clone());
                     if !config.dry_run {
+                        let has_position = state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some();
                         let clob_check = Arc::clone(&clob);
                         let token_up = market.token_id_up.clone();
                         let token_down = market.token_id_down.clone();
@@ -1312,10 +1313,20 @@ pub async fn run() -> Result<()> {
                                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
                                             let bal = json.get("balance").and_then(|v| v.as_str()).unwrap_or("?");
                                             let allow = json.get("allowance").and_then(|v| v.as_str()).unwrap_or("?");
-                                            info!("[Allowance] {} token balance={} allowance={}", label, bal, allow);
+                                            if has_position {
+                                                info!("[Allowance] {} token balance={} allowance={}", label, bal, allow);
+                                            } else {
+                                                debug!("[Allowance] {} token balance={} allowance={}", label, bal, allow);
+                                            }
                                         }
                                     }
-                                    Err(e) => warn!("[Allowance] could not fetch for {} token: {}", label, e),
+                                    Err(e) => {
+                                        if has_position {
+                                            warn!("[Allowance] could not fetch for {} token: {}", label, e);
+                                        } else {
+                                            debug!("[Allowance] could not fetch for {} token: {}", label, e);
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -1554,17 +1565,8 @@ pub async fn run() -> Result<()> {
                                 continue;
                             }
 
-                            if bid > sl_trigger {
-                                if total_filled > Decimal::ZERO {
-                                    info!(
-                                        "[IntervalSniper] SL loop: bid {} recovered above trigger {}, stopping ({}ms elapsed)",
-                                        fmt_price(Some(&bid)), fmt_price(Some(&sl_trigger)),
-                                        now_ms_loop.saturating_sub(sl_start_ms)
-                                    );
-                                    break;
-                                }
-                                // bid recovered but nothing sold yet — keep trying
-                            }
+                            // Once SL is activated, run until position is closed (remaining dust/zero) or interval ends.
+                            // Do not break on bid recovery above trigger — complete the exit regardless of price.
 
                             // Available balance: WS user fills (instant) then REST fallback.
                             let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache).await;
@@ -2124,6 +2126,73 @@ pub async fn run() -> Result<()> {
                             // Pending sellable balance: wait until it's settled before re-entry.
                             tokio::time::sleep(Duration::from_millis(loop_ms)).await;
                             continue;
+                        }
+
+                        // Dust cleanup: before re-entry, sell any remaining balance for this token so the new
+                        // position starts clean and the subsequent SL does not hit 400s from dirty balance.
+                        let reentry_token_balance = match side {
+                            EntrySide::Up => bal_up,
+                            EntrySide::Down => bal_down,
+                        };
+                        if reentry_token_balance.map_or(false, |b| b > Decimal::ZERO && b >= CLOB_DEFAULT_MIN_ORDER_SIZE) {
+                            let dust_balance = reentry_token_balance.unwrap();
+                            let side_book = match side {
+                                EntrySide::Up => &top.token_id_up,
+                                EntrySide::Down => &top.token_id_down,
+                            };
+                            if let Some(ref sb) = side_book.as_ref() {
+                                if let Some(best_bid) = sb.best_bid.as_ref().filter(|b| **b > Decimal::ZERO) {
+                                    let dust_size = effective_sell_size(
+                                        dust_balance,
+                                        Some(dust_balance),
+                                        CLOB_DEFAULT_MIN_ORDER_SIZE,
+                                    );
+                                    if dust_size >= MIN_SELL_SIZE {
+                                        let dust_price = round_to_tick(best_bid);
+                                        info!(
+                                            "[IntervalSniper] Re-entry dust cleanup: selling {} @ {} (FAK) before new buy",
+                                            fmt_decimal_2(&dust_size), fmt_price(Some(&dust_price))
+                                        );
+                                        let dust_result = clob
+                                            .place_sell_order(
+                                                token_id,
+                                                dust_price,
+                                                dust_size.clone(),
+                                                crate::types::SellOrderTimeInForce::Fak,
+                                            )
+                                            .await;
+                                        match &dust_result {
+                                            Err(e) => {
+                                                warn!("[IntervalSniper] Re-entry dust sell failed: {} (continuing with buy)", e);
+                                            }
+                                            Ok(res) => {
+                                                if res.success {
+                                                    debug!("[IntervalSniper] Re-entry dust sell filled, proceeding to buy");
+                                                }
+                                                if let Some(ref mut log) = state.session_log {
+                                                    let _ = log.log_order_submitted(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        now_ms_u,
+                                                        token_id,
+                                                        "SELL",
+                                                        "FAK",
+                                                        dust_price,
+                                                        dust_size,
+                                                        res.order_id.as_deref(),
+                                                        res.http_status,
+                                                        res.success,
+                                                        res.error_msg.as_deref(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        // Brief wait so balance/allowance reflects the dust sell before placing buy.
+                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                    }
+                                }
+                            }
                         }
                     }
                     let effective_price = limit_price;
