@@ -2034,8 +2034,8 @@ pub async fn run() -> Result<()> {
                                     fmt_price(Some(&entry_price))
                                 );
                             } else if let Some(ws) = ws_user_ref {
-                                if let Some(filled) = ws.get_order_filled_size(oid).await {
-                                    if filled >= tp.size * dec!(0.99) {
+                                if let Some(filled) = ws.get_order_filled_size_sell(oid).await {
+                                    if filled >= tp.size * dec!(0.99) && best_bid >= target - TICK_SIZE {
                                         tp_filled_this_iteration = true;
                                         if let Some(ref buy) = state.last_buy_order {
                                             let pnl = (target - buy.price) * filled.clone();

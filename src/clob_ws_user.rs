@@ -260,6 +260,18 @@ impl ClobWsUser {
             .map(|s| s.size_matched)
     }
 
+    /// Return the filled size for an order only if it is a SELL (or trade event).
+    /// Used for TP fill detection to avoid false positives from BUY fill events
+    /// leaking into the TP order check via normalize_order_id collisions.
+    pub async fn get_order_filled_size_sell(&self, order_id: &str) -> Option<Decimal> {
+        let key = normalize_order_id(order_id);
+        let map = self.state.read().await;
+        map.get(&key)
+            .filter(|s| s.size_matched > Decimal::ZERO)
+            .filter(|s| s.side == "SELL" || s.side.is_empty() || s.order_type == "TRADE")
+            .map(|s| s.size_matched)
+    }
+
     /// Return balance for a token derived from WS order fills: sum of size_matched for BUY orders
     /// minus sum for SELL orders for this asset_id. Returns None if we have no orders for this token.
     pub async fn get_balance_for_token(&self, asset_id: &str) -> Option<Decimal> {
