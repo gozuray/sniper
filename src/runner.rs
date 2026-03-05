@@ -2148,7 +2148,7 @@ pub async fn run() -> Result<()> {
                                         CLOB_DEFAULT_MIN_ORDER_SIZE,
                                     );
                                     if dust_size >= MIN_SELL_SIZE {
-                                        let dust_price = round_to_tick(best_bid);
+                                        let dust_price = round_to_tick(*best_bid);
                                         info!(
                                             "[IntervalSniper] Re-entry dust cleanup: selling {} @ {} (FAK) before new buy",
                                             fmt_decimal_2(&dust_size), fmt_price(Some(&dust_price))
@@ -2189,7 +2189,7 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                         // Brief wait so balance/allowance reflects the dust sell before placing buy.
-                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
                                     }
                                 }
                             }
