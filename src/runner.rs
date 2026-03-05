@@ -18,7 +18,7 @@ use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
 const TICK_SIZE: Decimal = dec!(0.01);
@@ -151,6 +151,8 @@ struct RunnerState {
     pending_gtc_price: Option<Decimal>,
     pending_gtc_requested_size: Option<Decimal>,
     pending_gtc_timestamp_ms: Option<u64>,
+    /// Cached result of get_available_balance for the current position token (TTL 3s).
+    allowance_cache: Option<(Decimal, Instant)>,
 }
 
 fn now_unix() -> u64 {
@@ -260,18 +262,50 @@ fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
     })
 }
 
-/// Get available balance for a token for TP/SL: prefer WS (instant after fill) then REST.
+/// Get available balance for a token for TP/SL.
+/// Priority: WS user fill state for *balance*, but always cap by REST allowance when WS is used,
+/// because the WS has no allowance info — the server enforces min(balance, allowance) on every sell.
+/// Falls back to full REST balance-allowance (which returns min(balance,allowance)) when WS has no data.
+/// REST result is cached with TTL 3s to avoid calling get_available_balance on every tick.
 async fn get_available_for_sell(
     clob: &dyn ClobClient,
     ws_user: Option<&ClobWsUser>,
     token_id: &str,
+    cache: &mut Option<(Decimal, Instant)>,
 ) -> Option<Decimal> {
-    if let Some(ws) = ws_user {
-        if let Some(b) = ws.get_balance_for_token(token_id).await {
-            return Some(b);
+    let ws_balance = if let Some(ws) = ws_user {
+        ws.get_balance_for_token(token_id).await
+    } else {
+        None
+    };
+
+    const REST_CACHE_TTL: Duration = Duration::from_secs(3);
+    let rest_effective = if let Some((cached_val, cached_at)) = cache {
+        if cached_at.elapsed() < REST_CACHE_TTL {
+            Some(*cached_val)
+        } else {
+            let fresh = clob.get_available_balance(token_id).await.ok().flatten();
+            if let Some(v) = fresh {
+                *cache = Some((v, Instant::now()));
+            }
+            fresh
         }
+    } else {
+        let fresh = clob.get_available_balance(token_id).await.ok().flatten();
+        if let Some(v) = fresh {
+            *cache = Some((v, Instant::now()));
+        }
+        fresh
+    };
+
+    match (ws_balance, rest_effective) {
+        // Both sources: use the minimum — WS has the freshest balance, REST has allowance enforcement.
+        (Some(ws), Some(rest)) => Some(ws.min(rest)),
+        // Only WS: no REST data; trust WS but it may exceed allowance — caller will hit 400 if allowance is low.
+        (Some(ws), None) => Some(ws),
+        // Only REST: normal path without WS.
+        (None, rest) => rest,
     }
-    clob.get_available_balance(token_id).await.ok().flatten()
 }
 
 /// Log balance immediately after a buy (debug level).
@@ -731,6 +765,7 @@ pub async fn run() -> Result<()> {
         pending_gtc_price: None,
         pending_gtc_requested_size: None,
         pending_gtc_timestamp_ms: None,
+        allowance_cache: None,
     };
 
     if config.session_log_enabled {
@@ -741,6 +776,26 @@ pub async fn run() -> Result<()> {
     info!(
         "[IntervalSniper] started dry_run={} slug={}",
         config.dry_run, config.market_slug
+    );
+    info!(
+        "[Config] strategy={:?} tp={} sl={} size={} min_buy={} max_buy={} loop_ms={} session_log={}",
+        config.order_strategy,
+        fmt_decimal_2(&config.take_profit_price),
+        fmt_decimal_2(&config.stop_loss_price),
+        fmt_decimal_2(&config.size_shares),
+        fmt_decimal_2(&config.min_buy_price),
+        fmt_decimal_2(&config.max_buy_price),
+        config.loop_ms,
+        config.session_log_enabled,
+    );
+    info!(
+        "[Config] allow_up={} allow_down={} auto_sell={} stop_loss={} dry_run={} redeem={}",
+        config.allow_buy_up,
+        config.allow_buy_down,
+        config.enable_auto_sell,
+        config.enable_stop_loss,
+        config.dry_run,
+        config.redeem_enabled,
     );
 
     let loop_ms = config.loop_ms;
@@ -796,6 +851,7 @@ pub async fn run() -> Result<()> {
                                 "ws_user",
                             );
                         }
+                        let fill_lag_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u));
                         let target_price = if state.config.auto_sell_at_max_price {
                             dec!(0.99)
                         } else {
@@ -842,10 +898,11 @@ pub async fn run() -> Result<()> {
                             EntrySide::Down => "Down",
                         };
                         info!(
-                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: user WS)   TP size={} ({}%)   SL size={} ({}%)",
+                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: user WS)   fill_lag={}ms   TP size={} ({}%)   SL size={} ({}%)",
                             side_str,
                             fmt_decimal_2(&entry_price),
                             fmt_decimal_2(&filled),
+                            fill_lag_ms,
                             fmt_decimal_2(&tp_size),
                             state.config.auto_sell_quantity_percent,
                             fmt_decimal_2(&sl_size),
@@ -1101,8 +1158,22 @@ pub async fn run() -> Result<()> {
                 .unwrap_or(true);
 
         if need_new_market {
+            let old_market_for_end_log = state.market.clone();
             // Log position close (MARKET_CLOSE) and interval summary for the market we're leaving
             if let Some(ref old_market) = state.market {
+                if state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some() {
+                    if let Some(ref buy) = state.last_buy_order {
+                        let last_bid = state.last_best_bid_for_position.unwrap_or(Decimal::ZERO);
+                        let pnl = (last_bid - buy.price) * buy.size.clone();
+                        let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                        warn!(
+                            "[ABANDONED] {} entry={} last_bid={} size={} unrealized_pnl={:+.4} held={}s — interval closed with open position",
+                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                            fmt_decimal_2(&buy.price), fmt_decimal_2(&last_bid),
+                            fmt_decimal_2(&buy.size), pnl, held_sec
+                        );
+                    }
+                }
                 if let Some(ref mut log) = state.session_log {
                     if state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some() {
                         let (side, entry_price, entry_time_ms, size) =
@@ -1181,9 +1252,22 @@ pub async fn run() -> Result<()> {
             }
             match fetch_market_by_slug(&http, &config.gamma_base_url, &current_slug).await {
                 Ok(market) => {
+                    // Log interval summary before reset
+                    if let Some(ref old_market) = old_market_for_end_log {
+                        if state.trades_this_interval > 0 || state.ordered_this_interval {
+                            info!(
+                                "[INTERVAL] END {}  trades={}  total_size={}  {}",
+                                old_market.slug.chars().rev().take(14).collect::<String>().chars().rev().collect::<String>(),
+                                state.trades_this_interval,
+                                fmt_decimal_2(&state.total_shares_this_interval),
+                                if state.pending_auto_sell.is_some() { "position=OPEN(abandoned)" } else { "position=closed" }
+                            );
+                        }
+                    }
                     state.ws_book = None; // drop previous WS before creating new (per-market)
                     // ws_user is persistent: connect once with empty markets to receive all fills (no race on interval switch)
                     let ws_url = ClobWsBook::ws_url_from_rest_host(&clob_host);
+                    info!("[WS] connecting order book for new interval...");
                     match ClobWsBook::connect(&ws_url, &market.token_id_up, &market.token_id_down)
                         .await
                     {
@@ -1201,10 +1285,12 @@ pub async fn run() -> Result<()> {
                     if !state.config.dry_run && state.ws_user.is_none() {
                         let ws_user_url = ClobWsUser::ws_url_from_rest_host(&clob_host);
                         // Empty markets = receive events for all markets (Polymarket API); avoids race with subscription delay
+                        info!("[WS] connecting user channel...");
                         match ClobWsUser::connect(&ws_user_url, &[]).await {
                             Ok(ws_u) => {
                                 state.ws_user = Some(Arc::new(ws_u));
                                 info!("[IntervalSniper] WebSocket user channel connected (order/trade updates, all markets)");
+                                info!("[WS] user channel active — fills via WS (0ms lag), REST is fallback only");
                             }
                             Err(e) => {
                                 warn!(
@@ -1215,6 +1301,25 @@ pub async fn run() -> Result<()> {
                         }
                     }
                     state.market = Some(market.clone());
+                    if !config.dry_run {
+                        let clob_check = Arc::clone(&clob);
+                        let token_up = market.token_id_up.clone();
+                        let token_down = market.token_id_down.clone();
+                        tokio::spawn(async move {
+                            for (label, token) in [("Up", token_up.as_str()), ("Down", token_down.as_str())] {
+                                match clob_check.as_ref().get_balance_allowance(token).await {
+                                    Ok(raw) => {
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                                            let bal = json.get("balance").and_then(|v| v.as_str()).unwrap_or("?");
+                                            let allow = json.get("allowance").and_then(|v| v.as_str()).unwrap_or("?");
+                                            info!("[Allowance] {} token balance={} allowance={}", label, bal, allow);
+                                        }
+                                    }
+                                    Err(e) => warn!("[Allowance] could not fetch for {} token: {}", label, e),
+                                }
+                            }
+                        });
+                    }
                     state.ordered_this_interval = false;
                     state.trades_this_interval = 0;
                     state.re_entry_allowed_after_sl = false;
@@ -1232,6 +1337,7 @@ pub async fn run() -> Result<()> {
                     state.stop_loss_placed = false;
                     state.tp_limit_order_id = None;
                     state.tp_limit_balance_retries = 0;
+                    state.allowance_cache = None;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
                     state.interval_min_bid_up = None;
                     state.interval_max_bid_up = None;
@@ -1411,7 +1517,10 @@ pub async fn run() -> Result<()> {
                         let mut canceled_for_balance = false;
                         let mut balance_error_retries: u32 = 0;
                         let mut total_filled = Decimal::ZERO;
+                        #[allow(unused_assignments)]
                         let mut last_sell_order_id: Option<String> = None; // updated on each fill
+                        #[allow(unused_assignments)]
+                        let mut best_bid_at_fill = Decimal::ZERO;
 
                         loop {
                             sl_attempt += 1;
@@ -1455,7 +1564,7 @@ pub async fn run() -> Result<()> {
                             }
 
                             // Available balance: WS user fills (instant) then REST fallback.
-                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id).await;
+                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache).await;
 
                             if remaining < DUST_THRESHOLD {
                                 info!(
@@ -1493,6 +1602,7 @@ pub async fn run() -> Result<()> {
                                 continue;
                             }
 
+                            best_bid_at_fill = bid;
                             let price = round_to_tick(bid);
                             let result = clob
                                 .place_sell_order(&sl_token_id, price, size.clone(), crate::types::SellOrderTimeInForce::Fak)
@@ -1525,6 +1635,20 @@ pub async fn run() -> Result<()> {
                                         "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed) [{}ms, {} attempts]",
                                         fmt_price(Some(&price)), elapsed, sl_attempt
                                     );
+                                    if total_filled > Decimal::ZERO {
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let pnl = (best_bid_at_fill - buy.price) * total_filled.clone();
+                                            let roi_pct = ((best_bid_at_fill / buy.price) - Decimal::ONE) * dec!(100);
+                                            let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
+                                            info!(
+                                                "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
+                                                match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                fmt_decimal_2(&buy.price), fmt_decimal_2(&best_bid_at_fill),
+                                                fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
+                                                sl_attempt, elapsed
+                                            );
+                                        }
+                                    }
                                     if let Some(ref mut log) = state.session_log {
                                         if let Some(ref buy) = state.last_buy_order {
                                             let _ = log.log_position_close(
@@ -1610,6 +1734,7 @@ pub async fn run() -> Result<()> {
                             state.tp_limit_balance_retries = 0;
                             state.pending_auto_sell = None;
                             state.pending_stop_loss = None;
+                            state.allowance_cache = None;
                             state.last_buy_order = None;
                             state.balance_reflected_at_ms = None;
                             state.balance_delay_clob_logged = false;
@@ -1659,7 +1784,7 @@ pub async fn run() -> Result<()> {
                             .as_ref()
                             .and_then(|s| s.best_bid)
                             .unwrap_or(Decimal::ZERO);
-                        let best_ask = side_book
+                        let _best_ask = side_book
                             .as_ref()
                             .and_then(|s| s.best_ask)
                             .unwrap_or(Decimal::ZERO);
@@ -1685,6 +1810,17 @@ pub async fn run() -> Result<()> {
                                             "[IntervalSniper] ✓ TP limit filled @ {} — position closed",
                                             fmt_price(Some(&target))
                                         );
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let pnl = (target - buy.price) * filled.clone();
+                                            let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
+                                            let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                            info!(
+                                                "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s",
+                                                match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                fmt_decimal_2(&buy.price), fmt_decimal_2(&target),
+                                                fmt_decimal_2(&filled), pnl, roi_pct, held_sec
+                                            );
+                                        }
                                         if let Some(ref mut log) = state.session_log {
                                             if let Some(ref buy) = state.last_buy_order {
                                                 let _ = log.log_position_close(
@@ -1716,6 +1852,7 @@ pub async fn run() -> Result<()> {
                                         state.tp_limit_balance_retries = 0;
                                         state.pending_auto_sell = None;
                                         state.pending_stop_loss = None;
+                                        state.allowance_cache = None;
                                         state.last_buy_order = None;
                                         state.balance_reflected_at_ms = None;
                                         state.balance_delay_clob_logged = false;
@@ -1734,7 +1871,7 @@ pub async fn run() -> Result<()> {
                             if target_reached {
                                 let position_size_real = tp.size.clone();
                                 let available =
-                                    get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id).await;
+                                    get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id, &mut state.allowance_cache).await;
                                 let size = effective_sell_size(
                                     position_size_real,
                                     available.clone(),
@@ -1779,9 +1916,21 @@ pub async fn run() -> Result<()> {
                                         state.tp_limit_balance_retries += 1;
                                         if state.tp_limit_balance_retries == 1 {
                                             warn!(
-                                                "[IntervalSniper] TP limit balance/allowance error, canceling orders and retrying"
+                                                "[IntervalSniper] TP limit balance/allowance error (retry {}), canceling orders and retrying",
+                                                state.tp_limit_balance_retries
                                             );
                                             let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                            // Log raw balance-allowance JSON so we know if it's balance=0 or allowance=0.
+                                            match clob.get_balance_allowance(&tp.token_id).await {
+                                                Ok(raw) => warn!(
+                                                    "[IntervalSniper] balance-allowance for TP token: {}",
+                                                    raw.chars().take(300).collect::<String>()
+                                                ),
+                                                Err(e) => warn!(
+                                                    "[IntervalSniper] could not fetch balance-allowance: {}",
+                                                    e
+                                                ),
+                                            }
                                         } else if state.tp_limit_balance_retries >= 10 {
                                             warn!(
                                                 "[IntervalSniper] TP limit failed {} times with balance/allowance error — attempting FOK market sell",
@@ -1801,6 +1950,17 @@ pub async fn run() -> Result<()> {
                                                     "[IntervalSniper] ✓ TP emergency FOK sell filled @ {} — position closed",
                                                     fmt_price(Some(&fok_price))
                                                 );
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let pnl = (fok_price - buy.price) * size.clone();
+                                                    let roi_pct = ((fok_price / buy.price) - Decimal::ONE) * dec!(100);
+                                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                    info!(
+                                                        "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s",
+                                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&fok_price),
+                                                        fmt_decimal_2(&size), pnl, roi_pct, held_sec
+                                                    );
+                                                }
                                                 if let Some(ref mut log) = state.session_log {
                                                     if let Some(ref buy) = state.last_buy_order {
                                                         let _ = log.log_position_close(
@@ -1832,6 +1992,7 @@ pub async fn run() -> Result<()> {
                                                 state.tp_limit_balance_retries = 0;
                                                 state.pending_auto_sell = None;
                                                 state.pending_stop_loss = None;
+                                                state.allowance_cache = None;
                                                 state.last_buy_order = None;
                                                 state.balance_reflected_at_ms = None;
                                                 state.balance_delay_clob_logged = false;
@@ -1952,12 +2113,14 @@ pub async fn run() -> Result<()> {
                             clob.as_ref().as_ref(),
                             ws_user_ref,
                             &market.token_id_up,
+                            &mut state.allowance_cache,
                         )
                         .await;
                         let bal_down = get_available_for_sell(
                             clob.as_ref().as_ref(),
                             ws_user_ref,
                             &market.token_id_down,
+                            &mut state.allowance_cache,
                         )
                         .await;
                         let has_sellable_balance = bal_up.map_or(false, |b| b >= CLOB_DEFAULT_MIN_ORDER_SIZE)
@@ -1978,7 +2141,7 @@ pub async fn run() -> Result<()> {
                             .max(min_order_size)
                             .round_dp(2),
                     );
-                    let maker_amount =
+                    let _maker_amount =
                         maker_amount_2_decimals(size.clone(), effective_price.clone());
                     if size >= min_order_size && size > Decimal::ZERO {
                         let params = LimitOrderParams {
@@ -2004,6 +2167,7 @@ pub async fn run() -> Result<()> {
                             state.config.min_buy_price,
                             state.config.max_buy_price
                         );
+                        let t_order_start = Instant::now();
                         let result = clob.place_limit_order(params, order_type).await?;
                         if let Some(ref mut log) = state.session_log {
                             let order_type_str = match order_type {
@@ -2123,19 +2287,19 @@ pub async fn run() -> Result<()> {
                                 });
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;
+                                let http_ms = t_order_start.elapsed().as_millis();
                                 let side_str = match entry_side {
                                     EntrySide::Up => "Up  ",
                                     EntrySide::Down => "Down",
                                 };
                                 info!(
-                                    "[IntervalSniper]  BUY   {}  @ {}   size={}   TP size={} ({}%)   SL size={} ({}%)",
+                                    "[IntervalSniper]  BUY   {}  @ {}   size={}   http={}ms   TP={} SL={}",
                                     side_str,
                                     fmt_decimal_2(&entry_price),
                                     fmt_decimal_2(&state.last_buy_order.as_ref().unwrap().size),
+                                    http_ms,
                                     fmt_decimal_2(&tp_size),
-                                    state.config.auto_sell_quantity_percent,
-                                    fmt_decimal_2(&sl_size),
-                                    state.config.stop_loss_quantity_percent
+                                    fmt_decimal_2(&sl_size)
                                 );
                                 let w = state.ws_user.clone();
                                 log_balance_after_buy(

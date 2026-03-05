@@ -397,27 +397,42 @@ impl LiveClob {
         Ok(text)
     }
 
-    /// Parse balance from balance-allowance JSON and normalize to shares.
-    /// Conditional balances are returned in base units (1e6).
-    fn parse_balance_from_response(text: &str) -> Option<Decimal> {
-        let json: serde_json::Value = serde_json::from_str(text).ok()?;
-        let balance = json.get("balance")?;
-        let s = balance
+    /// Parse a single decimal field from a JSON value (string, int, or float).
+    fn parse_decimal_field(v: &serde_json::Value) -> Option<Decimal> {
+        let s = v
             .as_str()
             .map(String::from)
-            .or_else(|| balance.as_f64().map(|f| f.to_string()))
-            .or_else(|| balance.as_i64().map(|i| i.to_string()))
-            .or_else(|| balance.as_u64().map(|u| u.to_string()))?;
-        let raw = Decimal::from_str(s.trim())
+            .or_else(|| v.as_f64().map(|f| f.to_string()))
+            .or_else(|| v.as_i64().map(|i| i.to_string()))
+            .or_else(|| v.as_u64().map(|u| u.to_string()))?;
+        Decimal::from_str(s.trim())
             .ok()
-            .filter(|d| *d >= Decimal::ZERO)?;
-        let shares = if CONDITIONAL_BASE_DECIMALS == 6 {
-            raw / CONDITIONAL_BASE_FACTOR
+            .filter(|d| *d >= Decimal::ZERO)
+    }
+
+    /// Parse available sell capacity from balance-allowance JSON.
+    /// The CLOB server enforces min(balance, allowance) — if either is zero the order fails.
+    /// We return min(balance, allowance) so `effective_sell_size` never exceeds what the server allows.
+    /// Conditional token amounts are returned in base units (1e6); we normalize to shares.
+    fn parse_balance_from_response(text: &str) -> Option<Decimal> {
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+
+        let balance_raw = json.get("balance").and_then(Self::parse_decimal_field)?;
+        // allowance may be absent on some response shapes — treat as u64::MAX (no cap).
+        let allowance_raw = json
+            .get("allowance")
+            .and_then(Self::parse_decimal_field)
+            .unwrap_or(Decimal::MAX);
+
+        // Server uses min(balance, allowance) for the sell check.
+        let effective_raw = balance_raw.min(allowance_raw);
+
+        let divisor = if CONDITIONAL_BASE_DECIMALS == 6 {
+            CONDITIONAL_BASE_FACTOR
         } else {
-            let divisor = Decimal::from(10u64.pow(CONDITIONAL_BASE_DECIMALS));
-            raw / divisor
+            Decimal::from(10u64.pow(CONDITIONAL_BASE_DECIMALS))
         };
-        Some(shares)
+        Some(effective_raw / divisor)
     }
 }
 

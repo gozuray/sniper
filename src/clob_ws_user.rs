@@ -101,20 +101,48 @@ impl ClobWsUser {
         let join = tokio::spawn(async move {
             let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
             ping_interval.tick().await;
+            let mut last_msg_at = std::time::Instant::now();
+            let mut heartbeat = interval(Duration::from_secs(30));
+            heartbeat.tick().await;
 
             loop {
                 tokio::select! {
                     _ = ping_interval.tick() => {
                         if write.send(Message::Ping(vec![])).await.is_err() {
+                            tracing::warn!("[ClobWsUser] ping failed — connection lost, fills will degrade to REST");
                             break;
                         }
                     }
                     msg = read.next() => {
-                        let Some(Ok(msg)) = msg else { break };
-                        if let Message::Text(text) = msg {
-                            if let Err(e) = Self::apply_message(&state_recv, &text).await {
-                                tracing::debug!("ClobWsUser parse: {} | payload: {}", e, text.chars().take(300).collect::<String>());
+                        let Some(Ok(msg)) = msg else {
+                            tracing::warn!("[ClobWsUser] connection closed — fills will degrade to REST fallback");
+                            break;
+                        };
+                        match msg {
+                            Message::Text(text) => {
+                                if let Err(e) = Self::apply_message(&state_recv, &text).await {
+                                    let event_type = serde_json::from_str::<serde_json::Value>(&text)
+                                        .ok()
+                                        .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
+                                        .unwrap_or_default();
+                                    if event_type.is_empty() {
+                                        tracing::debug!("ClobWsUser parse: {} | payload: {}", e, text.chars().take(300).collect::<String>());
+                                    } else {
+                                        tracing::warn!("ClobWsUser parse error [{}]: {}", event_type, e);
+                                    }
+                                }
+                                last_msg_at = std::time::Instant::now();
                             }
+                            Message::Pong(_) => {
+                                last_msg_at = std::time::Instant::now();
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = heartbeat.tick() => {
+                        let silent_secs = last_msg_at.elapsed().as_secs();
+                        if silent_secs > 30 {
+                            tracing::warn!("[ClobWsUser] no messages in {}s — possible silent disconnect", silent_secs);
                         }
                     }
                 }
