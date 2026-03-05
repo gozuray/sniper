@@ -1809,9 +1809,20 @@ pub async fn run() -> Result<()> {
 
                             // Error handling.
                             if is_invalid_amounts_error(result.error_msg.as_deref()) {
-                                info!("[IntervalSniper] SL: exchange rejected amount (dust/zero), position closed");
-                                sl_done = true;
-                                break;
+                                if total_filled > Decimal::ZERO {
+                                    info!("[IntervalSniper] SL: exchange rejected amount (dust/zero), position closed");
+                                    sl_done = true;
+                                    break;
+                                } else {
+                                    // Got invalid amounts but sold nothing yet — cache is stale or TP order still locking balance.
+                                    // Cancel again, reset cache, and retry immediately.
+                                    warn!("[IntervalSniper] SL: invalid amounts but total_filled=0 — canceling again and resetting cache");
+                                    let _ = clob.cancel_orders_for_token(&sl_token_id).await;
+                                    state.allowance_cache = None;
+                                    canceled_for_balance = false;
+                                    balance_error_retries = 0;
+                                    continue;
+                                }
                             }
 
                             if is_position_closed_error(result.error_msg.as_deref()) {
