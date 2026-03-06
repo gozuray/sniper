@@ -33,6 +33,8 @@ const SELL_SIZE_DECIMALS: u32 = 4;
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 /// Below this we consider position closed (dust); avoids spamming the API with tiny amounts the exchange rejects.
 const DUST_THRESHOLD: Decimal = dec!(0.001);
+/// API reported fill below this is treated like 0 — run full WS/REST reconciliation (exchange often filled fully).
+const TINY_FILL_THRESHOLD: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
@@ -1887,6 +1889,94 @@ pub async fn run() -> Result<()> {
                                     remaining = Decimal::ZERO;
                                     sl_done = true;
                                     break;
+                                }
+
+                                // Tiny fill (e.g. 0.001–0.004): API artifact; exchange may have filled fully. Run same reconciliation as zero-fill.
+                                if filled < TINY_FILL_THRESHOLD {
+                                    let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
+                                    if let Some(ws) = ws_ref.as_ref() {
+                                        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+                                        loop {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                            let ws_bal = ws.get_balance_for_token(&sl_token_id).await;
+                                            if ws_bal.map_or(false, |b| b < remaining) {
+                                                break; // WS balance dropped — sell fill arrived
+                                            }
+                                            if tokio::time::Instant::now() >= deadline {
+                                                break; // timeout — proceed with REST fallback
+                                            }
+                                        }
+                                    }
+                                    state.allowance_cache = None;
+                                    let fresh_available = get_available_for_sell(
+                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache
+                                    ).await;
+                                    let filled_by_reconciliation = match fresh_available {
+                                        Some(a) if a <= DUST_THRESHOLD => {
+                                            let implied_fill = remaining - a;
+                                            if implied_fill > DUST_THRESHOLD {
+                                                implied_fill
+                                            } else {
+                                                remaining // assume full fill
+                                            }
+                                        }
+                                        Some(a) if a < remaining => remaining - a,
+                                        _ => Decimal::ZERO,
+                                    };
+                                    if filled_by_reconciliation > Decimal::ZERO {
+                                        // Replace tiny API-reported fill with reconciled amount
+                                        total_filled = total_filled - filled.clone() + filled_by_reconciliation.clone();
+                                        last_sell_order_id = result.order_id.clone();
+                                        remaining = remaining - filled_by_reconciliation.clone();
+                                        info!(
+                                            "[IntervalSniper] SL reconciled fill {} @ {} (tiny API fill {}, WS/REST balance showed fill), remaining={}",
+                                            fmt_decimal_2(&filled_by_reconciliation), fmt_price(Some(&price)), fmt_decimal_2(&filled), fmt_decimal_2(&remaining)
+                                        );
+                                        if remaining <= DUST_THRESHOLD {
+                                            let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
+                                            info!(
+                                                "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed) [{}ms, {} attempts]",
+                                                fmt_price(Some(&price)), elapsed, sl_attempt
+                                            );
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let pnl = (best_bid_at_fill - buy.price) * total_filled.clone();
+                                                let roi_pct = ((best_bid_at_fill / buy.price) - Decimal::ONE) * dec!(100);
+                                                let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
+                                                info!(
+                                                    "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
+                                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&best_bid_at_fill),
+                                                    fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
+                                                    sl_attempt, elapsed
+                                                );
+                                            }
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug, market.interval_start_unix, market.close_time_unix,
+                                                        buy.side, buy.price, best_bid_at_fill, buy.timestamp_ms, now_ms_loop,
+                                                        ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
+                                                        buy.order_id.as_deref(), last_sell_order_id.as_deref(),
+                                                        state.interval_min_bid_up, state.interval_max_bid_up,
+                                                        state.interval_min_bid_down, state.interval_max_bid_down,
+                                                        None,
+                                                    );
+                                                }
+                                            }
+                                            sl_done = true;
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                        continue;
+                                    }
+                                    // Truly partial: update remaining from available and retry
+                                    if let Some(a) = fresh_available {
+                                        if a < remaining {
+                                            remaining = a;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                    continue;
                                 }
 
                                 remaining = new_remaining;
