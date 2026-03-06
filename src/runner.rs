@@ -34,6 +34,8 @@ const SELL_SIZE_DECIMALS: u32 = 4;
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 /// Below this we consider position closed (dust); avoids spamming the API with tiny amounts the exchange rejects.
 const DUST_THRESHOLD: Decimal = dec!(0.001);
+/// When SL limit order is resting but available balance for the token is <= this, treat as position closed (fill detected via balance; WS/REST may have missed the event).
+const SL_BALANCE_DUST_CLOSE: Decimal = dec!(0.05);
 /// Polymarket may reject small sell sizes with "invalid amounts"; below this treat as dust and consider position closed.
 const TP_SL_DUST_SIZE: Decimal = dec!(0.01);
 /// API reported fill below this is treated like 0 — run full WS/REST reconciliation (exchange often filled fully).
@@ -1645,6 +1647,25 @@ pub async fn run() -> Result<()> {
                                             fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
                                         );
                                     }
+                                }
+                            }
+
+                            // Balance-dust fallback: if available balance is dust, order filled and we missed WS/REST — close position so 2nd buy can run.
+                            let sl_available = get_available_for_sell(
+                                clob.as_ref().as_ref(),
+                                ws_user_ref,
+                                &sl.token_id,
+                                &mut state.allowance_cache,
+                                true,
+                            ).await;
+                            if sl_available.map_or(false, |a| a <= SL_BALANCE_DUST_CLOSE) {
+                                let implied_filled = sl.size - sl_available.unwrap_or(Decimal::ZERO);
+                                if implied_filled >= sl.size * dec!(0.99) {
+                                    state.sl_cumulative_filled = sl.size;
+                                    info!(
+                                        "[IntervalSniper] SL position closed (balance dust {}), allowing re-entry",
+                                        fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
+                                    );
                                 }
                             }
 
