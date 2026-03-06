@@ -90,6 +90,12 @@ pub trait ClobClient: Send + Sync {
         Ok(None)
     }
 
+    /// Fetch order by ID (GET /order/{orderID}). Returns JSON with e.g. status (ORDER_STATUS_LIVE, ORDER_STATUS_MATCHED, etc).
+    /// Default: not supported (dry-run).
+    async fn get_order(&self, _order_id: &str) -> Result<serde_json::Value> {
+        anyhow::bail!("get_order not supported")
+    }
+
     async fn place_sell_order(
         &self,
         token_id: &str,
@@ -595,6 +601,39 @@ impl ClobClient for LiveClob {
     async fn get_available_balance(&self, token_id: &str) -> Result<Option<Decimal>> {
         let text = self.get_balance_allowance_inner(token_id).await.ok();
         Ok(text.as_deref().and_then(Self::parse_balance_from_response))
+    }
+
+    async fn get_order(&self, order_id: &str) -> Result<serde_json::Value> {
+        let path = format!("/order/{}", order_id);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = build_poly_hmac(&self.api_secret, timestamp, "GET", &path, None)?;
+        let url = format!("{}{}", self.clob_host, path);
+        let signer_addr = format!("{:?}", self.wallet.address())
+            .trim_matches('"')
+            .to_string();
+        let res = self
+            .client
+            .get(&url)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_ADDRESS", &signer_addr)
+            .header("POLY_SIGNATURE", &sig)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .send()
+            .await?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "get_order HTTP {}: {}",
+                status,
+                text.chars().take(200).collect::<String>()
+            );
+        }
+        serde_json::from_str(&text).context("parse get_order response")
     }
 }
 
