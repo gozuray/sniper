@@ -3,6 +3,9 @@
 //! Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/user`, authenticates with
 //! API key/secret/passphrase, subscribes by condition_id (market), and keeps per-order
 //! fill state (size_matched) so the runner can know fills without waiting for balance.
+//!
+//! **Reconnection:** On connection close or error, the client automatically reconnects
+//! in a loop (no bot restart needed). Fills use REST fallback until the WS is restored.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -158,29 +161,44 @@ impl ClobWsUser {
                             }
                         }
                         msg = read.next() => {
-                            let Some(Ok(msg)) = msg else {
-                                tracing::warn!("[ClobWsUser] connection closed — fills will degrade to REST fallback");
-                                is_reconnecting = true;
-                                tracing::info!("[ClobWsUser] attempting to reconnect...");
-                                break;
-                            };
-                            last_msg_at = std::time::Instant::now();
                             match msg {
-                                Message::Text(text) => {
-                                    if let Err(e) = Self::apply_message(&state_recv, &text).await {
-                                        let event_type = serde_json::from_str::<serde_json::Value>(&text)
-                                            .ok()
-                                            .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
-                                            .unwrap_or_default();
-                                        if event_type.is_empty() {
-                                            tracing::debug!("ClobWsUser parse: {} | payload: {}", e, text.chars().take(300).collect::<String>());
-                                        } else {
-                                            tracing::warn!("ClobWsUser parse error [{}]: {}", event_type, e);
+                                Some(Ok(msg)) => {
+                                    last_msg_at = std::time::Instant::now();
+                                    match msg {
+                                        Message::Text(text) => {
+                                            if let Err(e) = Self::apply_message(&state_recv, &text).await {
+                                                let event_type = serde_json::from_str::<serde_json::Value>(&text)
+                                                    .ok()
+                                                    .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
+                                                    .unwrap_or_default();
+                                                if event_type.is_empty() {
+                                                    tracing::debug!("ClobWsUser parse: {} | payload: {}", e, text.chars().take(300).collect::<String>());
+                                                } else {
+                                                    tracing::warn!("ClobWsUser parse error [{}]: {}", event_type, e);
+                                                }
+                                            }
                                         }
+                                        Message::Pong(_) => {}
+                                        _ => {}
                                     }
                                 }
-                                Message::Pong(_) => {}
-                                _ => {}
+                                Some(Err(e)) => {
+                                    tracing::warn!(
+                                        "[ClobWsUser] connection error: {} — reconnecting (fills → REST until restored)",
+                                        e
+                                    );
+                                    is_reconnecting = true;
+                                    tracing::info!("[ClobWsUser] attempting to reconnect...");
+                                    break;
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "[ClobWsUser] connection closed by server — reconnecting (fills → REST until restored)"
+                                    );
+                                    is_reconnecting = true;
+                                    tracing::info!("[ClobWsUser] attempting to reconnect...");
+                                    break;
+                                }
                             }
                         }
                         _ = heartbeat.tick() => {
