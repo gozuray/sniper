@@ -1645,11 +1645,24 @@ pub async fn run() -> Result<()> {
                                     sl_done = true;
                                     break;
                                 } else {
-                                    warn!(
-                                        "[IntervalSniper] SL loop: remaining={} looks like dust but total_filled=0 — cache may be stale, resetting cache and retrying",
-                                        fmt_decimal_2(&remaining)
-                                    );
+                                    // remaining=dust pero aún no detectamos fills
+                                    if sl_attempt >= 50 {
+                                        warn!(
+                                            "[IntervalSniper] SL loop: remaining dust after 50 attempts ({}ms), assuming position already closed externally",
+                                            now_ms_loop.saturating_sub(sl_start_ms)
+                                        );
+                                        sl_done = true;
+                                        break;
+                                    }
+                                    if sl_attempt % 10 == 1 {
+                                        debug!(
+                                            "[IntervalSniper] SL loop: remaining={} but total_filled=0 (attempt {}) — verifying balance",
+                                            fmt_decimal_2(&remaining), sl_attempt
+                                        );
+                                    }
                                     state.allowance_cache = None;
+                                    let delay = if sl_attempt < 10 { 10 } else { 50 };
+                                    tokio::time::sleep(Duration::from_millis(delay)).await;
                                     continue;
                                 }
                             }
@@ -1690,11 +1703,24 @@ pub async fn run() -> Result<()> {
                                     sl_done = true;
                                     break;
                                 } else {
-                                    warn!(
-                                        "[IntervalSniper] SL loop: available={:?} looks like dust but total_filled=0 — cache may be stale, resetting cache and retrying",
-                                        available
-                                    );
+                                    // available=0 pero aún no detectamos fills
+                                    if sl_attempt >= 50 {
+                                        warn!(
+                                            "[IntervalSniper] SL loop: available=0 after 50 attempts ({}ms), assuming position already closed externally",
+                                            now_ms_loop.saturating_sub(sl_start_ms)
+                                        );
+                                        sl_done = true;
+                                        break;
+                                    }
+                                    if sl_attempt % 10 == 1 {
+                                        debug!(
+                                            "[IntervalSniper] SL loop: available={:?} but total_filled=0 (attempt {}) — verifying balance",
+                                            available, sl_attempt
+                                        );
+                                    }
                                     state.allowance_cache = None;
+                                    let delay = if sl_attempt < 10 { 10 } else { 50 };
+                                    tokio::time::sleep(Duration::from_millis(delay)).await;
                                     continue;
                                 }
                             }
@@ -1751,6 +1777,40 @@ pub async fn run() -> Result<()> {
                             let result = clob
                                 .place_sell_order(&sl_token_id, price, size.clone(), crate::types::SellOrderTimeInForce::Fak)
                                 .await?;
+
+                            // Verificar balance inmediatamente (incluso antes de procesar result).
+                            // Detecta fills parciales que el API no reporta correctamente.
+                            let balance_check = if let Some(ws) = ws_user_ref {
+                                ws.get_balance_for_token(&sl_token_id).await
+                            } else {
+                                clob.get_available_balance(&sl_token_id).await.ok().flatten()
+                            };
+                            if let Some(new_bal) = balance_check {
+                                let expected_before = remaining.clone();
+                                if new_bal < expected_before - dec!(0.001) {
+                                    let filled_amount = expected_before - new_bal;
+                                    if filled_amount >= dec!(0.001) {
+                                        total_filled += filled_amount.clone();
+                                        remaining = new_bal;
+                                        best_bid_at_fill = bid;
+                                        last_sell_order_id = result.order_id.clone();
+                                        info!(
+                                            "[IntervalSniper] SL detected fill {} @ {} (balance check), remaining={}",
+                                            fmt_decimal_2(&filled_amount), fmt_price(Some(&bid)), fmt_decimal_2(&remaining)
+                                        );
+                                        if remaining < DUST_THRESHOLD {
+                                            info!("[IntervalSniper] SL: remaining is dust after fill, position closed");
+                                            sl_done = true;
+                                            break;
+                                        }
+                                        balance_error_retries = 0;
+                                        no_match_retries = 0;
+                                        state.allowance_cache = None;
+                                        tokio::time::sleep(Duration::from_millis(10)).await;
+                                        continue;
+                                    }
+                                }
+                            }
 
                             if let Some(ref mut log) = state.session_log {
                                 let _ = log.log_order_submitted(
