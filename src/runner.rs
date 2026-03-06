@@ -17,6 +17,7 @@ use anyhow::Result;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
@@ -131,6 +132,16 @@ struct RunnerState {
     tp_limit_balance_retries: u32,
     /// Last wall time (ms) we did REST fallback check for TP order status; throttle to every 5s.
     tp_limit_last_rest_check_ms: Option<u64>,
+    /// Order ID of the GTC SL limit order (cancel and replace at new best_bid when bid drops).
+    sl_limit_order_id: Option<String>,
+    /// Price at which the current SL limit order was placed (to detect when to cancel and replace).
+    sl_limit_order_price: Option<Decimal>,
+    /// Total size filled so far in this SL exit (across possibly multiple limit orders); 100% = position closed.
+    sl_cumulative_filled: Decimal,
+    /// Filled size already accounted for the current SL order (to compute delta from WS).
+    sl_last_order_filled: Decimal,
+    /// Last wall time (ms) we did REST fallback check for SL order status; throttle to every 5s.
+    sl_limit_last_rest_check_ms: Option<u64>,
     interval_switch_wall_time_ms: Option<u64>,
     /// Session log (JSONL) when MM_SESSION_LOG=true.
     session_log: Option<SessionLog>,
@@ -777,6 +788,11 @@ pub async fn run() -> Result<()> {
         tp_limit_order_id: None,
         tp_limit_balance_retries: 0,
         tp_limit_last_rest_check_ms: None,
+        sl_limit_order_id: None,
+        sl_limit_order_price: None,
+        sl_cumulative_filled: Decimal::ZERO,
+        sl_last_order_filled: Decimal::ZERO,
+        sl_limit_last_rest_check_ms: None,
         interval_switch_wall_time_ms: None,
         session_log: None,
         interval_min_bid_up: None,
@@ -1390,6 +1406,11 @@ pub async fn run() -> Result<()> {
                     state.tp_limit_order_id = None;
                     state.tp_limit_balance_retries = 0;
                     state.tp_limit_last_rest_check_ms = None;
+                    state.sl_limit_order_id = None;
+                    state.sl_limit_order_price = None;
+                    state.sl_cumulative_filled = Decimal::ZERO;
+                    state.sl_last_order_filled = Decimal::ZERO;
+                    state.sl_limit_last_rest_check_ms = None;
                     state.allowance_cache = None;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
                     state.interval_min_bid_up = None;
@@ -1525,11 +1546,10 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Stop loss: single tight loop. When bid <= trigger, cancel TP once, then sell FAK
-        // repeatedly with minimal delay until position=0, bid recovers, or interval ends.
-        // Uses WS book for instant bid and WS user fills for instant available balance.
+        // Stop loss: limit-order style (like TP). When bid <= trigger, place GTC limit at best_bid;
+        // if bid drops before fill, cancel and replace at new best_bid. Detect 100% fill via WS user.
         if state.config.enable_stop_loss {
-            if let Some(ref mut sl) = state.pending_stop_loss {
+            if let Some(ref sl) = state.pending_stop_loss.clone() {
                 if !state.stop_loss_placed {
                     let top_sl = if let Some(ref ws) = state.ws_book {
                         ws.get_top_of_book().await
@@ -1543,721 +1563,202 @@ pub async fn run() -> Result<()> {
                     let side_book = if is_up { &top_sl.token_id_up } else { &top_sl.token_id_down };
                     let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
 
-                    if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
-                        let sl_start_ms = now_ms();
-                        info!(
-                            "[IntervalSniper] SL TRIGGERED: bid {} <= trigger {} — entering fast sell loop",
-                            fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
-                        );
-
-                        // Cancel TP/open orders once so balance is freed.
-                        let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
-                        match cancel_result {
-                            Err(e) => warn!("[IntervalSniper] cancel orders before SL failed: {} (continuing)", e),
-                            Ok(ref res) if !res.not_canceled.is_empty() => {
-                                warn!("[IntervalSniper] cancel before SL: {} order(s) not canceled", res.not_canceled.len());
-                            }
-                            _ => {}
+                    // Interval ended: cancel SL order so we don't leave a resting order in wrong interval.
+                    let now_check = now_unix();
+                    if now_check >= market.close_time_unix
+                        || current_5min_slug(config.interval_market) != market.slug
+                    {
+                        if state.sl_limit_order_id.is_some() {
+                            let _ = clob.cancel_orders_for_token(&sl.token_id).await;
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
                         }
-                        state.tp_limit_order_id = None;
-                        state.tp_limit_balance_retries = 0;
-                        state.allowance_cache = None;
-
-                        // Wait up to 300ms for the exchange to free balance after cancel.
-                        // Poll REST balance directly (bypass WS which may lag) up to 6 times x 50ms.
-                        let sl_token_id = sl.token_id.clone();
-                        for _ in 0..6 {
-                            let freed = clob.get_available_balance(&sl_token_id).await.ok().flatten();
-                            if freed.map_or(false, |a| a >= sl.size * dec!(0.90)) {
-                                break; // Balance is available, proceed immediately
-                            }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                        // Always reset cache so the SL loop reads fresh balance on first attempt.
-                        state.allowance_cache = None;
-                        let sl_trigger = sl.trigger_price;
-                        let mut remaining = sl.size;
-                        let mut sl_done = false;
-                        let mut sl_attempt: u32 = 0;
-                        let mut balance_error_retries: u32 = 0;
-                        let mut total_filled = Decimal::ZERO;
-                        #[allow(unused_assignments)]
-                        let mut last_sell_order_id: Option<String> = None; // updated on each fill
-                        #[allow(unused_assignments)]
-                        let mut best_bid_at_fill = Decimal::ZERO;
-                        let mut no_match_retries: u32 = 0;
-
-                        loop {
-                            sl_attempt += 1;
-
-                            let now_check = now_unix();
-                            let now_ms_loop = now_ms();
-                            if now_check >= market.close_time_unix
-                                || current_5min_slug(config.interval_market) != market.slug
-                            {
-                                info!("[IntervalSniper] SL loop: interval ended (attempt {}), stopping", sl_attempt);
-                                break;
-                            }
-
-                            // Bid from WS book (instant, no REST RTT).
-                            let top_loop = if let Some(ref ws) = state.ws_book {
-                                ws.get_top_of_book().await
-                            } else {
-                                match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
-                                    Ok(t) => t,
-                                    Err(_) => {
-                                        tokio::time::sleep(Duration::from_millis(10)).await;
-                                        continue;
-                                    }
+                    } else if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
+                        // First time in SL zone: cancel TP so balance is free for SL limit order.
+                        if state.sl_limit_order_id.is_none() && state.sl_cumulative_filled.is_zero() {
+                            let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
+                            match cancel_result {
+                                Err(e) => warn!("[IntervalSniper] cancel orders before SL limit failed: {} (continuing)", e),
+                                Ok(ref res) if !res.not_canceled.is_empty() => {
+                                    warn!("[IntervalSniper] cancel before SL: {} order(s) not canceled", res.not_canceled.len());
                                 }
-                            };
-                            let side_loop = if is_up { &top_loop.token_id_up } else { &top_loop.token_id_down };
-                            let bid = side_loop.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
-
-                            if bid <= Decimal::ZERO {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                continue;
+                                _ => {}
                             }
-
-                            // Once SL is activated, run until position is closed (remaining dust/zero) or interval ends.
-                            // Do not break on bid recovery above trigger — complete the exit regardless of price.
-
-                            // Available balance: WS user fills (instant) then REST fallback.
-                            // sl_loop=true: trust WS when REST=0 after cancel so we keep trying to sell.
-                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache, true).await;
-
-                            if remaining < DUST_THRESHOLD {
-                                if total_filled > Decimal::ZERO {
-                                    let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                    info!(
-                                        "[IntervalSniper] SL loop: remaining dust ({} < {}), position closed ({}ms elapsed)",
-                                        fmt_decimal_2(&remaining), DUST_THRESHOLD, elapsed
-                                    );
-                                    let exit_price = if best_bid_at_fill > Decimal::ZERO { best_bid_at_fill } else { bid };
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let pnl = (exit_price - buy.price) * total_filled.clone();
-                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
-                                        let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                        info!(
-                                            "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
-                                            fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                            sl_attempt, elapsed
-                                        );
-                                    }
-                                    if let Some(ref mut log) = state.session_log {
-                                        if let Some(ref buy) = state.last_buy_order {
-                                            let _ = log.log_position_close(
-                                                &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_loop,
-                                                ExitType::StopLoss, total_filled.clone(), None,
-                                                buy.order_id.as_deref(), last_sell_order_id.as_deref(),
-                                                state.interval_min_bid_up, state.interval_max_bid_up,
-                                                state.interval_min_bid_down, state.interval_max_bid_down,
-                                                None,
-                                            );
-                                        }
-                                    }
-                                    sl_done = true;
-                                    break;
-                                } else {
-                                    // remaining=dust pero aún no detectamos fills
-                                    if sl_attempt >= 50 {
-                                        warn!(
-                                            "[IntervalSniper] SL loop: remaining dust after 50 attempts ({}ms), assuming position already closed externally",
-                                            now_ms_loop.saturating_sub(sl_start_ms)
-                                        );
-                                        sl_done = true;
-                                        break;
-                                    }
-                                    if sl_attempt % 10 == 1 {
-                                        debug!(
-                                            "[IntervalSniper] SL loop: remaining={} but total_filled=0 (attempt {}) — verifying balance",
-                                            fmt_decimal_2(&remaining), sl_attempt
-                                        );
-                                    }
-                                    state.allowance_cache = None;
-                                    let delay = if sl_attempt < 10 { 10 } else { 50 };
-                                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                                    continue;
-                                }
-                            }
-                            if available.map_or(false, |a| a <= DUST_THRESHOLD) {
-                                if total_filled > Decimal::ZERO {
-                                    let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                    info!(
-                                        "[IntervalSniper] SL loop: available dust ({} <= {}), position closed ({}ms elapsed)",
-                                        fmt_price(available.as_ref()), fmt_price(Some(&DUST_THRESHOLD)),
-                                        elapsed
-                                    );
-                                    let exit_price = if best_bid_at_fill > Decimal::ZERO { best_bid_at_fill } else { bid };
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let pnl = (exit_price - buy.price) * total_filled.clone();
-                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
-                                        let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                        info!(
-                                            "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
-                                            fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                            sl_attempt, elapsed
-                                        );
-                                    }
-                                    if let Some(ref mut log) = state.session_log {
-                                        if let Some(ref buy) = state.last_buy_order {
-                                            let _ = log.log_position_close(
-                                                &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_loop,
-                                                ExitType::StopLoss, total_filled.clone(), None,
-                                                buy.order_id.as_deref(), last_sell_order_id.as_deref(),
-                                                state.interval_min_bid_up, state.interval_max_bid_up,
-                                                state.interval_min_bid_down, state.interval_max_bid_down,
-                                                None,
-                                            );
-                                        }
-                                    }
-                                    sl_done = true;
-                                    break;
-                                } else {
-                                    // available=0 pero aún no detectamos fills
-                                    if sl_attempt >= 50 {
-                                        if total_filled > Decimal::ZERO {
-                                            // OK: Vendimos algo, asumir cerrado
-                                            warn!(
-                                                "[IntervalSniper] SL loop: available=0 after 50 attempts ({}ms), position closed (filled {})",
-                                                now_ms_loop.saturating_sub(sl_start_ms),
-                                                fmt_decimal_2(&total_filled)
-                                            );
-                                            sl_done = true;
-                                            break;
-                                        } else {
-                                            // Fallback extremo: available=0 Y no vendimos nada
-                                            // Solo debería pasar si WS también falló
-                                            warn!(
-                                                "[IntervalSniper] SL loop: available=0 and total_filled=0 after 50 attempts ({}ms) - extreme edge case, keeping SL active",
-                                                now_ms_loop.saturating_sub(sl_start_ms)
-                                            );
-                                            // NO marcar sl_done, NO permitir re-entry
-                                            break;
-                                        }
-                                    }
-                                    if sl_attempt % 10 == 1 {
-                                        debug!(
-                                            "[IntervalSniper] SL loop: available={:?} but total_filled=0 (attempt {}) — verifying balance",
-                                            available, sl_attempt
-                                        );
-                                    }
-                                    state.allowance_cache = None;
-                                    let delay = if sl_attempt < 10 { 10 } else { 50 };
-                                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                                    continue;
-                                }
-                            }
-                            if let Some(ref a) = available {
-                                if *a < remaining {
-                                    remaining = *a;
-                                }
-                            }
-
-                            // Verificar available antes de intentar orden
-                            if let Some(avail) = available {
-                                if avail < MIN_SELL_SIZE {
-                                    if sl_attempt > 10 && total_filled > Decimal::ZERO {
-                                        info!("[IntervalSniper] SL: available {} too low after {} attempts, treating as closed", fmt_decimal_2(&avail), sl_attempt);
-                                        break;
-                                    }
-                                    state.allowance_cache = None;
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                    continue;
-                                }
-                            }
-
-                            let size = effective_sell_size(remaining, available.clone(), CLOB_DEFAULT_MIN_ORDER_SIZE);
-                            if size < MIN_SELL_SIZE {
-                                if sl_attempt % 50 == 0 {
-                                    debug!(
-                                        "[IntervalSniper] SL loop: available too low (attempt {}, available={:?}, size={}), waiting 10ms",
-                                        sl_attempt, available, size
-                                    );
-                                }
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                continue;
-                            }
-
-                            // For SL: use bid from book but if no-match occurred before,
-                            // drop price aggressively to find real liquidity.
-                            // After 1 no-match: drop to bid - 0.05
-                            // After 3 no-matches: drop to bid - 0.10
-                            // After 5 no-matches: sell at 0.01 (accept any price to exit)
-                            let price = if no_match_retries == 0 {
-                                round_to_tick(bid)
-                            } else if no_match_retries < 3 {
-                                round_to_tick((bid - dec!(0.05)).max(dec!(0.01)))
-                            } else if no_match_retries < 5 {
-                                round_to_tick((bid - dec!(0.10)).max(dec!(0.01)))
-                            } else {
-                                dec!(0.01) // accept any price, just exit
-                            };
-                            best_bid_at_fill = price;
-                            if no_match_retries > 0 {
-                                info!("[IntervalSniper] SL no-match retry {}: selling at {} (bid={})",
-                                    no_match_retries, fmt_price(Some(&price)), fmt_price(Some(&bid)));
-                            }
-                            let result = clob
-                                .place_sell_order(&sl_token_id, price, size.clone(), crate::types::SellOrderTimeInForce::Fak)
-                                .await?;
-
-                            // Verificar balance inmediatamente (incluso antes de procesar result).
-                            // Detecta fills parciales que el API no reporta correctamente.
-                            let balance_check = if let Some(ws) = ws_user_ref {
-                                ws.get_balance_for_token(&sl_token_id).await
-                            } else {
-                                clob.get_available_balance(&sl_token_id).await.ok().flatten()
-                            };
-                            if let Some(new_bal) = balance_check {
-                                let expected_before = remaining.clone();
-                                if new_bal < expected_before - dec!(0.001) {
-                                    let filled_amount = expected_before - new_bal;
-                                    if filled_amount >= dec!(0.001) {
-                                        total_filled += filled_amount.clone();
-                                        remaining = new_bal;
-                                        best_bid_at_fill = bid;
-                                        last_sell_order_id = result.order_id.clone();
-                                        info!(
-                                            "[IntervalSniper] SL detected fill {} @ {} (balance check), remaining={}",
-                                            fmt_decimal_2(&filled_amount), fmt_price(Some(&bid)), fmt_decimal_2(&remaining)
-                                        );
-                                        if remaining < DUST_THRESHOLD {
-                                            info!("[IntervalSniper] SL: remaining is dust after fill, position closed");
-                                            sl_done = true;
-                                            break;
-                                        }
-                                        balance_error_retries = 0;
-                                        no_match_retries = 0;
-                                        state.allowance_cache = None;
-                                        tokio::time::sleep(Duration::from_millis(10)).await;
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            if let Some(ref mut log) = state.session_log {
-                                let _ = log.log_order_submitted(
-                                    &market.slug, market.interval_start_unix, market.close_time_unix,
-                                    now_ms_loop, &sl_token_id, "SELL", "FAK", price, size.clone(),
-                                    result.order_id.as_deref(), result.http_status, result.success,
-                                    result.error_msg.as_deref(),
-                                );
-                            }
-
-                            let is_no_match = result.error_msg.as_deref()
-                                .map_or(false, |m| m.contains("no orders found"));
-                            if is_no_match {
-                                no_match_retries += 1;
-                                continue;
-                            }
-
-                            if result.success {
-                                let size_matched = result.filled_size.filter(|f| *f > Decimal::ZERO);
-                                if size_matched.is_none() || size_matched.as_ref().map_or(true, |s| *s == Decimal::ZERO) {
-                                    // API reported 0 fill — but exchange may have filled silently (FAK quirk).
-                                    // Reconcile: check WS user channel first (fastest), then REST balance.
-                                    let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
-
-                                    // When WS user is present, poll until WS balance drops below remaining
-                                    // (sell fill arrived) or 300ms timeout — avoids race vs fixed sleep.
-                                    if let Some(ws) = ws_ref.as_ref() {
-                                        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-                                        loop {
-                                            tokio::time::sleep(Duration::from_millis(20)).await;
-                                            let ws_bal = ws.get_balance_for_token(&sl_token_id).await;
-                                            if ws_bal.map_or(false, |b| b < remaining) {
-                                                break; // WS balance dropped — sell fill arrived
-                                            }
-                                            if tokio::time::Instant::now() >= deadline {
-                                                break; // timeout — proceed with REST fallback
-                                            }
-                                        }
-                                    }
-
-                                    // Force cache refresh so we get real current balance
-                                    state.allowance_cache = None;
-                                    let fresh_available = get_available_for_sell(
-                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache, true
-                                    ).await;
-
-                                    let filled_by_reconciliation = match fresh_available {
-                                        Some(a) if a <= DUST_THRESHOLD => {
-                                            // Balance is now dust/zero — the FAK filled silently
-                                            let implied_fill = remaining - a;
-                                            if implied_fill > DUST_THRESHOLD {
-                                                implied_fill
-                                            } else {
-                                                remaining // assume full fill
-                                            }
-                                        }
-                                        Some(a) if a < remaining => {
-                                            // Partial fill happened silently
-                                            remaining - a
-                                        }
-                                        _ => Decimal::ZERO,
-                                    };
-
-                                    if filled_by_reconciliation > Decimal::ZERO {
-                                        // Treat as real fill
-                                        total_filled += filled_by_reconciliation;
-                                        last_sell_order_id = result.order_id.clone();
-                                        remaining = remaining - filled_by_reconciliation;
-                                        info!(
-                                            "[IntervalSniper] SL reconciled fill {} @ {} (API reported 0, WS/REST balance showed fill), remaining={}",
-                                            fmt_decimal_2(&filled_by_reconciliation), fmt_price(Some(&price)), fmt_decimal_2(&remaining)
-                                        );
-                                        if remaining <= DUST_THRESHOLD {
-                                            let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                            info!(
-                                                "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed) [{}ms, {} attempts]",
-                                                fmt_price(Some(&price)), elapsed, sl_attempt
-                                            );
-                                            if let Some(ref buy) = state.last_buy_order {
-                                                let pnl = (best_bid_at_fill - buy.price) * total_filled.clone();
-                                                let roi_pct = ((best_bid_at_fill / buy.price) - Decimal::ONE) * dec!(100);
-                                                let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                                info!(
-                                                    "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&best_bid_at_fill),
-                                                    fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                                    sl_attempt, elapsed
-                                                );
-                                            }
-                                            if let Some(ref mut log) = state.session_log {
-                                                if let Some(ref buy) = state.last_buy_order {
-                                                    let _ = log.log_position_close(
-                                                        &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                        buy.side, buy.price, best_bid_at_fill, buy.timestamp_ms, now_ms_loop,
-                                                        ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
-                                                        buy.order_id.as_deref(), last_sell_order_id.as_deref(),
-                                                        state.interval_min_bid_up, state.interval_max_bid_up,
-                                                        state.interval_min_bid_down, state.interval_max_bid_down,
-                                                        None,
-                                                    );
-                                                }
-                                            }
-                                            sl_done = true;
-                                            break;
-                                        }
-                                        continue;
-                                    }
-
-                                    // Truly no fill — update remaining from available and retry
-                                    if let Some(a) = fresh_available {
-                                        if a < remaining { remaining = a; }
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(5)).await;
-                                    continue;
-                                }
-                                let filled = size_matched.unwrap();
-                                if let (Some(log), Some(oid)) = (state.session_log.as_mut(), result.order_id.as_deref()) {
-                                    let _ = log.log_order_filled(
-                                        &market.slug, market.interval_start_unix, market.close_time_unix,
-                                        now_ms_loop, oid, filled.clone(), "api_response",
-                                    );
-                                }
-                                total_filled += filled.clone();
-                                last_sell_order_id = result.order_id.clone();
-                                let new_remaining = remaining - filled.clone();
-
-                                if new_remaining <= Decimal::ZERO || new_remaining < DUST_THRESHOLD {
-                                    let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                    info!(
-                                        "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed) [{}ms, {} attempts]",
-                                        fmt_price(Some(&price)), elapsed, sl_attempt
-                                    );
-                                    if total_filled > Decimal::ZERO {
-                                        if let Some(ref buy) = state.last_buy_order {
-                                            let pnl = (best_bid_at_fill - buy.price) * total_filled.clone();
-                                            let roi_pct = ((best_bid_at_fill / buy.price) - Decimal::ONE) * dec!(100);
-                                            let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                            info!(
-                                                "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                                match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                                fmt_decimal_2(&buy.price), fmt_decimal_2(&best_bid_at_fill),
-                                                fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                                sl_attempt, elapsed
-                                            );
-                                        }
-                                    }
-                                    if let Some(ref mut log) = state.session_log {
-                                        if let Some(ref buy) = state.last_buy_order {
-                                            let _ = log.log_position_close(
-                                                &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                buy.side, buy.price, price, buy.timestamp_ms, now_ms_loop,
-                                                ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
-                                                buy.order_id.as_deref(), last_sell_order_id.as_deref(),
-                                                state.interval_min_bid_up, state.interval_max_bid_up,
-                                                state.interval_min_bid_down, state.interval_max_bid_down,
-                                                None,
-                                            );
-                                        }
-                                    }
-                                    remaining = Decimal::ZERO;
-                                    sl_done = true;
-                                    break;
-                                }
-
-                                // Tiny fill (e.g. 0.001–0.004): API artifact; exchange may have filled fully. Run same reconciliation as zero-fill.
-                                if filled < TINY_FILL_THRESHOLD {
-                                    let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
-                                    if let Some(ws) = ws_ref.as_ref() {
-                                        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-                                        loop {
-                                            tokio::time::sleep(Duration::from_millis(20)).await;
-                                            let ws_bal = ws.get_balance_for_token(&sl_token_id).await;
-                                            if ws_bal.map_or(false, |b| b < remaining) {
-                                                break; // WS balance dropped — sell fill arrived
-                                            }
-                                            if tokio::time::Instant::now() >= deadline {
-                                                break; // timeout — proceed with REST fallback
-                                            }
-                                        }
-                                    }
-                                    state.allowance_cache = None;
-                                    let fresh_available = get_available_for_sell(
-                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache, true
-                                    ).await;
-                                    let filled_by_reconciliation = match fresh_available {
-                                        Some(a) if a <= DUST_THRESHOLD => {
-                                            let implied_fill = remaining - a;
-                                            if implied_fill > DUST_THRESHOLD {
-                                                implied_fill
-                                            } else {
-                                                remaining // assume full fill
-                                            }
-                                        }
-                                        Some(a) if a < remaining => remaining - a,
-                                        _ => Decimal::ZERO,
-                                    };
-                                    if filled_by_reconciliation > Decimal::ZERO {
-                                        // Replace tiny API-reported fill with reconciled amount
-                                        total_filled = total_filled - filled.clone() + filled_by_reconciliation.clone();
-                                        last_sell_order_id = result.order_id.clone();
-                                        remaining = remaining - filled_by_reconciliation.clone();
-                                        info!(
-                                            "[IntervalSniper] SL reconciled fill {} @ {} (tiny API fill {}, WS/REST balance showed fill), remaining={}",
-                                            fmt_decimal_2(&filled_by_reconciliation), fmt_price(Some(&price)), fmt_decimal_2(&filled), fmt_decimal_2(&remaining)
-                                        );
-                                        if remaining <= DUST_THRESHOLD {
-                                            let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                            info!(
-                                                "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed) [{}ms, {} attempts]",
-                                                fmt_price(Some(&price)), elapsed, sl_attempt
-                                            );
-                                            if let Some(ref buy) = state.last_buy_order {
-                                                let pnl = (best_bid_at_fill - buy.price) * total_filled.clone();
-                                                let roi_pct = ((best_bid_at_fill / buy.price) - Decimal::ONE) * dec!(100);
-                                                let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                                info!(
-                                                    "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&best_bid_at_fill),
-                                                    fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                                    sl_attempt, elapsed
-                                                );
-                                            }
-                                            if let Some(ref mut log) = state.session_log {
-                                                if let Some(ref buy) = state.last_buy_order {
-                                                    let _ = log.log_position_close(
-                                                        &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                        buy.side, buy.price, best_bid_at_fill, buy.timestamp_ms, now_ms_loop,
-                                                        ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
-                                                        buy.order_id.as_deref(), last_sell_order_id.as_deref(),
-                                                        state.interval_min_bid_up, state.interval_max_bid_up,
-                                                        state.interval_min_bid_down, state.interval_max_bid_down,
-                                                        None,
-                                                    );
-                                                }
-                                            }
-                                            sl_done = true;
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(5)).await;
-                                        continue;
-                                    }
-                                    // Truly partial: update remaining from available and retry
-                                    if let Some(a) = fresh_available {
-                                        if a < remaining {
-                                            remaining = a;
-                                        }
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(5)).await;
-                                    continue;
-                                }
-
-                                remaining = new_remaining;
-                                info!(
-                                    "[IntervalSniper] SL partial fill {} @ {}, remaining {} — retrying immediately",
-                                    fmt_decimal_2(&filled), fmt_price(Some(&price)), fmt_decimal_2(&remaining)
-                                );
-                                // Forzar balance fresh desde REST
-                                state.allowance_cache = None;
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                                // Verificar balance REST directamente
-                                let fresh_balance = clob.get_available_balance(&sl_token_id).await.ok().flatten();
-                                if let Some(bal) = fresh_balance {
-                                    if bal < DUST_THRESHOLD {
-                                        info!("[IntervalSniper] SL: REST balance shows {} (dust), position closed", fmt_decimal_2(&bal));
-                                        sl_done = true;
-                                        break;
-                                    }
-                                    remaining = remaining.min(bal);
-                                }
-                                // Yield briefly so WS can process fill event before next available check.
-                                tokio::time::sleep(Duration::from_millis(5)).await;
-                                continue;
-                            }
-
-                            // Error handling.
-                            if is_invalid_amounts_error(result.error_msg.as_deref()) {
-                                // "invalid amounts" often means position already filled by previous order.
-                                // Reconcile before treating as closed.
-                                state.allowance_cache = None;
-                                let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
-                                let fresh = get_available_for_sell(
-                                    clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache, true
-                                ).await;
-                                let actual_remaining = fresh.unwrap_or(Decimal::ZERO);
-                                if actual_remaining <= DUST_THRESHOLD && total_filled == Decimal::ZERO {
-                                    // Position was filled by a previous order the API didn't report
-                                    total_filled = remaining; // best estimate
-                                    info!("[IntervalSniper] SL: invalid amounts + balance=dust → position was filled silently, size={}",
-                                        fmt_decimal_2(&total_filled));
-                                    let elapsed = now_ms_loop.saturating_sub(sl_start_ms);
-                                    info!(
-                                        "[IntervalSniper] ✓ SL filled @ {} — position closed (re-entry allowed) [{}ms, {} attempts]",
-                                        fmt_price(Some(&price)), elapsed, sl_attempt
-                                    );
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let pnl = (best_bid_at_fill - buy.price) * total_filled.clone();
-                                        let roi_pct = ((best_bid_at_fill / buy.price) - Decimal::ONE) * dec!(100);
-                                        let held_sec = now_ms_loop.saturating_sub(buy.timestamp_ms) / 1000;
-                                        info!(
-                                            "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s  [{} attempts, {}ms]",
-                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&best_bid_at_fill),
-                                            fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec,
-                                            sl_attempt, elapsed
-                                        );
-                                    }
-                                    if let Some(ref mut log) = state.session_log {
-                                        if let Some(ref buy) = state.last_buy_order {
-                                            let _ = log.log_position_close(
-                                                &market.slug, market.interval_start_unix, market.close_time_unix,
-                                                buy.side, buy.price, best_bid_at_fill, buy.timestamp_ms, now_ms_loop,
-                                                ExitType::StopLoss, total_filled.clone(), Some(size.clone()),
-                                                buy.order_id.as_deref(), last_sell_order_id.as_deref(),
-                                                state.interval_min_bid_up, state.interval_max_bid_up,
-                                                state.interval_min_bid_down, state.interval_max_bid_down,
-                                                None,
-                                            );
-                                        }
-                                    }
-                                } else if total_filled > Decimal::ZERO {
-                                    info!("[IntervalSniper] SL: exchange rejected amount (dust/zero), position closed");
-                                } else if actual_remaining > DUST_THRESHOLD {
-                                    // Still have balance but got invalid amounts — cancel and retry
-                                    warn!("[IntervalSniper] SL: invalid amounts but balance={} remaining — canceling and retrying",
-                                        fmt_decimal_2(&actual_remaining));
-                                    let _ = clob.cancel_orders_for_token(&sl_token_id).await;
-
-                                    // CRÍTICO: Esperar para que exchange procese cancel
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-
-                                    state.allowance_cache = None;
-                                    remaining = actual_remaining;
-
-                                    // CRÍTICO: Resetear balance check después de cancel
-                                    let fresh_after_cancel = get_available_for_sell(
-                                        clob.as_ref().as_ref(),
-                                        state.ws_user.as_ref().map(|a| a.as_ref()),
-                                        &sl_token_id,
-                                        &mut state.allowance_cache,
-                                        true
-                                    ).await;
-
-                                    if let Some(bal) = fresh_after_cancel {
-                                        remaining = bal;
-                                        if remaining < DUST_THRESHOLD {
-                                            info!("[IntervalSniper] SL: balance became dust after cancel, position closed");
-                                            sl_done = true;
-                                            break;
-                                        }
-                                    }
-
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                    continue;
-                                }
-                                sl_done = true;
-                                break;
-                            }
-
-                            if is_position_closed_error(result.error_msg.as_deref()) {
-                                balance_error_retries += 1;
-
-                                // Invalidar caché inmediatamente
-                                state.allowance_cache = None;
-
-                                // Cancelar órdenes cada 3 intentos
-                                if balance_error_retries % 3 == 0 {
-                                    warn!("[IntervalSniper] SL: balance/allowance error (retry {}), canceling orders", balance_error_retries);
-                                    let _ = clob.cancel_orders_for_token(&sl_token_id).await;
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
-
-                                // Backoff exponencial
-                                let backoff_ms = (SL_FOK_RETRY_DELAY_MS * 2u64.pow(balance_error_retries.min(4))).min(500);
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                continue;
-                            }
-
-                            if result.http_status == Some(400) {
-                                if sl_attempt <= 3 {
-                                    let ba = clob.get_balance_allowance(&sl_token_id).await.unwrap_or_else(|e| format!("error: {}", e));
-                                    info!("[IntervalSniper] SL 400 — size={} balance_allowance={}", size, ba);
-                                }
-                            }
-
-                            if let Some(ref msg) = result.error_msg {
-                                if sl_attempt <= 5 || sl_attempt % 20 == 0 {
-                                    debug!("[IntervalSniper] SL attempt {} error: {}", sl_attempt, msg);
-                                }
-                            }
-
-                            // No match or transient error: retry quickly.
-                            tokio::time::sleep(Duration::from_millis(SL_FOK_RETRY_DELAY_MS)).await;
-                        }
-
-                        // Write back remaining for next main-loop pass (if SL not done).
-                        if !sl_done {
-                            sl.size = remaining;
-                        }
-                        // sl is no longer used below; NLL allows reassigning the Option.
-                        if sl_done {
-                            state.stop_loss_placed = true;
-                            state.auto_sell_placed = true;
-                            state.re_entry_allowed_after_sl = true;
                             state.tp_limit_order_id = None;
                             state.tp_limit_balance_retries = 0;
-                            state.pending_auto_sell = None;
-                            state.pending_stop_loss = None;
                             state.allowance_cache = None;
-                            state.last_buy_order = None;
-                            state.balance_reflected_at_ms = None;
-                            state.balance_delay_clob_logged = false;
-                            state.last_logged_balance_up = None;
-                            state.last_logged_balance_down = None;
-                            state.total_shares_this_interval = Decimal::ZERO;
+                            for _ in 0..6 {
+                                let freed = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                if freed.map_or(false, |a| a >= sl.size * dec!(0.90)) {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            state.allowance_cache = None;
+                            info!(
+                                "[IntervalSniper] SL TRIGGERED: bid {} <= trigger {} — placing limit at best_bid (cancel+replace if bid drops)",
+                                fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
+                            );
+                        }
+
+                        let remaining = sl.size - state.sl_cumulative_filled.clone();
+
+                        // 1) If we have an SL limit order: check WS fill, or cancel+replace if bid dropped.
+                        if let Some(ref oid) = state.sl_limit_order_id {
+                            let order_price = state.sl_limit_order_price.unwrap_or(Decimal::ZERO);
+
+                            // Detect fill via WS user (partial or full for this order).
+                            if let Some(ws_user) = ws_user_ref {
+                                if let Some(filled_this_order) = ws_user.get_order_filled_size_sell(oid).await {
+                                    let delta = filled_this_order - state.sl_last_order_filled;
+                                    if delta > Decimal::ZERO {
+                                        state.sl_cumulative_filled += delta;
+                                        state.sl_last_order_filled = filled_this_order;
+                                        debug!(
+                                            "[IntervalSniper] SL limit fill +{} (total {}/{}), order_id={}",
+                                            fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
+                                        );
+                                    }
+                                }
+                            }
+
+                            // REST fallback for SL fill (when WS unavailable or missed event); throttle 5s.
+                            let should_check_sl_rest = ws_user_ref.is_none()
+                                || state.sl_limit_last_rest_check_ms
+                                    .map(|last| now_ms_u.saturating_sub(last) >= 5000)
+                                    .unwrap_or(true);
+                            if should_check_sl_rest {
+                                state.sl_limit_last_rest_check_ms = Some(now_ms_u);
+                                if let Ok(order_info) = clob.get_order(oid).await {
+                                    let _status = order_info.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                    let size_matched = order_info
+                                        .get("size_matched")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| Decimal::from_str(s).ok())
+                                        .unwrap_or(Decimal::ZERO);
+                                    if size_matched > state.sl_last_order_filled {
+                                        let delta = size_matched - state.sl_last_order_filled;
+                                        state.sl_cumulative_filled += delta;
+                                        state.sl_last_order_filled = size_matched;
+                                        debug!(
+                                            "[IntervalSniper] SL limit fill +{} (REST, total {}/{}), order_id={}",
+                                            fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Position closed when cumulative >= 99% of size.
+                            if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                                let exit_price = order_price;
+                                let total_filled = state.sl_cumulative_filled;
+                                if let Some(ref buy) = state.last_buy_order {
+                                    let pnl = (exit_price - buy.price) * total_filled.clone();
+                                    let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                    info!(
+                                        "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (limit @ best_bid)",
+                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                        fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
+                                    );
+                                }
+                                if let Some(ref mut log) = state.session_log {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let _ = log.log_position_close(
+                                            &market.slug, market.interval_start_unix, market.close_time_unix,
+                                            buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_u,
+                                            ExitType::StopLoss, total_filled.clone(), None,
+                                            buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
+                                            state.interval_min_bid_up, state.interval_max_bid_up,
+                                            state.interval_min_bid_down, state.interval_max_bid_down,
+                                            None,
+                                        );
+                                    }
+                                }
+                                info!("[IntervalSniper] ✓ SL limit filled @ {} — position closed (re-entry allowed)", fmt_price(Some(&exit_price)));
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.re_entry_allowed_after_sl = true;
+                                state.tp_limit_order_id = None;
+                                state.tp_limit_balance_retries = 0;
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
+                                state.sl_cumulative_filled = Decimal::ZERO;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.sl_limit_last_rest_check_ms = None;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.allowance_cache = None;
+                                state.last_buy_order = None;
+                                state.balance_reflected_at_ms = None;
+                                state.balance_delay_clob_logged = false;
+                                state.last_logged_balance_up = None;
+                                state.last_logged_balance_down = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                            } else if best_bid < order_price {
+                                // Bid dropped: cancel and replace at new best_bid next iteration.
+                                let _cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
+                                if let Some(ws_user) = ws_user_ref {
+                                    if let Some(final_fill) = ws_user.get_order_filled_size_sell(oid).await {
+                                        let delta = final_fill - state.sl_last_order_filled;
+                                        if delta > Decimal::ZERO {
+                                            state.sl_cumulative_filled += delta;
+                                        }
+                                    }
+                                }
+                                // If no WS and cancel said "matched", REST fallback could get order fill here; for now rely on next-iteration place for remaining.
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.allowance_cache = None;
+                                trace!(
+                                    "[IntervalSniper] SL limit canceled (bid {} < order {}), will replace at new best_bid",
+                                    fmt_price(Some(&best_bid)), fmt_price(Some(&order_price))
+                                );
+                            }
+                        }
+
+                        // 2) Place GTC limit at best_bid when we have no resting SL order and remaining to sell.
+                        if state.sl_limit_order_id.is_none() && remaining >= DUST_THRESHOLD {
+                            if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                                // Already closed above (WS detected 100%)
+                            } else {
+                                let available = get_available_for_sell(
+                                    clob.as_ref().as_ref(),
+                                    ws_user_ref,
+                                    &sl.token_id,
+                                    &mut state.allowance_cache,
+                                    true,
+                                ).await;
+                                let size = effective_sell_size(
+                                    remaining.clone(),
+                                    available,
+                                    CLOB_DEFAULT_MIN_ORDER_SIZE,
+                                );
+                                if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
+                                    let price = round_to_tick(best_bid);
+                                    let result = clob
+                                        .place_sell_order(
+                                            &sl.token_id,
+                                            price,
+                                            size.clone(),
+                                            crate::types::SellOrderTimeInForce::Gtc,
+                                        )
+                                        .await?;
+                                    if result.success {
+                                        state.sl_limit_order_id = result.order_id.clone();
+                                        state.sl_limit_order_price = Some(price);
+                                        state.sl_last_order_filled = Decimal::ZERO;
+                                        info!(
+                                            "[IntervalSniper] SL limit placed @ {} size={} order_id={:?} (cancel+replace if bid drops)",
+                                            fmt_price(Some(&price)), fmt_decimal_2(&size), result.order_id
+                                        );
+                                    } else if is_position_closed_error(result.error_msg.as_deref()) {
+                                        state.allowance_cache = None;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2366,6 +1867,11 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = false;
                                             state.tp_limit_order_id = None;
                                             state.tp_limit_balance_retries = 0;
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_cumulative_filled = Decimal::ZERO;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.sl_limit_last_rest_check_ms = None;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.allowance_cache = None;
@@ -2436,6 +1942,11 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = false;
                                             state.tp_limit_order_id = None;
                                             state.tp_limit_balance_retries = 0;
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_cumulative_filled = Decimal::ZERO;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.sl_limit_last_rest_check_ms = None;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.allowance_cache = None;
@@ -2512,6 +2023,11 @@ pub async fn run() -> Result<()> {
                                                 state.re_entry_allowed_after_sl = false;
                                                 state.tp_limit_order_id = None;
                                                 state.tp_limit_balance_retries = 0;
+                                                state.sl_limit_order_id = None;
+                                                state.sl_limit_order_price = None;
+                                                state.sl_cumulative_filled = Decimal::ZERO;
+                                                state.sl_last_order_filled = Decimal::ZERO;
+                                                state.sl_limit_last_rest_check_ms = None;
                                                 state.pending_auto_sell = None;
                                                 state.pending_stop_loss = None;
                                                 state.allowance_cache = None;
@@ -2676,6 +2192,11 @@ pub async fn run() -> Result<()> {
                                                 state.re_entry_allowed_after_sl = false;
                                                 state.tp_limit_order_id = None;
                                                 state.tp_limit_balance_retries = 0;
+                                                state.sl_limit_order_id = None;
+                                                state.sl_limit_order_price = None;
+                                                state.sl_cumulative_filled = Decimal::ZERO;
+                                                state.sl_last_order_filled = Decimal::ZERO;
+                                                state.sl_limit_last_rest_check_ms = None;
                                                 state.pending_auto_sell = None;
                                                 state.pending_stop_loss = None;
                                                 state.allowance_cache = None;
@@ -2706,6 +2227,11 @@ pub async fn run() -> Result<()> {
                                             state.re_entry_allowed_after_sl = false;
                                             state.tp_limit_order_id = None;
                                             state.tp_limit_balance_retries = 0;
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_cumulative_filled = Decimal::ZERO;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.sl_limit_last_rest_check_ms = None;
                                             state.pending_auto_sell = None;
                                             state.pending_stop_loss = None;
                                             state.allowance_cache = None;
