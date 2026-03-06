@@ -286,11 +286,14 @@ fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
 /// because the WS has no allowance info — the server enforces min(balance, allowance) on every sell.
 /// Falls back to full REST balance-allowance (which returns min(balance,allowance)) when WS has no data.
 /// REST result is cached with TTL 3s to avoid calling get_available_balance on every tick.
+/// When `sl_loop` is true: if REST returns 0/dust (e.g. balance still "locked" after cancelling TP),
+/// trust WS balance so we keep trying to place the SL sell instead of assuming position closed externally.
 async fn get_available_for_sell(
     clob: &dyn ClobClient,
     ws_user: Option<&ClobWsUser>,
     token_id: &str,
     cache: &mut Option<(Decimal, Instant)>,
+    sl_loop: bool,
 ) -> Option<Decimal> {
     let ws_balance = if let Some(ws) = ws_user {
         ws.get_balance_for_token(token_id).await
@@ -319,7 +322,14 @@ async fn get_available_for_sell(
 
     match (ws_balance, rest_effective) {
         // Both sources: use the minimum — WS has the freshest balance, REST has allowance enforcement.
-        (Some(ws), Some(rest)) => Some(ws.min(rest)),
+        // In SL loop: if REST says 0/dust (often after cancel-TP lag), trust WS so we don't assume "closed externally".
+        (Some(ws), Some(rest)) => {
+            if sl_loop && rest <= DUST_THRESHOLD && ws > DUST_THRESHOLD {
+                Some(ws)
+            } else {
+                Some(ws.min(rest))
+            }
+        }
         // Only WS: no REST data; trust WS but it may exceed allowance — caller will hit 400 if allowance is low.
         (Some(ws), None) => Some(ws),
         // Only REST: normal path without WS.
@@ -1613,7 +1623,8 @@ pub async fn run() -> Result<()> {
                             // Do not break on bid recovery above trigger — complete the exit regardless of price.
 
                             // Available balance: WS user fills (instant) then REST fallback.
-                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache).await;
+                            // sl_loop=true: trust WS when REST=0 after cancel so we keep trying to sell.
+                            let available = get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &sl_token_id, &mut state.allowance_cache, true).await;
 
                             if remaining < DUST_THRESHOLD {
                                 if total_filled > Decimal::ZERO {
@@ -1711,12 +1722,25 @@ pub async fn run() -> Result<()> {
                                 } else {
                                     // available=0 pero aún no detectamos fills
                                     if sl_attempt >= 50 {
-                                        warn!(
-                                            "[IntervalSniper] SL loop: available=0 after 50 attempts ({}ms), assuming position already closed externally",
-                                            now_ms_loop.saturating_sub(sl_start_ms)
-                                        );
-                                        sl_done = true;
-                                        break;
+                                        if total_filled > Decimal::ZERO {
+                                            // OK: Vendimos algo, asumir cerrado
+                                            warn!(
+                                                "[IntervalSniper] SL loop: available=0 after 50 attempts ({}ms), position closed (filled {})",
+                                                now_ms_loop.saturating_sub(sl_start_ms),
+                                                fmt_decimal_2(&total_filled)
+                                            );
+                                            sl_done = true;
+                                            break;
+                                        } else {
+                                            // Fallback extremo: available=0 Y no vendimos nada
+                                            // Solo debería pasar si WS también falló
+                                            warn!(
+                                                "[IntervalSniper] SL loop: available=0 and total_filled=0 after 50 attempts ({}ms) - extreme edge case, keeping SL active",
+                                                now_ms_loop.saturating_sub(sl_start_ms)
+                                            );
+                                            // NO marcar sl_done, NO permitir re-entry
+                                            break;
+                                        }
                                     }
                                     if sl_attempt % 10 == 1 {
                                         debug!(
@@ -1860,7 +1884,7 @@ pub async fn run() -> Result<()> {
                                     // Force cache refresh so we get real current balance
                                     state.allowance_cache = None;
                                     let fresh_available = get_available_for_sell(
-                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache
+                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache, true
                                     ).await;
 
                                     let filled_by_reconciliation = match fresh_available {
@@ -2000,7 +2024,7 @@ pub async fn run() -> Result<()> {
                                     }
                                     state.allowance_cache = None;
                                     let fresh_available = get_available_for_sell(
-                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache
+                                        clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache, true
                                     ).await;
                                     let filled_by_reconciliation = match fresh_available {
                                         Some(a) if a <= DUST_THRESHOLD => {
@@ -2101,7 +2125,7 @@ pub async fn run() -> Result<()> {
                                 state.allowance_cache = None;
                                 let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
                                 let fresh = get_available_for_sell(
-                                    clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache
+                                    clob.as_ref().as_ref(), ws_ref, &sl_token_id, &mut state.allowance_cache, true
                                 ).await;
                                 let actual_remaining = fresh.unwrap_or(Decimal::ZERO);
                                 if actual_remaining <= DUST_THRESHOLD && total_filled == Decimal::ZERO {
@@ -2490,7 +2514,7 @@ pub async fn run() -> Result<()> {
                             if target_reached {
                                 let position_size_real = tp.size.clone();
                                 let available =
-                                    get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id, &mut state.allowance_cache).await;
+                                    get_available_for_sell(clob.as_ref().as_ref(), ws_user_ref, &tp.token_id, &mut state.allowance_cache, false).await;
                                 let size = effective_sell_size(
                                     position_size_real,
                                     available.clone(),
@@ -2792,6 +2816,7 @@ pub async fn run() -> Result<()> {
                             ws_user_ref,
                             &market.token_id_up,
                             &mut state.allowance_cache,
+                            false,
                         )
                         .await;
                         let bal_down = get_available_for_sell(
@@ -2799,6 +2824,7 @@ pub async fn run() -> Result<()> {
                             ws_user_ref,
                             &market.token_id_down,
                             &mut state.allowance_cache,
+                            false,
                         )
                         .await;
                         let has_sellable_balance = bal_up.map_or(false, |b| b >= CLOB_DEFAULT_MIN_ORDER_SIZE)
