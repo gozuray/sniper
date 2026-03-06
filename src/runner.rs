@@ -2264,9 +2264,10 @@ pub async fn run() -> Result<()> {
                                     if result.success {
                                         state.tp_limit_order_id = result.order_id.clone();
                                         state.tp_limit_balance_retries = 0;
-                                        trace!(
-                                            "[IntervalSniper] TP limit placed @ {} (cancel if price drops to entry {})",
+                                        info!(
+                                            "[IntervalSniper] TP limit placed @ {} order_id={:?} (cancel if price drops to entry {})",
                                             fmt_price(Some(&price)),
+                                            result.order_id,
                                             fmt_price(Some(&entry_price))
                                         );
                                     } else if is_position_closed_error(result.error_msg.as_deref()) {

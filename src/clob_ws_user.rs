@@ -285,15 +285,25 @@ impl ClobWsUser {
             .map(|s| s.size_matched)
     }
 
-    /// Return the filled size for an order only if it is a SELL (or trade event).
-    /// Used for TP fill detection to avoid false positives from BUY fill events
-    /// leaking into the TP order check via normalize_order_id collisions.
+    /// Return the filled size for an order only if it is a confirmed SELL fill.
+    /// Requires side == "SELL" AND order has been executed (UPDATE/TRADE/CANCELLATION).
+    /// PLACEMENT events (even with size_matched > 0) are excluded because they can be
+    /// stale state from a previous session or an immediate-match that hasn't sent UPDATE yet —
+    /// the exchange always follows an immediate match with a separate UPDATE/TRADE event.
     pub async fn get_order_filled_size_sell(&self, order_id: &str) -> Option<Decimal> {
         let key = normalize_order_id(order_id);
         let map = self.state.read().await;
         map.get(&key)
             .filter(|s| s.size_matched > Decimal::ZERO)
-            .filter(|s| s.side == "SELL" || s.side.is_empty() || s.order_type == "TRADE")
+            .filter(|s| {
+                // Must be a SELL order (not a BUY or unknown side).
+                let is_sell = s.side == "SELL";
+                // Must have a confirmed execution event — not just a PLACEMENT.
+                let is_executed = s.order_type == "UPDATE"
+                    || s.order_type == "TRADE"
+                    || s.order_type == "CANCELLATION";
+                is_sell && is_executed
+            })
             .map(|s| s.size_matched)
     }
 
