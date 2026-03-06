@@ -1748,6 +1748,22 @@ pub async fn run() -> Result<()> {
                                     // Reconcile: check WS user channel first (fastest), then REST balance.
                                     let ws_ref = state.ws_user.as_ref().map(|a| a.as_ref());
 
+                                    // When WS user is present, poll until WS balance drops below remaining
+                                    // (sell fill arrived) or 300ms timeout — avoids race vs fixed sleep.
+                                    if let Some(ws) = ws_ref.as_ref() {
+                                        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+                                        loop {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                            let ws_bal = ws.get_balance_for_token(&sl_token_id).await;
+                                            if ws_bal.map_or(false, |b| b < remaining) {
+                                                break; // WS balance dropped — sell fill arrived
+                                            }
+                                            if tokio::time::Instant::now() >= deadline {
+                                                break; // timeout — proceed with REST fallback
+                                            }
+                                        }
+                                    }
+
                                     // Force cache refresh so we get real current balance
                                     state.allowance_cache = None;
                                     let fresh_available = get_available_for_sell(
