@@ -33,6 +33,8 @@ const SELL_SIZE_DECIMALS: u32 = 4;
 const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 /// Below this we consider position closed (dust); avoids spamming the API with tiny amounts the exchange rejects.
 const DUST_THRESHOLD: Decimal = dec!(0.001);
+/// Polymarket may reject small sell sizes with "invalid amounts"; below this treat as dust and consider position closed.
+const TP_SL_DUST_SIZE: Decimal = dec!(0.01);
 /// API reported fill below this is treated like 0 — run full WS/REST reconciliation (exchange often filled fully).
 const TINY_FILL_THRESHOLD: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
@@ -2256,15 +2258,80 @@ pub async fn run() -> Result<()> {
 
                         let mut tp_filled_this_iteration = false;
                         // 1) If we have a TP limit order resting: cancel when price drops to entry, or detect fill via ws_user.
-                        if let Some(ref oid) = state.tp_limit_order_id {
+                        let tp_order_id = state.tp_limit_order_id.clone();
+                        if let Some(ref oid) = tp_order_id {
                             if best_bid > Decimal::ZERO && best_bid <= entry_price {
-                                let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                let cancel_result = clob.cancel_orders_for_token(&tp.token_id).await;
                                 state.tp_limit_order_id = None;
                                 state.tp_limit_balance_retries = 0;
-                                trace!(
-                                    "[IntervalSniper] TP limit canceled (price at entry {}), waiting for target again",
-                                    fmt_price(Some(&entry_price))
-                                );
+                                // If cancel failed because order was already matched, TP filled on exchange.
+                                if let Ok(ref res) = cancel_result {
+                                    if let Some(reason) = res.not_canceled.get(oid.as_str()) {
+                                        let r = reason.to_lowercase();
+                                        if r.contains("matched") || r.contains("already canceled") {
+                                            tp_filled_this_iteration = true;
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let pnl = (target - buy.price) * tp.size.clone();
+                                                let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
+                                                let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                info!(
+                                                    "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (fill detected via cancel)",
+                                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&target),
+                                                    fmt_decimal_2(&tp.size), pnl, roi_pct, held_sec
+                                                );
+                                            }
+                                            info!(
+                                                "[IntervalSniper] ✓ TP limit filled @ {} — position closed (cancel returned already matched)",
+                                                fmt_price(Some(&target))
+                                            );
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        buy.side,
+                                                        buy.price,
+                                                        target,
+                                                        buy.timestamp_ms,
+                                                        now_ms_u,
+                                                        ExitType::TakeProfit,
+                                                        tp.size.clone(),
+                                                        Some(tp.size.clone()),
+                                                        buy.order_id.as_deref(),
+                                                        Some(oid.as_str()),
+                                                        state.interval_min_bid_up,
+                                                        state.interval_max_bid_up,
+                                                        state.interval_min_bid_down,
+                                                        state.interval_max_bid_down,
+                                                        None,
+                                                    );
+                                                }
+                                            }
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false;
+                                            state.tp_limit_order_id = None;
+                                            state.tp_limit_balance_retries = 0;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.allowance_cache = None;
+                                            state.last_buy_order = None;
+                                            state.balance_reflected_at_ms = None;
+                                            state.balance_delay_clob_logged = false;
+                                            state.last_logged_balance_up = None;
+                                            state.last_logged_balance_down = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                        }
+                                    }
+                                }
+                                if !tp_filled_this_iteration {
+                                    trace!(
+                                        "[IntervalSniper] TP limit canceled (price at entry {}), waiting for target again",
+                                        fmt_price(Some(&entry_price))
+                                    );
+                                }
                             } else if let Some(ws) = ws_user_ref {
                                 if let Some(filled) = ws.get_order_filled_size_sell(oid).await {
                                     if filled >= tp.size * dec!(0.99) && best_bid >= target - TICK_SIZE {
@@ -2490,22 +2557,43 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                     } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
-                                        state.tp_limit_balance_retries += 1;
-
-                                        warn!(
-                                            "[IntervalSniper] TP limit 'invalid amounts' error (retry {}): size={}, available={:?}, position={}",
-                                            state.tp_limit_balance_retries, size, available, position_size_real
-                                        );
-
-                                        if state.tp_limit_balance_retries >= 5 {
-                                            warn!("[IntervalSniper] TP limit failed 5+ times with 'invalid amounts' — canceling TP, SL remains active");
+                                        // Position may already be closed (TP filled); remaining balance is dust below API minimum.
+                                        let available_is_dust = available.map_or(false, |a| a < TP_SL_DUST_SIZE);
+                                        if available_is_dust || size < TP_SL_DUST_SIZE {
+                                            info!(
+                                                "[IntervalSniper] TP 'invalid amounts' with dust (available={:?}, size={}) — position already closed",
+                                                available, size
+                                            );
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false;
                                             state.tp_limit_order_id = None;
                                             state.tp_limit_balance_retries = 0;
                                             state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
                                             state.allowance_cache = None;
+                                            state.last_buy_order = None;
+                                            state.balance_reflected_at_ms = None;
+                                            state.balance_delay_clob_logged = false;
+                                            state.last_logged_balance_up = None;
+                                            state.last_logged_balance_down = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
                                         } else {
-                                            state.allowance_cache = None;
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            state.tp_limit_balance_retries += 1;
+                                            warn!(
+                                                "[IntervalSniper] TP limit 'invalid amounts' error (retry {}): size={}, available={:?}, position={}",
+                                                state.tp_limit_balance_retries, size, available, position_size_real
+                                            );
+                                            if state.tp_limit_balance_retries >= 5 {
+                                                warn!("[IntervalSniper] TP limit failed 5+ times with 'invalid amounts' — canceling TP, SL remains active");
+                                                state.tp_limit_order_id = None;
+                                                state.tp_limit_balance_retries = 0;
+                                                state.pending_auto_sell = None;
+                                                state.allowance_cache = None;
+                                            } else {
+                                                state.allowance_cache = None;
+                                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                            }
                                         }
                                     } else if let Some(ref msg) = result.error_msg {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
