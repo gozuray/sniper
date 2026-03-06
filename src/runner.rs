@@ -544,6 +544,33 @@ async fn log_clob_balance_if_due(
         (up, down, false, from_fill_instant)
     };
 
+    // Cap position-token balance by inferred remaining when in SL: WS can aggregate stale orders
+    // or miss the SELL fill, showing e.g. 72.13 instead of ~0 after SL fill. Use min(ws, inferred).
+    let (up, down) = if let (Some(tid), Some(ref _sl), Some(ref buy)) = (
+        position_token_id,
+        state.pending_stop_loss.as_ref(),
+        state.last_buy_order.as_ref(),
+    ) {
+        if buy.token_id == *tid {
+            let inferred = buy.size.clone() - state.sl_cumulative_filled.clone();
+            let up_capped = if *tid == market.token_id_up {
+                up.map(|u| u.min(inferred.clone()))
+            } else {
+                up
+            };
+            let down_capped = if *tid == market.token_id_down {
+                down.map(|d| d.min(inferred))
+            } else {
+                down
+            };
+            (up_capped, down_capped)
+        } else {
+            (up, down)
+        }
+    } else {
+        (up, down)
+    };
+
     // If we have open position and haven't recorded "balance reflected" yet, check now.
     if state.balance_reflected_at_ms.is_none()
         && state.last_buy_order.is_some()
@@ -1589,7 +1616,7 @@ pub async fn run() -> Result<()> {
                             state.tp_limit_order_id = None;
                             state.tp_limit_balance_retries = 0;
                             state.allowance_cache = None;
-                            for _ in 0..6 {
+                            for _ in 0..20 {
                                 let freed = clob.get_available_balance(&sl.token_id).await.ok().flatten();
                                 if freed.map_or(false, |a| a >= sl.size * dec!(0.90)) {
                                     break;
@@ -1717,6 +1744,10 @@ pub async fn run() -> Result<()> {
                                 state.last_logged_balance_up = None;
                                 state.last_logged_balance_down = None;
                                 state.total_shares_this_interval = Decimal::ZERO;
+                                // Clear WS token state so next balance log doesn't show stale aggregated fills (e.g. 72.13).
+                                if let Some(ws) = ws_user_ref {
+                                    ws.clear_token_state(&sl.token_id).await;
+                                }
                             } else if best_bid < order_price {
                                 // Bid dropped: cancel and replace at new best_bid next iteration.
                                 let _cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
@@ -1759,7 +1790,7 @@ pub async fn run() -> Result<()> {
                                 );
                                 if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
                                     let price = round_to_tick(best_bid);
-                                    let result = clob
+                                    let mut result = clob
                                         .place_sell_order(
                                             &sl.token_id,
                                             price,
@@ -1767,6 +1798,19 @@ pub async fn run() -> Result<()> {
                                             crate::types::SellOrderTimeInForce::Gtc,
                                         )
                                         .await?;
+                                    // Retry once after delay if CLOB hadn't freed balance yet (cancel propagation).
+                                    if !result.success && is_position_closed_error(result.error_msg.as_deref()) {
+                                        state.allowance_cache = None;
+                                        tokio::time::sleep(Duration::from_millis(200)).await;
+                                        result = clob
+                                            .place_sell_order(
+                                                &sl.token_id,
+                                                price,
+                                                size,
+                                                crate::types::SellOrderTimeInForce::Gtc,
+                                            )
+                                            .await?;
+                                    }
                                     if result.success {
                                         state.sl_limit_order_id = result.order_id.clone();
                                         state.sl_limit_order_price = Some(price);
