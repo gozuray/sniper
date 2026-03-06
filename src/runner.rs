@@ -200,15 +200,28 @@ fn effective_sell_size(
 ) -> Decimal {
     let capped = available
         .map(|a| {
-            // Leave 1 base unit headroom so encoded amount never exceeds balance after rounding
-            let safe = (a - BALANCE_BUFFER_SHARES).max(Decimal::ZERO);
+            // Solo restar buffer si available es significativo
+            let safe = if a > dec!(0.01) {
+                (a - BALANCE_BUFFER_SHARES).max(Decimal::ZERO)
+            } else {
+                a
+            };
             position_size.min(safe)
         })
         .unwrap_or(position_size);
+
     let result = floor_to_decimals(capped, SELL_SIZE_DECIMALS);
-    // CLOB requires maker amount (sell size) with max 2 decimals; truncation can make e.g. 4.9999 → 4.99, below min 5.
-    // If we're just below min and balance allows, round up so the first attempt succeeds instead of failing then retrying.
-    if result < min_order_size
+
+    // Validar que result sea >= MIN_SELL_SIZE
+    if result < MIN_SELL_SIZE {
+        if result >= min_order_size - dec!(0.01)
+            && available.map_or(false, |a| a >= min_order_size)
+        {
+            min_order_size
+        } else {
+            Decimal::ZERO // Retornar 0 explícito en lugar de dust
+        }
+    } else if result < min_order_size
         && result >= min_order_size - dec!(0.01)
         && available.map_or(false, |a| a >= min_order_size)
     {
@@ -1550,7 +1563,6 @@ pub async fn run() -> Result<()> {
                         let mut remaining = sl.size;
                         let mut sl_done = false;
                         let mut sl_attempt: u32 = 0;
-                        let mut canceled_for_balance = false;
                         let mut balance_error_retries: u32 = 0;
                         let mut total_filled = Decimal::ZERO;
                         #[allow(unused_assignments)]
@@ -1689,6 +1701,19 @@ pub async fn run() -> Result<()> {
                             if let Some(ref a) = available {
                                 if *a < remaining {
                                     remaining = *a;
+                                }
+                            }
+
+                            // Verificar available antes de intentar orden
+                            if let Some(avail) = available {
+                                if avail < MIN_SELL_SIZE {
+                                    if sl_attempt > 10 && total_filled > Decimal::ZERO {
+                                        info!("[IntervalSniper] SL: available {} too low after {} attempts, treating as closed", fmt_decimal_2(&avail), sl_attempt);
+                                        break;
+                                    }
+                                    state.allowance_cache = None;
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    continue;
                                 }
                             }
 
@@ -1984,6 +2009,20 @@ pub async fn run() -> Result<()> {
                                     "[IntervalSniper] SL partial fill {} @ {}, remaining {} — retrying immediately",
                                     fmt_decimal_2(&filled), fmt_price(Some(&price)), fmt_decimal_2(&remaining)
                                 );
+                                // Forzar balance fresh desde REST
+                                state.allowance_cache = None;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                                // Verificar balance REST directamente
+                                let fresh_balance = clob.get_available_balance(&sl_token_id).await.ok().flatten();
+                                if let Some(bal) = fresh_balance {
+                                    if bal < DUST_THRESHOLD {
+                                        info!("[IntervalSniper] SL: REST balance shows {} (dust), position closed", fmt_decimal_2(&bal));
+                                        sl_done = true;
+                                        break;
+                                    }
+                                    remaining = remaining.min(bal);
+                                }
                                 // Yield briefly so WS can process fill event before next available check.
                                 tokio::time::sleep(Duration::from_millis(5)).await;
                                 continue;
@@ -2051,13 +2090,20 @@ pub async fn run() -> Result<()> {
 
                             if is_position_closed_error(result.error_msg.as_deref()) {
                                 balance_error_retries += 1;
-                                if !canceled_for_balance {
-                                    canceled_for_balance = true;
+
+                                // Invalidar caché inmediatamente
+                                state.allowance_cache = None;
+
+                                // Cancelar órdenes cada 3 intentos
+                                if balance_error_retries % 3 == 0 {
+                                    warn!("[IntervalSniper] SL: balance/allowance error (retry {}), canceling orders", balance_error_retries);
                                     let _ = clob.cancel_orders_for_token(&sl_token_id).await;
-                                    warn!("[IntervalSniper] SL: balance/allowance error, canceling once and retrying");
-                                } else if balance_error_retries % 5 == 0 {
-                                    canceled_for_balance = false;
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
                                 }
+
+                                // Backoff exponencial
+                                let backoff_ms = (SL_FOK_RETRY_DELAY_MS * 2u64.pow(balance_error_retries.min(4))).min(500);
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                                 continue;
                             }
 
@@ -2234,10 +2280,28 @@ pub async fn run() -> Result<()> {
                                     available.clone(),
                                     CLOB_DEFAULT_MIN_ORDER_SIZE,
                                 );
+                                debug!(
+                                    "[IntervalSniper] TP limit calculation: position_size={}, available={:?}, effective_size={}, MIN_SELL_SIZE={}, DUST_THRESHOLD={}",
+                                    position_size_real, available, size, MIN_SELL_SIZE, DUST_THRESHOLD
+                                );
                                 if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
-                                    let price = target;
-                                    let result = clob
-                                        .place_sell_order(
+                                    // Validación adicional para evitar "invalid amounts"
+                                    if size < dec!(0.0001) {
+                                        warn!(
+                                            "[IntervalSniper] TP limit: calculated size {} is too small, skipping (available={:?}, position={})",
+                                            size, available, position_size_real
+                                        );
+                                        state.tp_limit_balance_retries += 1;
+
+                                        if state.tp_limit_balance_retries >= 3 {
+                                            state.allowance_cache = None;
+                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
+                                    } else {
+                                        let price = target;
+                                        let result = clob
+                                            .place_sell_order(
                                             &tp.token_id,
                                             price,
                                             size.clone(),
@@ -2365,8 +2429,27 @@ pub async fn run() -> Result<()> {
                                                 state.tp_limit_balance_retries = 0;
                                             }
                                         }
+                                    } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
+                                        state.tp_limit_balance_retries += 1;
+
+                                        warn!(
+                                            "[IntervalSniper] TP limit 'invalid amounts' error (retry {}): size={}, available={:?}, position={}",
+                                            state.tp_limit_balance_retries, size, available, position_size_real
+                                        );
+
+                                        if state.tp_limit_balance_retries >= 5 {
+                                            warn!("[IntervalSniper] TP limit failed 5+ times with 'invalid amounts' — canceling TP, SL remains active");
+                                            state.tp_limit_order_id = None;
+                                            state.tp_limit_balance_retries = 0;
+                                            state.pending_auto_sell = None;
+                                            state.allowance_cache = None;
+                                        } else {
+                                            state.allowance_cache = None;
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
                                     } else if let Some(ref msg) = result.error_msg {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
+                                    }
                                     }
                                 }
                             }
