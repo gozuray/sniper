@@ -1750,7 +1750,7 @@ pub async fn run() -> Result<()> {
                                 }
                             } else if best_bid < order_price {
                                 // Bid dropped: cancel and replace at new best_bid next iteration.
-                                let _cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
+                                let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
                                 if let Some(ws_user) = ws_user_ref {
                                     if let Some(final_fill) = ws_user.get_order_filled_size_sell(oid).await {
                                         let delta = final_fill - state.sl_last_order_filled;
@@ -1759,15 +1759,32 @@ pub async fn run() -> Result<()> {
                                         }
                                     }
                                 }
-                                // If no WS and cancel said "matched", REST fallback could get order fill here; for now rely on next-iteration place for remaining.
-                                state.sl_limit_order_id = None;
-                                state.sl_limit_order_price = None;
-                                state.sl_last_order_filled = Decimal::ZERO;
-                                state.allowance_cache = None;
-                                trace!(
-                                    "[IntervalSniper] SL limit canceled (bid {} < order {}), will replace at new best_bid",
-                                    fmt_price(Some(&best_bid)), fmt_price(Some(&order_price))
-                                );
+                                // If cancel failed because order was already matched, SL filled on exchange — mark as filled so next iteration runs position-closed + re-entry.
+                                let sl_filled_via_cancel = cancel_result
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|res| res.not_canceled.get(oid.as_str()))
+                                    .map(|r| {
+                                        let lower = r.to_lowercase();
+                                        lower.contains("matched") || lower.contains("already canceled")
+                                    })
+                                    .unwrap_or(false);
+                                if sl_filled_via_cancel {
+                                    state.sl_cumulative_filled = sl.size.clone();
+                                    trace!(
+                                        "[IntervalSniper] SL order already matched (cancel said so) — will close position and allow re-entry next tick"
+                                    );
+                                    // Do not clear sl_limit_order_id so next iteration we hit sl_cumulative_filled >= 99% and run full position-closed + re_entry_allowed_after_sl.
+                                } else {
+                                    state.sl_limit_order_id = None;
+                                    state.sl_limit_order_price = None;
+                                    state.sl_last_order_filled = Decimal::ZERO;
+                                    state.allowance_cache = None;
+                                    trace!(
+                                        "[IntervalSniper] SL limit canceled (bid {} < order {}), will replace at new best_bid",
+                                        fmt_price(Some(&best_bid)), fmt_price(Some(&order_price))
+                                    );
+                                }
                             }
                         }
 
@@ -2280,7 +2297,7 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                     } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
-                                        // Position may already be closed (TP filled); remaining balance is dust below API minimum.
+                                        // Position may already be closed (TP or SL filled); remaining balance is dust below API minimum.
                                         let available_is_dust = available.map_or(false, |a| a < TP_SL_DUST_SIZE);
                                         if available_is_dust || size < TP_SL_DUST_SIZE {
                                             info!(
@@ -2289,7 +2306,8 @@ pub async fn run() -> Result<()> {
                                             );
                                             state.auto_sell_placed = true;
                                             state.stop_loss_placed = true;
-                                            state.re_entry_allowed_after_sl = false;
+                                            // If we had SL active, position was likely closed by SL (e.g. filled before we detected); allow re-entry.
+                                            state.re_entry_allowed_after_sl = state.pending_stop_loss.is_some();
                                             state.tp_limit_order_id = None;
                                             state.tp_limit_balance_retries = 0;
                                             state.sl_limit_order_id = None;
