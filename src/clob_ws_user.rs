@@ -19,6 +19,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 pub const DEFAULT_WS_USER_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 
 const PING_INTERVAL_SECS: u64 = 10;
+/// Max time to wait for TCP+WS handshake; avoids hanging indefinitely on reconnect.
+const CONNECT_TIMEOUT_SECS: u64 = 20;
 
 /// Per-order state from user channel (order events).
 #[derive(Debug, Clone)]
@@ -82,20 +84,35 @@ impl ClobWsUser {
 
         let join = tokio::spawn(async move {
             let mut attempt = 0u32;
+            let mut is_reconnecting = false;
             loop {
                 let connect_result = async {
-                    let (ws_stream, _) = connect_async(&url).await?;
-                    anyhow::Ok(ws_stream)
+                    let connect_fut = connect_async(&url);
+                    match tokio::time::timeout(
+                        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                        connect_fut,
+                    )
+                    .await
+                    {
+                        Ok(Ok((ws_stream, _))) => Ok(ws_stream),
+                        Ok(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "connection timeout after {}s",
+                            CONNECT_TIMEOUT_SECS
+                        )),
+                    }
                 }
                 .await;
 
                 let ws_stream = match connect_result {
                     Ok(s) => {
-                        let succeeded_attempt = attempt + 1;
                         attempt = 0;
-                        if succeeded_attempt > 1 {
-                            tracing::info!("[ClobWsUser] reconnected (attempt {})", succeeded_attempt);
+                        if is_reconnecting {
+                            tracing::info!(
+                                "[ClobWsUser] ✓ reconnected successfully (fills back to real-time WS)"
+                            );
                         }
+                        is_reconnecting = false;
                         s
                     }
                     Err(e) => {
@@ -135,12 +152,16 @@ impl ClobWsUser {
                         _ = ping_interval.tick() => {
                             if write.send(Message::Ping(vec![])).await.is_err() {
                                 tracing::warn!("[ClobWsUser] ping failed — reconnecting...");
+                                is_reconnecting = true;
+                                tracing::info!("[ClobWsUser] attempting to reconnect...");
                                 break;
                             }
                         }
                         msg = read.next() => {
                             let Some(Ok(msg)) = msg else {
                                 tracing::warn!("[ClobWsUser] connection closed — fills will degrade to REST fallback");
+                                is_reconnecting = true;
+                                tracing::info!("[ClobWsUser] attempting to reconnect...");
                                 break;
                             };
                             last_msg_at = std::time::Instant::now();
