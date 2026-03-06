@@ -2170,8 +2170,32 @@ pub async fn run() -> Result<()> {
                                     warn!("[IntervalSniper] SL: invalid amounts but balance={} remaining — canceling and retrying",
                                         fmt_decimal_2(&actual_remaining));
                                     let _ = clob.cancel_orders_for_token(&sl_token_id).await;
+
+                                    // CRÍTICO: Esperar para que exchange procese cancel
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+
                                     state.allowance_cache = None;
                                     remaining = actual_remaining;
+
+                                    // CRÍTICO: Resetear balance check después de cancel
+                                    let fresh_after_cancel = get_available_for_sell(
+                                        clob.as_ref().as_ref(),
+                                        state.ws_user.as_ref().map(|a| a.as_ref()),
+                                        &sl_token_id,
+                                        &mut state.allowance_cache,
+                                        true
+                                    ).await;
+
+                                    if let Some(bal) = fresh_after_cancel {
+                                        remaining = bal;
+                                        if remaining < DUST_THRESHOLD {
+                                            info!("[IntervalSniper] SL: balance became dust after cancel, position closed");
+                                            sl_done = true;
+                                            break;
+                                        }
+                                    }
+
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
                                     continue;
                                 }
                                 sl_done = true;
