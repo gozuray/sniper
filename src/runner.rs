@@ -722,14 +722,18 @@ async fn redeem_run_once(
     wallet: &ethers::signers::LocalWallet,
 ) {
     // Use FUNDER_ADDRESS (proxy wallet) for positions API if set; otherwise EOA. Positions are under proxy on Polymarket.
-    let user_addr = std::env::var("FUNDER_ADDRESS")
+    let (user_addr, funder_address) = match std::env::var("FUNDER_ADDRESS")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            let s = s.trim().trim_start_matches("0x");
-            format!("0x{}", s)
-        })
-        .unwrap_or_else(|| format!("{:#x}", wallet.address()));
+        .map(|s| s.trim().trim_start_matches("0x").to_string())
+    {
+        Some(ref s) => {
+            let addr = format!("0x{}", s);
+            let funder = addr.parse::<ethers::types::Address>().ok();
+            (addr, funder)
+        }
+        None => (format!("{:#x}", wallet.address()), None),
+    };
     match redeem::fetch_resolved_condition_ids_from_positions(http, clob_host, &user_addr).await {
         Ok(condition_ids) => {
             if condition_ids.is_empty() {
@@ -741,7 +745,7 @@ async fn redeem_run_once(
                 condition_ids.len()
             );
             for cid in &condition_ids {
-                match redeem::redeem_positions(wallet, rpc_url, cid).await {
+                match redeem::redeem_positions(wallet, rpc_url, cid, funder_address).await {
                     Ok(success) => {
                         if success {
                             info!(

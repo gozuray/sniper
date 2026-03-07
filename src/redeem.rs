@@ -1,10 +1,11 @@
 //! Redeem resolved Conditional Token positions on Polygon (CTF.redeemPositions).
 //! Auto-claim every N minutes for all closed markets (from Data API /positions?user=...).
+//! When FUNDER_ADDRESS (proxy/Safe) is set, executes redeem via Gnosis Safe so the proxy's positions are claimed.
 
 use anyhow::{Context, Result};
 use ethers::contract::abigen;
 use ethers::prelude::*;
-use ethers::types::Address;
+use ethers::types::{Address, Bytes};
 use reqwest::Client;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -20,11 +21,24 @@ const PARENT_COLLECTION_ID: [u8; 32] = [0u8; 32];
 const INDEX_SETS: [u64; 2] = [1, 2];
 /// Default gas price for redeem txs (gwei). Must be >= block base fee (Polygon can be 100+ gwei when busy).
 const DEFAULT_REDEEM_GAS_PRICE_GWEI: u64 = 150;
+/// Operation.Call for Safe execTransaction.
+const SAFE_OP_CALL: u8 = 0;
+/// Gas for inner Safe tx (redeemPositions).
+const SAFE_TX_GAS: u64 = 500_000;
 
 abigen!(
     ConditionalTokens,
     r#"[
         function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external
+    ]"#
+);
+
+abigen!(
+    GnosisSafe,
+    r#"[
+        function nonce() external view returns (uint256)
+        function getTransactionHash(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, uint256 _nonce) external view returns (bytes32)
+        function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) external payable returns (bool success)
     ]"#
 );
 
@@ -92,23 +106,143 @@ fn condition_id_to_bytes32(condition_id: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Build calldata for CTF.redeemPositions(collateral, parent, conditionId, indexSets).
+fn encode_redeem_calldata(
+    collateral: Address,
+    parent_b32: [u8; 32],
+    condition_b32: [u8; 32],
+    index_sets: &[ethers::types::U256],
+) -> Result<Bytes> {
+    use ethers::abi::{encode, Token};
+    let selector = ethers::utils::id("redeemPositions(address,bytes32,bytes32,uint256[])");
+    let tokens = vec![
+        Token::Address(collateral),
+        Token::FixedBytes(parent_b32.to_vec()),
+        Token::FixedBytes(condition_b32.to_vec()),
+        Token::Array(
+            index_sets
+                .iter()
+                .map(|u| Token::Uint(*u))
+                .collect::<Vec<_>>(),
+        ),
+    ];
+    let encoded = encode(&tokens);
+    let calldata: Vec<u8> = selector[..4]
+        .iter()
+        .copied()
+        .chain(encoded.into_iter())
+        .collect();
+    Ok(Bytes::from(calldata))
+}
+
+/// Redeem one condition via Gnosis Safe (proxy). The Safe holds the positions; EOA signs and calls execTransaction.
+async fn redeem_positions_via_safe(
+    wallet: &LocalWallet,
+    rpc_url: &str,
+    safe_address: Address,
+    condition_id: &str,
+    gas_price: ethers::types::U256,
+) -> Result<bool> {
+    let condition_bytes = condition_id_to_bytes32(condition_id)?;
+    let provider = Provider::<Http>::try_from(rpc_url).context("Polygon RPC provider")?;
+    let chain_id = provider.get_chainid().await?.as_u64();
+    let wallet = wallet.clone().with_chain_id(chain_id);
+    let client = SignerMiddleware::new(provider.clone(), wallet.clone());
+
+    let ctf_addr = Address::from_str(CTF_ADDRESS).context("CTF address")?;
+    let collateral = Address::from_str(USDC_E_ADDRESS).context("USDC.e address")?;
+    let parent_b32: [u8; 32] = PARENT_COLLECTION_ID;
+    let condition_b32: [u8; 32] = condition_bytes;
+    let index_sets: Vec<ethers::types::U256> = INDEX_SETS.iter().map(|&u| u.into()).collect();
+
+    let calldata = encode_redeem_calldata(collateral, parent_b32, condition_b32, &index_sets)?;
+
+    let safe = GnosisSafe::new(safe_address, client.into());
+    let nonce = safe.nonce().call().await.context("Safe nonce")?;
+    let zero = Address::zero();
+    let tx_hash = safe
+        .get_transaction_hash(
+            ctf_addr,
+            U256::zero(),
+            calldata.clone(),
+            SAFE_OP_CALL,
+            SAFE_TX_GAS.into(),
+            U256::zero(),
+            gas_price,
+            zero,
+            zero,
+            nonce,
+        )
+        .call()
+        .await
+        .context("Safe getTransactionHash")?;
+
+    let hash_bytes: [u8; 32] = tx_hash
+        .as_ref()
+        .try_into()
+        .context("tx_hash to bytes")?;
+    let sig = wallet.sign_hash(hash_bytes.into()).context("sign Safe tx hash")?;
+    let mut r_b = [0u8; 32];
+    sig.r.to_big_endian(&mut r_b);
+    let mut s_b = [0u8; 32];
+    sig.s.to_big_endian(&mut s_b);
+    let v = sig.v as u8;
+    let signature_bytes: Vec<u8> = r_b
+        .iter()
+        .chain(s_b.iter())
+        .chain(std::iter::once(&v))
+        .copied()
+        .collect();
+
+    let provider2 = Provider::<Http>::try_from(rpc_url).context("Polygon RPC provider 2")?;
+    let client2 = SignerMiddleware::new(provider2, wallet.clone());
+    let safe_signer = GnosisSafe::new(safe_address, client2.into());
+
+    let exec_call = safe_signer.exec_transaction(
+        ctf_addr,
+        U256::zero(),
+        calldata,
+        SAFE_OP_CALL,
+        SAFE_TX_GAS.into(),
+        U256::zero(),
+        gas_price,
+        zero,
+        zero,
+        signature_bytes.into(),
+    );
+    let with_gas = exec_call.gas_price(gas_price);
+    let pending = with_gas
+        .send()
+        .await
+        .context("Safe execTransaction")?;
+    let hash = pending.tx_hash();
+    info!(
+        "[Redeem] redeemPositions via Safe submitted condition_id={}.. tx_hash={:?}",
+        &condition_id[..condition_id.len().min(18)],
+        hash
+    );
+    let success = if let Ok(Some(receipt)) = pending.await {
+        let s = receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false);
+        if s {
+            info!("[Redeem] Safe exec tx confirmed block={:?}", receipt.block_number);
+        } else {
+            warn!("[Redeem] Safe exec tx reverted");
+        }
+        s
+    } else {
+        false
+    };
+    Ok(success)
+}
+
 /// Call CTF.redeemPositions for one condition. Skips (no error) if condition not resolved yet.
+/// If funder_address is Some and different from wallet.address(), uses Safe (proxy) path so the proxy's positions are redeemed.
 pub async fn redeem_positions(
     wallet: &LocalWallet,
     rpc_url: &str,
     condition_id: &str,
+    funder_address: Option<Address>,
 ) -> Result<bool> {
-    let condition_bytes = condition_id_to_bytes32(condition_id)?;
-    let provider = Provider::<Http>::try_from(rpc_url)
-        .context("Polygon RPC provider")?;
-    let chain_id = provider.get_chainid().await?.as_u64();
-    let wallet = wallet.clone().with_chain_id(chain_id);
-    let client = SignerMiddleware::new(provider, wallet);
-
-    let ctf_addr = Address::from_str(CTF_ADDRESS).context("CTF address")?;
-    let collateral = Address::from_str(USDC_E_ADDRESS).context("USDC.e address")?;
-    let contract = ConditionalTokens::new(ctf_addr, client.into());
-
     let gas_price_gwei: u64 = std::env::var("REDEEM_GAS_PRICE_GWEI")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -123,6 +257,27 @@ pub async fn redeem_positions(
         gas_price_gwei
     };
     let gas_price = ethers::types::U256::from(gas_price_gwei) * ethers::types::U256::from(1_000_000_000u64);
+
+    let wallet_addr = wallet.address();
+    let use_safe = funder_address
+        .map(|f| f != wallet_addr)
+        .unwrap_or(false);
+
+    if use_safe {
+        let safe_addr = funder_address.unwrap();
+        return redeem_positions_via_safe(wallet, rpc_url, safe_addr, condition_id, gas_price).await;
+    }
+
+    let condition_bytes = condition_id_to_bytes32(condition_id)?;
+    let provider = Provider::<Http>::try_from(rpc_url)
+        .context("Polygon RPC provider")?;
+    let chain_id = provider.get_chainid().await?.as_u64();
+    let wallet = wallet.clone().with_chain_id(chain_id);
+    let client = SignerMiddleware::new(provider, wallet);
+
+    let ctf_addr = Address::from_str(CTF_ADDRESS).context("CTF address")?;
+    let collateral = Address::from_str(USDC_E_ADDRESS).context("USDC.e address")?;
+    let contract = ConditionalTokens::new(ctf_addr, client.into());
 
     let parent_b32: [u8; 32] = PARENT_COLLECTION_ID;
     let condition_b32: [u8; 32] = condition_bytes;
