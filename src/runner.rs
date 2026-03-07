@@ -2817,6 +2817,11 @@ pub async fn run() -> Result<()> {
                                             state.last_logged_balance_up = None;
                                             state.last_logged_balance_down = None;
                                             state.total_shares_this_interval = Decimal::ZERO;
+                                            // Clear WS token state so re-entry balance check is fresh.
+                                            if let Some(ws) = ws_user_ref {
+                                                ws.clear_token_state(&market.token_id_up).await;
+                                                ws.clear_token_state(&market.token_id_down).await;
+                                            }
                                         } else {
                                             state.tp_limit_balance_retries += 1;
                                             warn!(
@@ -2927,6 +2932,15 @@ pub async fn run() -> Result<()> {
                         },
                     ),
                 };
+                if entry.is_none()
+                    && state.trades_this_interval == 1
+                    && state.re_entry_allowed_after_sl
+                {
+                    debug!(
+                        "[IntervalSniper] Re-entry allowed after SL but price not in range (min_buy={} max_buy={}) — waiting for target",
+                        state.config.min_buy_price, state.config.max_buy_price
+                    );
+                }
                 if let Some((side, size_available, order_type, limit_price)) = entry {
                     let token_id = match side {
                         EntrySide::Up => &market.token_id_up,
