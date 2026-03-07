@@ -2040,10 +2040,66 @@ pub async fn run() -> Result<()> {
                                     .unwrap_or(false);
                                 if sl_filled_via_cancel {
                                     state.sl_cumulative_filled = sl.size.clone();
-                                    trace!(
-                                        "[IntervalSniper] SL order already matched (cancel said so) — will close position and allow re-entry next tick"
+                                    info!(
+                                        "[IntervalSniper] SL position closed (order already matched on cancel), allowing re-entry"
                                     );
-                                    // Do not clear sl_limit_order_id so next iteration we hit sl_cumulative_filled >= 99% and run full position-closed + re_entry_allowed_after_sl.
+                                    // Run full cleanup immediately: next tick price may be above trigger so we'd never enter this block again.
+                                    let exit_price = order_price;
+                                    let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
+                                        sl.size.clone() - state.tp_cumulative_filled.clone()
+                                    } else {
+                                        state.sl_cumulative_filled.clone()
+                                    };
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let pnl = (exit_price - buy.price) * total_filled.clone();
+                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                        let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                        info!(
+                                            "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (limit @ best_bid)",
+                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                            fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
+                                        );
+                                    }
+                                    if let Some(ref mut log) = state.session_log {
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let _ = log.log_position_close(
+                                                &market.slug, market.interval_start_unix, market.close_time_unix,
+                                                buy.side, buy.price, exit_price, buy.timestamp_ms, now_ms_u,
+                                                ExitType::StopLoss, total_filled.clone(), None,
+                                                buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
+                                                state.interval_min_bid_up, state.interval_max_bid_up,
+                                                state.interval_min_bid_down, state.interval_max_bid_down,
+                                                None,
+                                            );
+                                        }
+                                    }
+                                    info!("[IntervalSniper] ✓ SL limit filled @ {} — position closed (re-entry allowed)", fmt_price(Some(&exit_price)));
+                                    state.stop_loss_placed = true;
+                                    state.auto_sell_placed = true;
+                                    state.re_entry_allowed_after_sl = true;
+                                    state.tp_limit_order_id = None;
+                                    state.tp_placed_size = None;
+                                    state.tp_cumulative_filled = Decimal::ZERO;
+                                    state.tp_last_order_filled = Decimal::ZERO;
+                                    state.tp_limit_balance_retries = 0;
+                                    state.sl_limit_order_id = None;
+                                    state.sl_limit_order_price = None;
+                                    state.sl_cumulative_filled = Decimal::ZERO;
+                                    state.sl_last_order_filled = Decimal::ZERO;
+                                    state.sl_limit_last_rest_check_ms = None;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.allowance_cache = None;
+                                    state.last_buy_order = None;
+                                    state.balance_reflected_at_ms = None;
+                                    state.balance_delay_clob_logged = false;
+                                    state.last_logged_balance_up = None;
+                                    state.last_logged_balance_down = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                    if let Some(ws) = ws_user_ref {
+                                        ws.clear_token_state(&sl.token_id).await;
+                                    }
                                 } else {
                                     state.sl_limit_order_id = None;
                                     state.sl_limit_order_price = None;
@@ -2548,70 +2604,9 @@ pub async fn run() -> Result<()> {
                             }
                         }
 
-                        // TP dust: if we have a TP order resting and available balance is dust, TP filled on exchange (WS/REST missed it).
-                        if !tp_filled_this_iteration && state.tp_limit_order_id.is_some() {
-                            let tp_available = get_available_for_sell(
-                                clob.as_ref().as_ref(),
-                                ws_user_ref,
-                                &tp.token_id,
-                                &mut state.allowance_cache,
-                                false,
-                            ).await;
-                            if tp_available.map_or(false, |a| a <= SL_BALANCE_DUST_CLOSE) {
-                                let dust_close_size = tp.size.clone() - state.tp_cumulative_filled.clone();
-                                info!(
-                                    "[IntervalSniper] ✓ TP position closed (balance dust {}), TP filled on exchange",
-                                    fmt_decimal_2(&tp_available.unwrap_or(Decimal::ZERO))
-                                );
-                                if let Some(ref buy) = state.last_buy_order {
-                                    let pnl = (target - buy.price) * dust_close_size.clone();
-                                    let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
-                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
-                                    info!(
-                                        "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (dust)",
-                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&target),
-                                        fmt_decimal_2(&dust_close_size), pnl, roi_pct, held_sec
-                                    );
-                                }
-                                if let Some(ref mut log) = state.session_log {
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let _ = log.log_position_close(
-                                            &market.slug, market.interval_start_unix, market.close_time_unix,
-                                            buy.side, buy.price.clone(), target, buy.timestamp_ms, now_ms_u,
-                                            ExitType::TakeProfit, dust_close_size.clone(), state.tp_placed_size.clone(),
-                                            buy.order_id.as_deref(), state.tp_limit_order_id.as_deref(),
-                                            state.interval_min_bid_up, state.interval_max_bid_up,
-                                            state.interval_min_bid_down, state.interval_max_bid_down,
-                                            None,
-                                        );
-                                    }
-                                }
-                                tp_filled_this_iteration = true;
-                                state.auto_sell_placed = true;
-                                state.stop_loss_placed = true;
-                                state.re_entry_allowed_after_sl = false;
-                                state.tp_limit_order_id = None;
-                                state.tp_placed_size = None;
-                                state.tp_cumulative_filled = Decimal::ZERO;
-                                state.tp_last_order_filled = Decimal::ZERO;
-                                state.tp_limit_balance_retries = 0;
-                                state.sl_limit_order_id = None;
-                                state.sl_limit_order_price = None;
-                                state.sl_cumulative_filled = Decimal::ZERO;
-                                state.sl_last_order_filled = Decimal::ZERO;
-                                state.sl_limit_last_rest_check_ms = None;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.allowance_cache = None;
-                                state.last_buy_order = None;
-                                state.balance_reflected_at_ms = None;
-                                state.balance_delay_clob_logged = false;
-                                state.last_logged_balance_up = None;
-                                state.last_logged_balance_down = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
-                            }
-                        }
+                        // TP fill is only confirmed by: (1) WS fill, (2) REST get_order filled, or (3) cancel returned "matched".
+                        // We do NOT infer TP filled from "available balance is dust" while a TP order is resting: the API can
+                        // report available=0 because balance is locked in the open order, causing a false positive "TP filled".
 
                         // 2) Place GTC limit at target only when price has touched TP - 0.01; cancel if it drops back to entry.
                         // Skip if we just detected TP fill this iteration (position already closed; avoid "not enough balance").
