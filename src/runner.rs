@@ -1867,6 +1867,35 @@ pub async fn run() -> Result<()> {
                             }
                         });
                     }
+                    // Cancel any resting GTC buy order from the previous interval so we don't
+                    // leave it on the book and allow a second buy in the new interval.
+                    if let Some(ref token_id) = state.pending_gtc_token_id {
+                        if state.pending_gtc_order_id.is_some() && !config.dry_run {
+                            match clob.cancel_orders_for_token(token_id).await {
+                                Ok(res) => {
+                                    if !res.canceled.is_empty() {
+                                        info!(
+                                            "[IntervalSniper] canceled {} resting GTC order(s) at interval switch",
+                                            res.canceled.len()
+                                        );
+                                    }
+                                    if !res.not_canceled.is_empty() {
+                                        warn!(
+                                            "[IntervalSniper] {} order(s) not canceled at interval switch: {:?}",
+                                            res.not_canceled.len(),
+                                            res.not_canceled.keys().collect::<Vec<_>>()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "[IntervalSniper] failed to cancel resting GTC order at interval switch: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
                     state.ordered_this_interval = false;
                     state.trades_this_interval = 0;
                     state.re_entry_allowed_after_sl = false;
