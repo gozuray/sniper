@@ -1486,6 +1486,63 @@ pub async fn run() -> Result<()> {
 
         if need_new_market {
             let old_market_for_end_log = state.market.clone();
+
+            // Before logging ABANDONED: check via REST if the TP limit order was already filled
+            // on the exchange (WS/loop may have missed the fill event at the interval boundary).
+            if let Some(tp_oid) = state.tp_limit_order_id.clone() {
+                if state.pending_auto_sell.is_some() {
+                    match clob.get_order(&tp_oid).await {
+                        Ok(order_info) => {
+                            let status = order_info.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            let size_matched = order_info
+                                .get("size_matched")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| Decimal::from_str(s).ok())
+                                .unwrap_or(Decimal::ZERO);
+                            let tp_size = state.tp_placed_size.clone()
+                                .or_else(|| state.pending_auto_sell.as_ref().map(|t| t.size.clone()))
+                                .unwrap_or(Decimal::ZERO);
+                            if (status.contains("MATCHED") || status.eq_ignore_ascii_case("FILLED"))
+                                && size_matched >= tp_size * dec!(0.99)
+                            {
+                                // TP was filled — log correctly instead of ABANDONED
+                                let exit_price = state.pending_auto_sell.as_ref()
+                                    .map(|t| round_to_tick(t.target_price))
+                                    .unwrap_or(Decimal::ZERO);
+                                if let Some(ref buy) = state.last_buy_order {
+                                    let pnl = (exit_price - buy.price) * size_matched.clone();
+                                    let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                    info!(
+                                        "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (detected at interval close via REST)",
+                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                        fmt_decimal_2(&size_matched), pnl, roi_pct, held_sec
+                                    );
+                                }
+                                info!("[IntervalSniper] ✓ TP limit filled @ interval boundary — position closed (REST confirmed)");
+                                state.tp_limit_order_id = None;
+                                state.tp_placed_size = None;
+                                state.tp_cumulative_filled = Decimal::ZERO;
+                                state.tp_last_order_filled = Decimal::ZERO;
+                                state.tp_limit_balance_retries = 0;
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
+                                state.sl_cumulative_filled = Decimal::ZERO;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.last_buy_order = None;
+                                state.allowance_cache = None;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[IntervalSniper] could not check TP order at interval close: {}", e);
+                        }
+                    }
+                }
+            }
+
             // Log position close (MARKET_CLOSE) and interval summary for the market we're leaving
             if let Some(ref old_market) = state.market {
                 if state.pending_auto_sell.is_some() || state.pending_stop_loss.is_some() {
