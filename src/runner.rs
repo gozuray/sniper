@@ -927,10 +927,21 @@ pub async fn run() -> Result<()> {
                         .as_ref()
                         .cloned()
                         .unwrap_or(Decimal::ZERO);
-                    let filled = filled_size.min(requested.clone());
-                    let is_full_fill = filled >= requested.clone() * dec!(0.99);
-                    if is_full_fill
-                        && filled >= MIN_SELL_SIZE
+                    // Cap by REST size_matched when available so we never assume more filled than exchange (avoids partial→TP for full size→balance error→cancel).
+                    let filled = {
+                        let from_ws = filled_size.min(requested.clone());
+                        match clob.get_order(order_id).await {
+                            Ok(info) => info
+                                .get("size_matched")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| Decimal::from_str(s).ok())
+                                .map(|rest_matched| from_ws.min(rest_matched))
+                                .unwrap_or(from_ws),
+                            _ => from_ws,
+                        }
+                    };
+                    // Allow partial fill: set TP/SL for actual filled size so we don't place TP for more than we have (and avoid balance error → cancel).
+                    if filled >= MIN_SELL_SIZE
                         && state.pending_gtc_token_id.is_some()
                         && state.pending_gtc_side.is_some()
                         && state.pending_gtc_price.is_some()
@@ -2824,10 +2835,10 @@ pub async fn run() -> Result<()> {
                                         state.tp_limit_balance_retries += 1;
                                         if state.tp_limit_balance_retries == 1 {
                                             warn!(
-                                                "[IntervalSniper] TP limit balance/allowance error (retry {}), canceling orders and retrying",
+                                                "[IntervalSniper] TP limit balance/allowance error (retry {}), will retry with actual balance next tick (do not cancel — would cancel resting GTC entry)",
                                                 state.tp_limit_balance_retries
                                             );
-                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                            state.allowance_cache = None;
                                             // Log raw balance-allowance JSON so we know if it's balance=0 or allowance=0.
                                             match clob.get_balance_allowance(&tp.token_id).await {
                                                 Ok(raw) => warn!(
