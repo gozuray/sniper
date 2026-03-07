@@ -292,12 +292,12 @@ fn is_position_closed_error(msg: Option<&str>) -> bool {
     })
 }
 
-/// True if the API error is "invalid amounts, maker and taker amount must be higher than 0".
-/// Balance is slow to update; treat as position closed to stop retry spam.
+/// True if the API error is "invalid amounts, maker and taker amount must be higher than 0",
+/// or "size lower than the minimum". Balance is slow to update; treat as position closed to stop retry spam.
 fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
     msg.map_or(false, |m| {
         let lower = m.to_lowercase();
-        lower.contains("invalid amounts") || lower.contains("maker and taker amount")
+        lower.contains("invalid amounts") || lower.contains("maker and taker amount") || lower.contains("lower than the minimum")
     })
 }
 
@@ -2636,7 +2636,49 @@ pub async fn run() -> Result<()> {
                                     "[IntervalSniper] TP limit calculation: position_size={}, available={:?}, effective_size={}, MIN_SELL_SIZE={}, DUST_THRESHOLD={}",
                                     position_size_real, available, size, MIN_SELL_SIZE, DUST_THRESHOLD
                                 );
-                                if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
+                                // Remaining is below API minimum order size (e.g. 0.01 < 5): unsellable dust after partial TP fill.
+                                // Close the position immediately rather than spamming the API with rejected orders.
+                                if size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                    info!(
+                                        "[IntervalSniper] TP remaining {} below API minimum {} — dust after partial fill, closing position",
+                                        fmt_decimal_2(&size), fmt_decimal_2(&CLOB_DEFAULT_MIN_ORDER_SIZE)
+                                    );
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let exit_price = target;
+                                        let filled = state.tp_cumulative_filled.clone();
+                                        let pnl = (exit_price - buy.price) * filled.clone();
+                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                        let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                        info!(
+                                            "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (partial fill, dust remainder)",
+                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                            fmt_decimal_2(&filled), pnl, roi_pct, held_sec
+                                        );
+                                    }
+                                    state.auto_sell_placed = true;
+                                    state.stop_loss_placed = true;
+                                    state.re_entry_allowed_after_sl = false;
+                                    state.tp_limit_order_id = None;
+                                    state.tp_placed_size = None;
+                                    state.tp_cumulative_filled = Decimal::ZERO;
+                                    state.tp_last_order_filled = Decimal::ZERO;
+                                    state.tp_limit_balance_retries = 0;
+                                    state.sl_limit_order_id = None;
+                                    state.sl_limit_order_price = None;
+                                    state.sl_cumulative_filled = Decimal::ZERO;
+                                    state.sl_last_order_filled = Decimal::ZERO;
+                                    state.sl_limit_last_rest_check_ms = None;
+                                    state.pending_auto_sell = None;
+                                    state.pending_stop_loss = None;
+                                    state.allowance_cache = None;
+                                    state.last_buy_order = None;
+                                    state.balance_reflected_at_ms = None;
+                                    state.balance_delay_clob_logged = false;
+                                    state.last_logged_balance_up = None;
+                                    state.last_logged_balance_down = None;
+                                    state.total_shares_this_interval = Decimal::ZERO;
+                                } else if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
                                     let price = target;
                                         let result = clob
                                             .place_sell_order(
