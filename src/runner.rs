@@ -2035,7 +2035,7 @@ pub async fn run() -> Result<()> {
                                     .and_then(|res| res.not_canceled.get(oid.as_str()))
                                     .map(|r| {
                                         let lower = r.to_lowercase();
-                                        lower.contains("matched") || lower.contains("already canceled")
+                                        lower.contains("matched")
                                     })
                                     .unwrap_or(false);
                                 if sl_filled_via_cancel {
@@ -2147,18 +2147,28 @@ pub async fn run() -> Result<()> {
                                                 crate::types::SellOrderTimeInForce::Gtc,
                                             )
                                             .await?;
-                                        // Retry up to 2x after delay only for transient balance/allowance lag (e.g. cancel propagation).
+                                        // Retry up to 2x after delay for transient balance/allowance lag (e.g. cancel propagation).
                                         for _ in 0..2 {
                                             if result.success {
                                                 break;
                                             }
-                                            if !is_position_closed_error(result.error_msg.as_deref()) {
+                                            if is_position_closed_error(result.error_msg.as_deref()) {
+                                                // Position already closed on exchange (SL filled via WS); stop retrying.
+                                                state.sl_cumulative_filled = sl.size.clone();
+                                                state.allowance_cache = None;
                                                 break;
                                             }
-                                            // Position already closed on exchange (SL filled via WS); stop retrying to avoid 3x LiveClob errors.
-                                            state.sl_cumulative_filled = sl.size.clone();
+                                            // Transient error: wait for cancel to propagate and retry.
+                                            tokio::time::sleep(Duration::from_millis(SL_FOK_RETRY_DELAY_MS)).await;
                                             state.allowance_cache = None;
-                                            break;
+                                            result = clob
+                                                .place_sell_order(
+                                                    &sl.token_id,
+                                                    price,
+                                                    size.clone(),
+                                                    crate::types::SellOrderTimeInForce::Gtc,
+                                                )
+                                                .await?;
                                         }
                                         if result.success {
                                             state.sl_limit_order_id = result.order_id.clone();
@@ -2289,7 +2299,7 @@ pub async fn run() -> Result<()> {
                         // 1) If we have a TP limit order resting: cancel when price drops to entry, or detect fill via ws_user.
                         let tp_order_id = state.tp_limit_order_id.clone();
                         if let Some(ref oid) = tp_order_id {
-                            if best_bid > Decimal::ZERO && best_bid <= entry_price {
+                            if best_bid > Decimal::ZERO && best_bid < entry_price {
                                 // HFT: WS first — get partial fill before cancel to track tp_cumulative_filled.
                                 if let Some(ws_user) = ws_user_ref {
                                     if let Some(filled) = ws_user.get_order_filled_size_sell(oid).await {
@@ -2627,21 +2637,7 @@ pub async fn run() -> Result<()> {
                                     position_size_real, available, size, MIN_SELL_SIZE, DUST_THRESHOLD
                                 );
                                 if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
-                                    // Validación adicional para evitar "invalid amounts"
-                                    if size < dec!(0.0001) {
-                                        warn!(
-                                            "[IntervalSniper] TP limit: calculated size {} is too small, skipping (available={:?}, position={})",
-                                            size, available, position_size_real
-                                        );
-                                        state.tp_limit_balance_retries += 1;
-
-                                        if state.tp_limit_balance_retries >= 3 {
-                                            state.allowance_cache = None;
-                                            let _ = clob.cancel_orders_for_token(&tp.token_id).await;
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
-                                        }
-                                    } else {
-                                        let price = target;
+                                    let price = target;
                                         let result = clob
                                             .place_sell_order(
                                             &tp.token_id,
@@ -2837,7 +2833,6 @@ pub async fn run() -> Result<()> {
                                         }
                                     } else if let Some(ref msg) = result.error_msg {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
-                                    }
                                     }
                                 }
                             }
