@@ -2530,44 +2530,13 @@ pub async fn run() -> Result<()> {
                                 let tp_size_for_check = state.tp_placed_size.unwrap_or(tp.size.clone());
                                 match ws_user.get_order_filled_size_sell(oid).await {
                                     Some(filled) if filled >= tp_size_for_check * dec!(0.99) => {
-                                        debug!(
-                                            "[IntervalSniper] TP fill via WS: {}/{} — confirming with REST...",
-                                            fmt_decimal_2(&filled), fmt_decimal_2(&tp_size_for_check)
-                                        );
+                                        // WS fill event (TRADE/UPDATE) is authoritative — close immediately.
+                                        // REST may lag 1-5s; requiring confirmation causes missed/delayed detection.
                                         {
-                                            // REST confirmation to avoid WS false positives.
-                                            let rest_confirms_fill = match clob.get_order(oid).await {
-                                                Ok(order_info) => {
-                                                    let status = order_info.get("status")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("");
-                                                    let rest_matched = order_info
-                                                        .get("size_matched")
-                                                        .and_then(|v| v.as_str())
-                                                        .and_then(|s| Decimal::from_str(s).ok())
-                                                        .unwrap_or(Decimal::ZERO);
-                                                    let ok = (status.contains("MATCHED") || status.eq_ignore_ascii_case("FILLED"))
-                                                        && rest_matched >= tp_size_for_check.clone() * dec!(0.99);
-                                                    if !ok && (status.len() > 0 || rest_matched > Decimal::ZERO) {
-                                                        debug!(
-                                                            "[IntervalSniper] TP WS said filled but REST disagrees: status={} size_matched={} (need >= {})",
-                                                            status, rest_matched, tp_size_for_check * dec!(0.99)
-                                                        );
-                                                    }
-                                                    ok
-                                                }
-                                                Err(_) => {
-                                                    debug!("[IntervalSniper] TP WS said filled but get_order failed, skipping close this tick");
-                                                    false
-                                                }
-                                            };
-                                            if !rest_confirms_fill {
-                                                // No cerrar esta iteración; REST no confirma. El polling REST (prioridad 2) cerrará cuando sea real.
-                                            } else {
                                             tp_detected_by_ws = true;
                                             let close_size = filled.clone();
 
-                                            info!("[IntervalSniper] ✓ TP fill via WS confirmed by REST: {}/{} filled",
+                                            info!("[IntervalSniper] ✓ TP fill via WS (TRADE/UPDATE event): {}/{} filled",
                                                 fmt_decimal_2(&close_size), fmt_decimal_2(&tp_size_for_check));
 
                                             if let Some(ref buy) = state.last_buy_order {
@@ -2623,7 +2592,6 @@ pub async fn run() -> Result<()> {
                                             state.last_logged_balance_up = None;
                                             state.last_logged_balance_down = None;
                                             state.total_shares_this_interval = Decimal::ZERO;
-                                            }
                                         }
                                     }
                                     _ => {}
