@@ -2504,8 +2504,8 @@ pub async fn run() -> Result<()> {
                                 let tp_size_for_check = state.tp_placed_size.unwrap_or(tp.size.clone());
                                 match ws_user.get_order_filled_size_sell(oid).await {
                                     Some(filled) if filled >= tp_size_for_check * dec!(0.99) => {
-                                        info!(
-                                            "[IntervalSniper] TP fill via WS: {}/{} filled, confirming with REST...",
+                                        debug!(
+                                            "[IntervalSniper] TP fill via WS: {}/{} — confirming with REST...",
                                             fmt_decimal_2(&filled), fmt_decimal_2(&tp_size_for_check)
                                         );
                                         {
@@ -2523,7 +2523,7 @@ pub async fn run() -> Result<()> {
                                                     let ok = (status.contains("MATCHED") || status.eq_ignore_ascii_case("FILLED"))
                                                         && rest_matched >= tp_size_for_check.clone() * dec!(0.99);
                                                     if !ok && (status.len() > 0 || rest_matched > Decimal::ZERO) {
-                                                        trace!(
+                                                        debug!(
                                                             "[IntervalSniper] TP WS said filled but REST disagrees: status={} size_matched={} (need >= {})",
                                                             status, rest_matched, tp_size_for_check * dec!(0.99)
                                                         );
@@ -2531,17 +2531,18 @@ pub async fn run() -> Result<()> {
                                                     ok
                                                 }
                                                 Err(_) => {
-                                                    trace!("[IntervalSniper] TP WS said filled but get_order failed, skipping close this tick");
+                                                    debug!("[IntervalSniper] TP WS said filled but get_order failed, skipping close this tick");
                                                     false
                                                 }
                                             };
                                             if !rest_confirms_fill {
-                                                // No cerrar esta iteración; REST no confirma. El polling REST (prioridad 2) o balance dust cerrará cuando sea real.
+                                                // No cerrar esta iteración; REST no confirma. El polling REST (prioridad 2) cerrará cuando sea real.
                                             } else {
                                             tp_detected_by_ws = true;
                                             let close_size = filled.clone();
 
-                                            info!("[IntervalSniper] ✓ TP detected via WS user (instant), REST confirmed");
+                                            info!("[IntervalSniper] ✓ TP fill via WS confirmed by REST: {}/{} filled",
+                                                fmt_decimal_2(&close_size), fmt_decimal_2(&tp_size_for_check));
 
                                             if let Some(ref buy) = state.last_buy_order {
                                                 let exit_price = target;
