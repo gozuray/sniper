@@ -37,6 +37,8 @@ const MIN_SELL_SIZE: Decimal = dec!(0.0001);
 const DUST_THRESHOLD: Decimal = dec!(0.001);
 /// When SL limit order is resting but available balance for the token is <= this, treat as position closed (fill detected via balance; WS/REST may have missed the event).
 const SL_BALANCE_DUST_CLOSE: Decimal = dec!(0.05);
+/// Extra margin above SL trigger so we keep trying to place the SL limit on every tick while price is at or slightly above trigger (avoids missing the window if price bounces).
+const SL_TRIGGER_MARGIN: Decimal = dec!(0.01);
 /// Polymarket may reject small sell sizes with "invalid amounts"; below this treat as dust and consider position closed.
 const TP_SL_DUST_SIZE: Decimal = dec!(0.01);
 /// API reported fill below this is treated like 0 — run full WS/REST reconciliation (exchange often filled fully).
@@ -1978,7 +1980,7 @@ pub async fn run() -> Result<()> {
                         &top.token_id_down
                     };
                     debug!(
-                        "[IntervalSniper]  POS   SL   trigger={}  best_bid={}  (sell when bid <= trigger)",
+                        "[IntervalSniper]  POS   SL   trigger={}  best_bid={}  (sell when bid <= trigger + margin)",
                         fmt_price(Some(&sl.trigger_price)),
                         fmt_price(side_book.as_ref().and_then(|s| s.best_bid.as_ref()))
                     );
@@ -1986,8 +1988,9 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Stop loss: limit-order style (like TP). When bid <= trigger, place GTC limit at best_bid;
-        // if bid drops before fill, cancel and replace at new best_bid. Detect 100% fill via WS user.
+        // Stop loss: limit-order style (like TP). When bid <= trigger + SL_TRIGGER_MARGIN, place GTC limit at best_bid
+        // and keep trying every tick while in zone (no resting SL order). If bid drops before fill, cancel and replace.
+        // Detect 100% fill via WS user.
         if state.config.enable_stop_loss {
             if let Some(ref sl) = state.pending_stop_loss.clone() {
                 if !state.stop_loss_placed {
@@ -2013,8 +2016,9 @@ pub async fn run() -> Result<()> {
                             state.sl_limit_order_id = None;
                             state.sl_limit_order_price = None;
                         }
-                    } else if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price {
-                        // First time in SL zone: cancel TP so balance is free for SL limit order.
+                    } else if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price + SL_TRIGGER_MARGIN {
+                        // In SL zone (bid <= trigger + margin): try to place SL limit every tick while we have position and no resting SL order.
+                        // First time in zone: cancel TP so balance is free for SL limit order.
                         if state.sl_limit_order_id.is_none() && state.sl_cumulative_filled.is_zero() {
                             let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
                             match cancel_result {
@@ -2039,7 +2043,7 @@ pub async fn run() -> Result<()> {
                             tokio::time::sleep(Duration::from_millis(150)).await;
                             state.allowance_cache = None;
                             info!(
-                                "[IntervalSniper] SL TRIGGERED: bid {} <= trigger {} — placing limit at best_bid (cancel+replace if bid drops)",
+                                "[IntervalSniper] SL TRIGGERED: bid {} in SL zone (trigger {} + margin) — placing limit at best_bid (cancel+replace if bid drops)",
                                 fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
                             );
                         }
