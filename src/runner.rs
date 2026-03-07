@@ -1989,7 +1989,9 @@ pub async fn run() -> Result<()> {
                                 }
                             }
 
-                            // Balance-dust fallback: if available balance is dust, order filled and we missed WS/REST — close position so 2nd buy can run.
+                            // Balance-dust fallback: if available balance is dust, order may be filled and WS/REST missed it.
+                            // IMPORTANT: a resting SL limit order locks the allowance, so available can be ~0 even when NOT filled.
+                            // Always verify via REST get_order status before concluding position is closed.
                             let sl_available = get_available_for_sell(
                                 clob.as_ref().as_ref(),
                                 ws_user_ref,
@@ -2000,18 +2002,42 @@ pub async fn run() -> Result<()> {
                             if sl_available.map_or(false, |a| a <= SL_BALANCE_DUST_CLOSE) {
                                 let implied_filled = sl.size - sl_available.unwrap_or(Decimal::ZERO);
                                 if implied_filled >= sl.size * dec!(0.99) {
-                                    state.sl_cumulative_filled = sl.size;
-                                    info!(
-                                        "[IntervalSniper] SL position closed (balance dust {}), allowing re-entry",
-                                        fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
-                                    );
+                                    // Verify via REST that the order is actually MATCHED, not just locking allowance.
+                                    let order_confirmed_filled = match clob.get_order(oid).await {
+                                        Ok(info) => {
+                                            let status = info.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                            status.contains("MATCHED") || status.eq_ignore_ascii_case("FILLED")
+                                        }
+                                        Err(_) => false,
+                                    };
+                                    if order_confirmed_filled {
+                                        state.sl_cumulative_filled = sl.size;
+                                        info!(
+                                            "[IntervalSniper] SL position closed (balance dust {}, REST confirmed MATCHED), allowing re-entry",
+                                            fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
+                                        );
+                                    } else {
+                                        debug!(
+                                            "[IntervalSniper] SL balance dust {} but order not yet MATCHED (resting) — skipping dust close",
+                                            fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
+                                        );
+                                    }
                                 } else if state.tp_cumulative_filled > Decimal::ZERO {
-                                    // Partial TP: we sold the remaining (sl.size - tp_cumulative_filled) at SL; set so 99% check passes.
-                                    state.sl_cumulative_filled = sl.size;
-                                    info!(
-                                        "[IntervalSniper] SL position closed (balance dust {}, had partial TP), allowing re-entry",
-                                        fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
-                                    );
+                                    // Partial TP: remaining sold at SL. Verify REST before closing.
+                                    let order_confirmed_filled = match clob.get_order(oid).await {
+                                        Ok(info) => {
+                                            let status = info.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                            status.contains("MATCHED") || status.eq_ignore_ascii_case("FILLED")
+                                        }
+                                        Err(_) => false,
+                                    };
+                                    if order_confirmed_filled {
+                                        state.sl_cumulative_filled = sl.size;
+                                        info!(
+                                            "[IntervalSniper] SL position closed (balance dust {}, had partial TP, REST confirmed), allowing re-entry",
+                                            fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
+                                        );
+                                    }
                                 }
                             }
 
