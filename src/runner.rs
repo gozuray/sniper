@@ -2856,10 +2856,83 @@ pub async fn run() -> Result<()> {
                                         && state.tp_cumulative_filled.is_zero();
                                     let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
                                     if stale_available && !dust_after_sl {
-                                        debug!(
-                                            "[IntervalSniper] TP skip: position_remaining {} >= MIN but available gives size {} (stale balance?), waiting",
-                                            fmt_decimal_2(&position_size_real), fmt_decimal_2(&size)
+                                        // Balance not yet updated after re-entry (e.g. WS still shows 0.01 from previous SL dust).
+                                        // Place TP using position size from state so we don't block TP until balance propagates.
+                                        let size_to_place = floor_to_decimals(
+                                            position_size_real.min(state.config.size_shares),
+                                            SELL_SIZE_DECIMALS,
                                         );
+                                        if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                            debug!(
+                                                "[IntervalSniper] TP using position size {} (available stale {}) — placing limit",
+                                                fmt_decimal_2(&size_to_place), fmt_decimal_2(&size)
+                                            );
+                                            let price = target;
+                                            let result = clob
+                                                .place_sell_order(
+                                                    &tp.token_id,
+                                                    price,
+                                                    size_to_place.clone(),
+                                                    crate::types::SellOrderTimeInForce::Gtc,
+                                                )
+                                                .await?;
+                                            if let Some(ref mut log) = state.session_log {
+                                                let _ = log.log_order_submitted(
+                                                    &market.slug,
+                                                    market.interval_start_unix,
+                                                    market.close_time_unix,
+                                                    now_ms_u,
+                                                    &tp.token_id,
+                                                    "SELL",
+                                                    "GTC",
+                                                    price,
+                                                    size_to_place.clone(),
+                                                    result.order_id.as_deref(),
+                                                    result.http_status,
+                                                    result.success,
+                                                    result.error_msg.as_deref(),
+                                                );
+                                            }
+                                            if result.success {
+                                                state.tp_limit_order_id = result.order_id.clone();
+                                                state.tp_placed_size = Some(size_to_place.clone());
+                                                state.tp_limit_balance_retries = 0;
+                                                info!(
+                                                    "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (cancel if price drops to entry {})",
+                                                    fmt_price(Some(&price)),
+                                                    fmt_decimal_2(&size_to_place),
+                                                    result.order_id,
+                                                    fmt_price(Some(&entry_price))
+                                                );
+                                            } else if is_position_closed_error(result.error_msg.as_deref()) {
+                                                state.tp_limit_balance_retries += 1;
+                                                if state.tp_limit_balance_retries == 1 {
+                                                    warn!(
+                                                        "[IntervalSniper] TP limit balance/allowance error (retry {}), will retry with actual balance next tick (do not cancel — would cancel resting GTC entry)",
+                                                        state.tp_limit_balance_retries
+                                                    );
+                                                    state.allowance_cache = None;
+                                                    match clob.get_balance_allowance(&tp.token_id).await {
+                                                        Ok(raw) => warn!(
+                                                            "[IntervalSniper] balance-allowance for TP token: {}",
+                                                            raw.chars().take(300).collect::<String>()
+                                                        ),
+                                                        Err(e) => warn!(
+                                                            "[IntervalSniper] could not fetch balance-allowance: {}",
+                                                            e
+                                                        ),
+                                                    }
+                                                }
+                                            } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
+                                                state.tp_limit_balance_retries += 1;
+                                                state.allowance_cache = None;
+                                            }
+                                        } else {
+                                            debug!(
+                                                "[IntervalSniper] TP skip: position_remaining {} >= MIN but available gives size {} (stale balance?), waiting",
+                                                fmt_decimal_2(&position_size_real), fmt_decimal_2(&size)
+                                            );
+                                        }
                                     } else if dust_after_sl {
                                         // Dust left after SL filled (e.g. SL size was 5.99, left 0.01). Do not report as TP.
                                         let exit_price = state.sl_limit_order_price.unwrap_or(target);
