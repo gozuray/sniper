@@ -18,6 +18,8 @@ const USDC_E_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const PARENT_COLLECTION_ID: [u8; 32] = [0u8; 32];
 /// Binary markets: redeem both outcome index sets (only winning pays out).
 const INDEX_SETS: [u64; 2] = [1, 2];
+/// Default gas price for redeem txs (gwei). Polygon often requires >= 25 gwei.
+const DEFAULT_REDEEM_GAS_PRICE_GWEI: u64 = 30;
 
 abigen!(
     ConditionalTokens,
@@ -107,12 +109,20 @@ pub async fn redeem_positions(
     let collateral = Address::from_str(USDC_E_ADDRESS).context("USDC.e address")?;
     let contract = ConditionalTokens::new(ctf_addr, client.into());
 
+    let gas_price_gwei: u64 = std::env::var("REDEEM_GAS_PRICE_GWEI")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_REDEEM_GAS_PRICE_GWEI)
+        .max(25);
+    let gas_price = ethers::types::U256::from(gas_price_gwei) * ethers::types::U256::from(1_000_000_000u64);
+
     let parent_b32: [u8; 32] = PARENT_COLLECTION_ID;
     let condition_b32: [u8; 32] = condition_bytes;
     let index_sets: Vec<ethers::types::U256> = INDEX_SETS.iter().map(|&u| u.into()).collect();
 
     match contract
         .redeem_positions(collateral, parent_b32, condition_b32, index_sets)
+        .gas_price(gas_price)
         .send()
         .await
     {
