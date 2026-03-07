@@ -28,6 +28,10 @@ fn asset_from_slug(slug: &str) -> &'static str {
     }
 }
 
+fn fmt_decimal_2(d: &Decimal) -> String {
+    format!("{}", d.round_dp(2))
+}
+
 /// Exit type for a closed position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitType {
@@ -203,6 +207,9 @@ impl SessionLog {
     ) -> Result<()> {
         let duration_sec = (exit_time_ms.saturating_sub(entry_time_ms)) / 1000;
         let pnl = executed_size * (exit_price - entry_price);
+        // Real transaction values as shown in Polymarket history / blockchain (USDC).
+        let entry_value_usd = executed_size * entry_price;
+        let exit_value_usd = executed_size * exit_price;
 
         match exit_type {
             ExitType::TakeProfit => self.tp_count += 1,
@@ -228,6 +235,8 @@ impl SessionLog {
             "side": side_str(side),
             "entry_price": entry_price.to_string(),
             "exit_price": exit_price.to_string(),
+            "entry_value_usd": entry_value_usd.to_string(),
+            "exit_value_usd": exit_value_usd.to_string(),
             "entry_time_ms": entry_time_ms,
             "exit_time_ms": exit_time_ms,
             "exit_type": exit_type_str(exit_type),
@@ -248,27 +257,34 @@ impl SessionLog {
         self.write_line(&obj)?;
         if let Some(ref t) = self.telegram {
             let interval_label = format!("{} · {}", asset_from_slug(slug), interval_lisbon_time(interval_start_unix));
+            // Real USDC values (as in Polymarket history): cost = size*entry_price, proceeds = size*exit_price.
             let msg = match self.telegram_msg_format {
                 1 => format!(
-                    "📌 Close\n{} · {} {}\nPnL: ${}",
+                    "📌 Close\n{} · {} {}\n├ Entrada: ${}  →  Venta: ${}\n└ PnL: ${}",
                     interval_label,
                     side_str(side),
                     exit_type_str(exit_type),
-                    pnl
+                    fmt_decimal_2(&entry_value_usd),
+                    fmt_decimal_2(&exit_value_usd),
+                    fmt_decimal_2(&pnl)
                 ),
                 2 => format!(
-                    "━━━━━━━━━━━━━━━━\n📊 Position closed\n━━━━━━━━━━━━━━━━\n├ Interval: {} 5m · {}\n├ Side: {} · {}\n└ PnL: ${}\n━━━━━━━━━━━━━━━━",
+                    "━━━━━━━━━━━━━━━━\n📊 Position closed\n━━━━━━━━━━━━━━━━\n├ Interval: {} 5m · {}\n├ Side: {} · {}\n├ Entrada (coste): ${}\n├ Venta (recibido): ${}\n└ PnL: ${}\n━━━━━━━━━━━━━━━━",
                     asset_from_slug(slug),
                     interval_lisbon_time(interval_start_unix),
                     side_str(side),
                     exit_type_str(exit_type),
-                    pnl
+                    fmt_decimal_2(&entry_value_usd),
+                    fmt_decimal_2(&exit_value_usd),
+                    fmt_decimal_2(&pnl)
                 ),
                 _ => format!(
-                    "✓ {} {}  ${}  ({})",
+                    "✓ {} {}  Entrada ${} → Venta ${}  PnL ${}  ({})",
                     side_str(side),
                     exit_type_str(exit_type),
-                    pnl,
+                    fmt_decimal_2(&entry_value_usd),
+                    fmt_decimal_2(&exit_value_usd),
+                    fmt_decimal_2(&pnl),
                     interval_label
                 ),
             };
