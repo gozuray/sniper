@@ -82,7 +82,7 @@ pub struct Config {
     pub session_log_dir: String,
     /// Run CTF redeemPositions every redeem_interval_sec for resolved markets.
     pub redeem_enabled: bool,
-    /// Interval in seconds between redeem runs (default 600 = 10 min).
+    /// Interval in seconds between redeem runs (default 300 = 5 min).
     pub redeem_interval_sec: u64,
 }
 

@@ -160,6 +160,6 @@ pub fn load_config() -> Result<Config> {
         session_log_enabled: env_bool("MM_SESSION_LOG", false),
         session_log_dir: env("MM_SESSION_LOG_DIR", "logs").to_string(),
         redeem_enabled: env_bool("MM_REDEEM_ENABLED", true),
-        redeem_interval_sec: env_u64("MM_REDEEM_INTERVAL_SEC", 600).max(60),
+        redeem_interval_sec: env_u64("MM_REDEEM_INTERVAL_SEC", 300).max(60),
     })
 }

@@ -5,7 +5,7 @@ use crate::clob::{ClobClient, LimitOrderParams, OrderSide, OrderType};
 use crate::clob_ws_book::ClobWsBook;
 use crate::clob_ws_user::ClobWsUser;
 use crate::config::{current_5min_slug, load_config};
-use crate::market::{fetch_market_by_slug, fetch_resolved_condition_ids};
+use crate::market::fetch_market_by_slug;
 use crate::orderbook::fetch_top_of_book;
 use crate::redeem;
 use crate::session_log::{ExitType, SessionLog};
@@ -14,6 +14,7 @@ use crate::types::{
     OrderStrategy,
 };
 use anyhow::Result;
+use ethers::signers::Signer;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -711,51 +712,67 @@ fn choose_side_by_bid(
     candidates.into_iter().next()
 }
 
-/// Number of past 5-min intervals to try redeeming each run (e.g. 24 = 2 hours).
-const REDEEM_LAST_N_INTERVALS: u32 = 24;
 /// Delay between redeem tx submissions to avoid RPC rate limit.
 const REDEEM_DELAY_BETWEEN_TXS_MS: u64 = 500;
 
+async fn redeem_run_once(
+    http: &Client,
+    clob_host: &str,
+    rpc_url: &str,
+    wallet: &ethers::signers::LocalWallet,
+) {
+    let user_addr = format!("{:#x}", wallet.address());
+    match redeem::fetch_resolved_condition_ids_from_positions(http, clob_host, &user_addr).await {
+        Ok(condition_ids) => {
+            if condition_ids.is_empty() {
+                debug!("[Redeem] no resolved positions this run");
+                return;
+            }
+            info!(
+                "[Redeem] run: {} resolved market(s) to try",
+                condition_ids.len()
+            );
+            for cid in &condition_ids {
+                match redeem::redeem_positions(wallet, rpc_url, cid).await {
+                    Ok(success) => {
+                        if success {
+                            info!(
+                                "[Redeem] redeemed condition_id={}..",
+                                &cid[..cid.len().min(18)]
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[Redeem] failed condition_id={}..: {}",
+                            &cid[..cid.len().min(18)],
+                            e
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(REDEEM_DELAY_BETWEEN_TXS_MS)).await;
+            }
+        }
+        Err(e) => {
+            warn!("[Redeem] fetch positions failed: {}", e);
+        }
+    }
+}
+
 async fn redeem_loop(
     http: Client,
-    gamma_base_url: String,
-    interval_market: crate::types::IntervalMarketAsset,
+    clob_host: String,
     rpc_url: String,
     wallet: ethers::signers::LocalWallet,
     redeem_interval_sec: u64,
 ) {
+    // Run once immediately (like the JS: redeemAllWinnings(); setInterval(...)).
+    redeem_run_once(&http, &clob_host, &rpc_url, &wallet).await;
+
     let mut interval = tokio::time::interval(Duration::from_secs(redeem_interval_sec));
-    interval.tick().await; // first tick fires immediately, so skip and wait one period
     loop {
         interval.tick().await;
-        let condition_ids = fetch_resolved_condition_ids(
-            &http,
-            &gamma_base_url,
-            interval_market,
-            REDEEM_LAST_N_INTERVALS,
-        )
-        .await;
-        if condition_ids.is_empty() {
-            debug!("[Redeem] no resolved condition IDs this run");
-            continue;
-        }
-        info!(
-            "[Redeem] run: {} condition(s) to try",
-            condition_ids.len()
-        );
-        for cid in &condition_ids {
-            match redeem::redeem_positions(&wallet, &rpc_url, cid).await {
-                Ok(success) => {
-                    if success {
-                        info!("[Redeem] redeemed condition_id={}..", &cid[..cid.len().min(18)]);
-                    }
-                }
-                Err(e) => {
-                    warn!("[Redeem] failed condition_id={}..: {}", &cid[..cid.len().min(18)], e);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(REDEEM_DELAY_BETWEEN_TXS_MS)).await;
-        }
+        redeem_run_once(&http, &clob_host, &rpc_url, &wallet).await;
     }
 }
 
@@ -780,22 +797,14 @@ pub async fn run() -> Result<()> {
                 .ok();
             if let Some(wallet) = wallet {
                 let http_redeem = http.clone();
-                let gamma_base_url = config.gamma_base_url.clone();
-                let interval_market = config.interval_market;
+                let clob_host = clob_host.clone();
                 let redeem_interval_sec = config.redeem_interval_sec;
                 tokio::spawn(async move {
-                    redeem_loop(
-                        http_redeem,
-                        gamma_base_url,
-                        interval_market,
-                        rpc_url,
-                        wallet,
-                        redeem_interval_sec,
-                    )
-                    .await
+                    redeem_loop(http_redeem, clob_host, rpc_url, wallet, redeem_interval_sec)
+                        .await
                 });
                 info!(
-                    "[IntervalSniper] redeem task started: every {}s for resolved positions (CTF)",
+                    "[IntervalSniper] redeem task started: every {}s for all resolved positions (CLOB + CTF)",
                     redeem_interval_sec
                 );
             } else {

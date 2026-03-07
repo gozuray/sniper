@@ -1,10 +1,12 @@
 //! Redeem resolved Conditional Token positions on Polygon (CTF.redeemPositions).
-//! Runs every 10 minutes for resolved markets (e.g. past 5m interval markets).
+//! Auto-claim every N minutes for all closed markets (from CLOB /positions?user=...).
 
 use anyhow::{Context, Result};
 use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::types::Address;
+use reqwest::Client;
+use serde::Deserialize;
 use std::str::FromStr;
 use tracing::{info, warn};
 
@@ -23,6 +25,64 @@ abigen!(
         function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external
     ]"#
 );
+
+/// CLOB API: position item (GET /positions?user=...).
+#[derive(Debug, Deserialize)]
+struct ClobPosition {
+    #[serde(rename = "conditionId")]
+    condition_id: Option<String>,
+    #[serde(default)]
+    market: Option<ClobPositionMarket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClobPositionMarket {
+    resolved: Option<bool>,
+}
+
+/// Fetch all resolved market condition IDs for a user from CLOB positions API.
+/// GET {clob_host}/positions?user={address}; filter by market.resolved == true.
+pub async fn fetch_resolved_condition_ids_from_positions(
+    http: &Client,
+    clob_host: &str,
+    user_address: &str,
+) -> Result<Vec<String>> {
+    let base = clob_host.trim_end_matches('/');
+    let url = format!(
+        "{}/positions?user={}",
+        base,
+        urlencoding::encode(user_address)
+    );
+    let positions: Vec<ClobPosition> = http
+        .get(&url)
+        .send()
+        .await
+        .context("CLOB positions request")?
+        .error_for_status()
+        .context("CLOB positions error status")?
+        .json()
+        .await
+        .context("CLOB positions JSON")?;
+
+    let mut condition_ids: Vec<String> = positions
+        .into_iter()
+        .filter(|p| {
+            p.market
+                .as_ref()
+                .and_then(|m| m.resolved)
+                .unwrap_or(false)
+        })
+        .filter_map(|p| {
+            p.condition_id
+                .filter(|id| !id.trim().is_empty())
+        })
+        .collect();
+
+    // Deduplicate by condition_id (user can have multiple positions per market).
+    condition_ids.sort();
+    condition_ids.dedup();
+    Ok(condition_ids)
+}
 
 /// Parse condition_id (hex with or without 0x) into bytes32.
 fn condition_id_to_bytes32(condition_id: &str) -> Result<[u8; 32]> {
