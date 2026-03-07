@@ -161,7 +161,13 @@ pub fn load_config() -> Result<Config> {
         session_log_dir: env("MM_SESSION_LOG_DIR", "logs").to_string(),
         redeem_enabled: env_bool("MM_REDEEM_ENABLED", true),
         redeem_interval_sec: env_u64("MM_REDEEM_INTERVAL_SEC", 300).max(60),
-        telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.is_empty()),
-        telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty()),
+        telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     })
 }

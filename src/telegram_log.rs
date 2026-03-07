@@ -33,9 +33,15 @@ impl TelegramLog {
 
         let handle = tokio::spawn(async move {
             let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
+                .unwrap_or_else(|_| {
+                    reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(15))
+                        .build()
+                        .unwrap_or_else(|_| reqwest::Client::new())
+                });
 
             while let Some(text) = rx.recv().await {
                 let text = if text.len() > TELEGRAM_MAX_TEXT_LEN {
@@ -80,6 +86,7 @@ async fn send_message(
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
     let res = client
         .post(&url)
+        .timeout(std::time::Duration::from_secs(15))
         .form(&[("chat_id", chat_id), ("text", text)])
         .send()
         .await?;
