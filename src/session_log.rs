@@ -1,6 +1,8 @@
 //! Session log: JSONL file per run with position closes, interval summaries, and session stats.
 //! One JSON object per line for easy append and parsing.
+//! Optionally forwards short summaries to Telegram (non-blocking, no delay in hot path).
 
+use crate::telegram_log::TelegramLog;
 use crate::types::EntrySide;
 use anyhow::Result;
 use rust_decimal::Decimal;
@@ -37,6 +39,7 @@ fn dec_opt(o: Option<Decimal>) -> Option<String> {
 }
 
 /// Session logger: appends JSONL lines to a file. Tracks counts for session summary.
+/// If telegram is Some, enqueues short summaries (position close, session summary) without blocking.
 pub struct SessionLog {
     file: File,
     session_start_ms: u64,
@@ -44,12 +47,14 @@ pub struct SessionLog {
     sl_count: u32,
     market_close_count: u32,
     total_pnl: Decimal,
+    telegram: Option<TelegramLog>,
 }
 
 impl SessionLog {
     /// Create a new session log in `dir` with filename `session_YYYY-MM-DDTHH-MM-SS.jsonl`.
     /// Creates `dir` if it does not exist. Returns None if disabled or creation fails.
-    pub fn new(session_start_ms: u64, dir: &str) -> Result<Option<Self>> {
+    /// If `telegram` is Some, short summaries are enqueued to Telegram (non-blocking).
+    pub fn new(session_start_ms: u64, dir: &str, telegram: Option<TelegramLog>) -> Result<Option<Self>> {
         let path = Path::new(dir);
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -74,6 +79,7 @@ impl SessionLog {
             sl_count: 0,
             market_close_count: 0,
             total_pnl: Decimal::ZERO,
+            telegram,
         }))
     }
 
@@ -213,7 +219,18 @@ impl SessionLog {
             "ranged_01_99_up": ranged_01_99_up,
             "ranged_01_99_down": ranged_01_99_down,
         });
-        self.write_line(&obj)
+        self.write_line(&obj)?;
+        if let Some(ref t) = self.telegram {
+            let short = format!(
+                "Close {} {} {} PnL=${}",
+                slug,
+                side_str(side),
+                exit_type_str(exit_type),
+                pnl
+            );
+            t.send(short);
+        }
+        Ok(())
     }
 
     /// Log interval summary (price range observed). Call when leaving an interval.
@@ -278,7 +295,23 @@ impl SessionLog {
             "win_rate": if win_rate.is_nan() { serde_json::Value::Null } else { serde_json::json!(win_rate) },
             "total_pnl_usd": self.total_pnl.to_string(),
         });
-        self.write_line(&obj)
+        self.write_line(&obj)?;
+        if let Some(ref t) = self.telegram {
+            let short = format!(
+                "Session summary: TP={} SL={} MC={} win_rate={:.2} total_pnl=${}",
+                self.tp_count,
+                self.sl_count,
+                self.market_close_count,
+                if closed_count > 0 && tp_sl_count > 0 {
+                    (self.tp_count as f64) / (tp_sl_count as f64)
+                } else {
+                    f64::NAN
+                },
+                self.total_pnl
+            );
+            t.send(short);
+        }
+        Ok(())
     }
 }
 

@@ -9,6 +9,7 @@ use crate::market::fetch_market_by_slug;
 use crate::orderbook::fetch_top_of_book;
 use crate::redeem;
 use crate::session_log::{ExitType, SessionLog};
+use crate::telegram_log::TelegramLog;
 use crate::types::{
     Config, EntrySide, LastBuyOrder, PendingAutoSell, PendingStopLoss, ResolvedMarket, TopOfBook,
     OrderStrategy,
@@ -185,6 +186,10 @@ struct RunnerState {
     pending_gtc_fill_deltas: Vec<Decimal>,
     /// Cached result of get_available_balance for the current position token (TTL 3s).
     allowance_cache: Option<(Decimal, Instant)>,
+    /// Optional Telegram log: enqueues messages in background (no delay in hot path).
+    telegram: Option<TelegramLog>,
+    /// Keep the Telegram sender task alive.
+    telegram_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn now_unix() -> u64 {
@@ -883,11 +888,27 @@ pub async fn run() -> Result<()> {
         pending_gtc_last_observed_filled: None,
         pending_gtc_fill_deltas: vec![],
         allowance_cache: None,
+        telegram: None,
+        telegram_handle: None,
     };
+
+    // Telegram: background task sends logs; main loop only enqueues (try_send), so no delay.
+    if config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some() {
+        let (telegram, handle) = TelegramLog::new(
+            config.telegram_bot_token.clone(),
+            config.telegram_chat_id.clone(),
+        );
+        state.telegram = Some(telegram.clone());
+        state.telegram_handle = Some(handle.unwrap());
+    }
 
     if config.session_log_enabled {
         let session_start_ms = now_ms();
-        state.session_log = SessionLog::new(session_start_ms, &config.session_log_dir)?;
+        state.session_log = SessionLog::new(
+            session_start_ms,
+            &config.session_log_dir,
+            state.telegram.clone(),
+        )?;
     }
 
     info!(

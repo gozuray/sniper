@@ -11,6 +11,7 @@ mod redeem;
 mod runner;
 mod session_log;
 mod signing;
+mod telegram_log;
 mod types;
 
 #[tokio::main]

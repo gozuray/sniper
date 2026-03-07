@@ -84,6 +84,10 @@ pub struct Config {
     pub redeem_enabled: bool,
     /// Interval in seconds between redeem runs (default 300 = 5 min).
     pub redeem_interval_sec: u64,
+    /// If set, enqueue log messages to Telegram in a background task (no delay in main loop).
+    pub telegram_bot_token: Option<String>,
+    /// Telegram chat ID to send logs to (required if telegram_bot_token is set).
+    pub telegram_chat_id: Option<String>,
 }
 
 /// Resolved market from Gamma API.
