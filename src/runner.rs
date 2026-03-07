@@ -2204,19 +2204,31 @@ pub async fn run() -> Result<()> {
                                                 crate::types::SellOrderTimeInForce::Gtc,
                                             )
                                             .await?;
-                                        // Retry up to 2x after delay for transient balance/allowance lag (e.g. cancel propagation).
-                                        for _ in 0..2 {
+                                        // Retry up to 3x with delay for transient balance/allowance lag
+                                        // (e.g. GTC buy allowance not yet propagated, or TP cancel lag).
+                                        // IMPORTANT: "not enough balance/allowance" does NOT necessarily mean
+                                        // the position is closed — it can be a lag. Always verify balance first.
+                                        for _ in 0..3 {
                                             if result.success {
                                                 break;
                                             }
                                             if is_position_closed_error(result.error_msg.as_deref()) {
-                                                // Position already closed on exchange (SL filled via WS); stop retrying.
-                                                state.sl_cumulative_filled = sl.size.clone();
+                                                // Verify actual balance before concluding position is closed.
+                                                // If balance > dust, this is a lag error — wait and retry.
                                                 state.allowance_cache = None;
-                                                break;
+                                                let balance_check = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                                if balance_check.map_or(true, |a| a <= DUST_THRESHOLD) {
+                                                    // Balance is truly zero/dust — position closed externally.
+                                                    state.sl_cumulative_filled = sl.size.clone();
+                                                    break;
+                                                }
+                                                warn!(
+                                                    "[IntervalSniper] SL 'not enough balance' but balance={} — allowance lag, retrying",
+                                                    fmt_decimal_2(&balance_check.unwrap_or(Decimal::ZERO))
+                                                );
                                             }
-                                            // Transient error: wait for cancel to propagate and retry.
-                                            tokio::time::sleep(Duration::from_millis(SL_FOK_RETRY_DELAY_MS)).await;
+                                            // Wait for allowance propagation (longer than SL retry; covers GTC buy lag).
+                                            tokio::time::sleep(Duration::from_millis(300)).await;
                                             state.allowance_cache = None;
                                             result = clob
                                                 .place_sell_order(
@@ -2236,8 +2248,18 @@ pub async fn run() -> Result<()> {
                                                 fmt_price(Some(&price)), fmt_decimal_2(&size), result.order_id
                                             );
                                         } else if is_position_closed_error(result.error_msg.as_deref()) {
-                                            state.sl_cumulative_filled = sl.size.clone();
+                                            // After all retries: verify balance one last time.
                                             state.allowance_cache = None;
+                                            let final_balance = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                            if final_balance.map_or(true, |a| a <= DUST_THRESHOLD) {
+                                                state.sl_cumulative_filled = sl.size.clone();
+                                                state.allowance_cache = None;
+                                            } else {
+                                                warn!(
+                                                    "[IntervalSniper] SL place failed after 3 retries (balance={}), will retry next tick",
+                                                    fmt_decimal_2(&final_balance.unwrap_or(Decimal::ZERO))
+                                                );
+                                            }
                                         }
                                     }
                                 }
