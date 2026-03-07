@@ -725,7 +725,7 @@ async fn redeem_run_once(
     match redeem::fetch_resolved_condition_ids_from_positions(http, clob_host, &user_addr).await {
         Ok(condition_ids) => {
             if condition_ids.is_empty() {
-                debug!("[Redeem] no resolved positions this run");
+                info!("[Redeem] no redeemable positions this run (Data API checked)");
                 return;
             }
             info!(

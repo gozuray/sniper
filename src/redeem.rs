@@ -1,5 +1,5 @@
 //! Redeem resolved Conditional Token positions on Polygon (CTF.redeemPositions).
-//! Auto-claim every N minutes for all closed markets (from CLOB /positions?user=...).
+//! Auto-claim every N minutes for all closed markets (from Data API /positions?user=...).
 
 use anyhow::{Context, Result};
 use ethers::contract::abigen;
@@ -26,52 +26,46 @@ abigen!(
     ]"#
 );
 
-/// CLOB API: position item (GET /positions?user=...).
+/// Data API: position item (GET https://data-api.polymarket.com/positions?user=...).
 #[derive(Debug, Deserialize)]
-struct ClobPosition {
+struct DataApiPosition {
     #[serde(rename = "conditionId")]
     condition_id: Option<String>,
     #[serde(default)]
-    market: Option<ClobPositionMarket>,
+    redeemable: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ClobPositionMarket {
-    resolved: Option<bool>,
-}
+/// Data API base URL for positions (not CLOB).
+const DATA_API_BASE: &str = "https://data-api.polymarket.com";
 
-/// Fetch all resolved market condition IDs for a user from CLOB positions API.
-/// GET {clob_host}/positions?user={address}; filter by market.resolved == true.
+/// Fetch all redeemable condition IDs for a user from Polymarket Data API.
+/// Uses GET {data_api}/positions?user={address}&redeemable=true so only claimable positions are returned.
 pub async fn fetch_resolved_condition_ids_from_positions(
     http: &Client,
-    clob_host: &str,
+    _clob_host: &str,
     user_address: &str,
 ) -> Result<Vec<String>> {
-    let base = clob_host.trim_end_matches('/');
+    let base = std::env::var("POLYMARKET_DATA_API_URL").unwrap_or_else(|_| DATA_API_BASE.to_string());
+    let base = base.trim_end_matches('/');
     let url = format!(
-        "{}/positions?user={}",
+        "{}/positions?user={}&redeemable=true&limit=500",
         base,
         urlencoding::encode(user_address)
     );
-    let positions: Vec<ClobPosition> = http
+    let positions: Vec<DataApiPosition> = http
         .get(&url)
         .send()
         .await
-        .context("CLOB positions request")?
+        .context("Data API positions request")?
         .error_for_status()
-        .context("CLOB positions error status")?
+        .context("Data API positions error status")?
         .json()
         .await
-        .context("CLOB positions JSON")?;
+        .context("Data API positions JSON")?;
 
     let mut condition_ids: Vec<String> = positions
         .into_iter()
-        .filter(|p| {
-            p.market
-                .as_ref()
-                .and_then(|m| m.resolved)
-                .unwrap_or(false)
-        })
+        .filter(|p| p.redeemable.unwrap_or(false))
         .filter_map(|p| {
             p.condition_id
                 .filter(|id| !id.trim().is_empty())
