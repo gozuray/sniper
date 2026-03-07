@@ -88,6 +88,8 @@ pub struct Config {
     pub telegram_bot_token: Option<String>,
     /// Telegram chat ID to send logs to (required if telegram_bot_token is set).
     pub telegram_chat_id: Option<String>,
+    /// Telegram message format: 1=compact, 2=card, 3=minimal (default 1).
+    pub telegram_msg_format: u8,
 }
 
 /// Resolved market from Gamma API.

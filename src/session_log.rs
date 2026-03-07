@@ -5,11 +5,28 @@
 use crate::telegram_log::TelegramLog;
 use crate::types::EntrySide;
 use anyhow::Result;
+use chrono_tz::Europe::Lisbon;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+
+/// Format interval start (unix) as Lisbon time, e.g. "07 Mar 14:35".
+fn interval_lisbon_time(interval_start_unix: u64) -> String {
+    chrono::DateTime::from_timestamp(interval_start_unix as i64, 0)
+        .map(|utc| utc.with_timezone(&Lisbon).format("%d %b %H:%M").to_string())
+        .unwrap_or_else(|| interval_start_unix.to_string())
+}
+
+/// Asset label from slug (e.g. btc-updown-5m-123 -> "BTC", sol-updown-5m-123 -> "SOL").
+fn asset_from_slug(slug: &str) -> &'static str {
+    if slug.starts_with("sol-") {
+        "SOL"
+    } else {
+        "BTC"
+    }
+}
 
 /// Exit type for a closed position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,13 +65,21 @@ pub struct SessionLog {
     market_close_count: u32,
     total_pnl: Decimal,
     telegram: Option<TelegramLog>,
+    /// 1=compact, 2=card, 3=minimal
+    telegram_msg_format: u8,
 }
 
 impl SessionLog {
     /// Create a new session log in `dir` with filename `session_YYYY-MM-DDTHH-MM-SS.jsonl`.
     /// Creates `dir` if it does not exist. Returns None if disabled or creation fails.
     /// If `telegram` is Some, short summaries are enqueued to Telegram (non-blocking).
-    pub fn new(session_start_ms: u64, dir: &str, telegram: Option<TelegramLog>) -> Result<Option<Self>> {
+    /// `telegram_msg_format`: 1=compact, 2=card, 3=minimal.
+    pub fn new(
+        session_start_ms: u64,
+        dir: &str,
+        telegram: Option<TelegramLog>,
+        telegram_msg_format: u8,
+    ) -> Result<Option<Self>> {
         let path = Path::new(dir);
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -80,6 +105,7 @@ impl SessionLog {
             market_close_count: 0,
             total_pnl: Decimal::ZERO,
             telegram,
+            telegram_msg_format: telegram_msg_format.min(1).max(3),
         }))
     }
 
@@ -221,14 +247,32 @@ impl SessionLog {
         });
         self.write_line(&obj)?;
         if let Some(ref t) = self.telegram {
-            let short = format!(
-                "Close {} {} {} PnL=${}",
-                slug,
-                side_str(side),
-                exit_type_str(exit_type),
-                pnl
-            );
-            t.send(short);
+            let interval_label = format!("{} · {}", asset_from_slug(slug), interval_lisbon_time(interval_start_unix));
+            let msg = match self.telegram_msg_format {
+                1 => format!(
+                    "📌 Close\n{} · {} {}\nPnL: ${}",
+                    interval_label,
+                    side_str(side),
+                    exit_type_str(exit_type),
+                    pnl
+                ),
+                2 => format!(
+                    "━━━━━━━━━━━━━━━━\n📊 Position closed\n━━━━━━━━━━━━━━━━\n├ Interval: {} 5m · {}\n├ Side: {} · {}\n└ PnL: ${}\n━━━━━━━━━━━━━━━━",
+                    asset_from_slug(slug),
+                    interval_lisbon_time(interval_start_unix),
+                    side_str(side),
+                    exit_type_str(exit_type),
+                    pnl
+                ),
+                _ => format!(
+                    "✓ {} {}  ${}  ({})",
+                    side_str(side),
+                    exit_type_str(exit_type),
+                    pnl,
+                    interval_label
+                ),
+            };
+            t.send(msg);
         }
         Ok(())
     }
@@ -297,19 +341,41 @@ impl SessionLog {
         });
         self.write_line(&obj)?;
         if let Some(ref t) = self.telegram {
-            let short = format!(
-                "Session summary: TP={} SL={} MC={} win_rate={:.2} total_pnl=${}",
-                self.tp_count,
-                self.sl_count,
-                self.market_close_count,
-                if closed_count > 0 && tp_sl_count > 0 {
-                    (self.tp_count as f64) / (tp_sl_count as f64)
-                } else {
-                    f64::NAN
-                },
-                self.total_pnl
-            );
-            t.send(short);
+            let win_rate = if closed_count > 0 && tp_sl_count > 0 {
+                (self.tp_count as f64) / (tp_sl_count as f64)
+            } else {
+                f64::NAN
+            };
+            let win_pct = if win_rate.is_nan() {
+                "—".to_string()
+            } else {
+                format!("{:.0}%", win_rate * 100.0)
+            };
+            let msg = match self.telegram_msg_format {
+                1 => format!(
+                    "📈 Session summary\nTP={}  SL={}  MC={}  ·  Win {}  ·  PnL ${}",
+                    self.tp_count,
+                    self.sl_count,
+                    self.market_close_count,
+                    win_pct,
+                    self.total_pnl
+                ),
+                2 => format!(
+                    "══════════════════\n📈 Session summary\n══════════════════\n├ TP: {}  SL: {}  MC: {}\n├ Win rate: {}\n└ Total PnL: ${}\n══════════════════",
+                    self.tp_count,
+                    self.sl_count,
+                    self.market_close_count,
+                    win_pct,
+                    self.total_pnl
+                ),
+                _ => format!(
+                    "Session · {} trades · {} win · ${}",
+                    closed_count,
+                    win_pct,
+                    self.total_pnl
+                ),
+            };
+            t.send(msg);
         }
         Ok(())
     }

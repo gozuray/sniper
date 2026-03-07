@@ -169,5 +169,6 @@ pub fn load_config() -> Result<Config> {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
+        telegram_msg_format: env_u32("TELEGRAM_MSG_FORMAT", 1).min(1).max(3) as u8,
     })
 }

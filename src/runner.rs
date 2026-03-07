@@ -908,6 +908,7 @@ pub async fn run() -> Result<()> {
             session_start_ms,
             &config.session_log_dir,
             state.telegram.clone(),
+            config.telegram_msg_format,
         )?;
     }
 
