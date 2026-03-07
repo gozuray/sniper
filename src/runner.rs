@@ -2240,18 +2240,31 @@ pub async fn run() -> Result<()> {
                                             }
                                             if is_position_closed_error(result.error_msg.as_deref()) {
                                                 // Verify actual balance before concluding position is closed.
-                                                // If balance > dust, this is a lag error — wait and retry.
-                                                state.allowance_cache = None;
-                                                let balance_check = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                                                if balance_check.map_or(true, |a| a <= DUST_THRESHOLD) {
-                                                    // Balance is truly zero/dust — position closed externally.
-                                                    state.sl_cumulative_filled = sl.size.clone();
-                                                    break;
+                                                // Check WS balance first: REST may lag 1-5s after a recent GTC fill,
+                                                // reporting 0 even though we own the tokens (WS is authoritative here).
+                                                let ws_bal = if let Some(ws) = ws_user_ref {
+                                                    ws.get_balance_for_token(&sl.token_id).await
+                                                } else {
+                                                    None
+                                                };
+                                                if ws_bal.map_or(false, |b| b > DUST_THRESHOLD) {
+                                                    warn!(
+                                                        "[IntervalSniper] SL 'not enough balance' but WS balance={} — allowance lag, retrying",
+                                                        fmt_decimal_2(&ws_bal.unwrap_or(Decimal::ZERO))
+                                                    );
+                                                } else {
+                                                    state.allowance_cache = None;
+                                                    let balance_check = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                                    if balance_check.map_or(true, |a| a <= DUST_THRESHOLD) {
+                                                        // WS and REST both show dust/zero — position closed externally.
+                                                        state.sl_cumulative_filled = sl.size.clone();
+                                                        break;
+                                                    }
+                                                    warn!(
+                                                        "[IntervalSniper] SL 'not enough balance' but balance={} — allowance lag, retrying",
+                                                        fmt_decimal_2(&balance_check.unwrap_or(Decimal::ZERO))
+                                                    );
                                                 }
-                                                warn!(
-                                                    "[IntervalSniper] SL 'not enough balance' but balance={} — allowance lag, retrying",
-                                                    fmt_decimal_2(&balance_check.unwrap_or(Decimal::ZERO))
-                                                );
                                             }
                                             // Wait for allowance propagation (longer than SL retry; covers GTC buy lag).
                                             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2274,17 +2287,29 @@ pub async fn run() -> Result<()> {
                                                 fmt_price(Some(&price)), fmt_decimal_2(&size), result.order_id
                                             );
                                         } else if is_position_closed_error(result.error_msg.as_deref()) {
-                                            // After all retries: verify balance one last time.
-                                            state.allowance_cache = None;
-                                            let final_balance = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                                            if final_balance.map_or(true, |a| a <= DUST_THRESHOLD) {
-                                                state.sl_cumulative_filled = sl.size.clone();
-                                                state.allowance_cache = None;
+                                            // After all retries: check WS first, then REST.
+                                            let ws_bal_final = if let Some(ws) = ws_user_ref {
+                                                ws.get_balance_for_token(&sl.token_id).await
                                             } else {
+                                                None
+                                            };
+                                            if ws_bal_final.map_or(false, |b| b > DUST_THRESHOLD) {
                                                 warn!(
-                                                    "[IntervalSniper] SL place failed after 3 retries (balance={}), will retry next tick",
-                                                    fmt_decimal_2(&final_balance.unwrap_or(Decimal::ZERO))
+                                                    "[IntervalSniper] SL place failed after 3 retries but WS balance={} — will retry next tick",
+                                                    fmt_decimal_2(&ws_bal_final.unwrap_or(Decimal::ZERO))
                                                 );
+                                            } else {
+                                                state.allowance_cache = None;
+                                                let final_balance = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                                if final_balance.map_or(true, |a| a <= DUST_THRESHOLD) {
+                                                    state.sl_cumulative_filled = sl.size.clone();
+                                                    state.allowance_cache = None;
+                                                } else {
+                                                    warn!(
+                                                        "[IntervalSniper] SL place failed after 3 retries (balance={}), will retry next tick",
+                                                        fmt_decimal_2(&final_balance.unwrap_or(Decimal::ZERO))
+                                                    );
+                                                }
                                             }
                                         }
                                     }
