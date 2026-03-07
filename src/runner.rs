@@ -921,7 +921,7 @@ pub async fn run() -> Result<()> {
                 state.pending_gtc_order_id.as_ref(),
                 state.ws_user.as_ref().map(|a| a.as_ref()),
             ) {
-                if let Some(filled_size) = ws_user.get_order_filled_size(order_id).await {
+                if let Some((filled_size, ws_event_type)) = ws_user.get_order_filled_size_with_type(order_id).await {
                     let requested = state
                         .pending_gtc_requested_size
                         .as_ref()
@@ -1008,10 +1008,11 @@ pub async fn run() -> Result<()> {
                             EntrySide::Down => "Down",
                         };
                         info!(
-                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: user WS)   fill_lag={}ms   TP size={} ({}%)   SL size={} ({}%)",
+                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: WS {})   fill_lag={}ms   TP size={} ({}%)   SL size={} ({}%)",
                             side_str,
                             fmt_decimal_2(&entry_price),
                             fmt_decimal_2(&filled),
+                            ws_event_type,
                             fill_lag_ms,
                             fmt_decimal_2(&tp_size),
                             state.config.auto_sell_quantity_percent,

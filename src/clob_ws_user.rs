@@ -324,6 +324,15 @@ impl ClobWsUser {
             .map(|s| s.size_matched)
     }
 
+    /// Same as `get_order_filled_size` but also returns the event type ("TRADE" | "UPDATE" | "PLACEMENT" | ...).
+    pub async fn get_order_filled_size_with_type(&self, order_id: &str) -> Option<(Decimal, String)> {
+        let key = normalize_order_id(order_id);
+        let map = self.state.read().await;
+        map.get(&key)
+            .filter(|s| s.size_matched > Decimal::ZERO)
+            .map(|s| (s.size_matched, s.order_type.clone()))
+    }
+
     /// Same as `get_order_filled_size_sell` but also returns the event type ("TRADE" | "UPDATE" | "CANCELLATION").
     pub async fn get_order_filled_size_sell_with_type(&self, order_id: &str) -> Option<(Decimal, String)> {
         let key = normalize_order_id(order_id);
