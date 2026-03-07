@@ -1955,8 +1955,8 @@ pub async fn run() -> Result<()> {
                                     if delta > Decimal::ZERO {
                                         state.sl_cumulative_filled += delta;
                                         state.sl_last_order_filled = filled_this_order;
-                                        debug!(
-                                            "[IntervalSniper] SL limit fill +{} (total {}/{}), order_id={}",
+                                        info!(
+                                            "[IntervalSniper] SL fill via WS: +{} (total {}/{}), order_id={}",
                                             fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
                                         );
                                     }
@@ -2504,9 +2504,12 @@ pub async fn run() -> Result<()> {
                                 let tp_size_for_check = state.tp_placed_size.unwrap_or(tp.size.clone());
                                 match ws_user.get_order_filled_size_sell(oid).await {
                                     Some(filled) if filled >= tp_size_for_check * dec!(0.99) => {
-                                        let bid_at_target = best_bid >= target - TICK_SIZE;
-                                        if bid_at_target {
-                                            // Verificar con REST que la orden está realmente MATCHED antes de cerrar (evita falsos positivos del WS).
+                                        info!(
+                                            "[IntervalSniper] TP fill via WS: {}/{} filled, confirming with REST...",
+                                            fmt_decimal_2(&filled), fmt_decimal_2(&tp_size_for_check)
+                                        );
+                                        {
+                                            // REST confirmation to avoid WS false positives.
                                             let rest_confirms_fill = match clob.get_order(oid).await {
                                                 Ok(order_info) => {
                                                     let status = order_info.get("status")
