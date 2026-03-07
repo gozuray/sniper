@@ -269,6 +269,9 @@ pub async fn redeem_positions(
     };
     let gas_price = ethers::types::U256::from(gas_price_gwei) * ethers::types::U256::from(1_000_000_000u64);
 
+    // Redeem always uses the wallet from PRIVATE_KEY. If that key's address equals FUNDER_ADDRESS,
+    // the proxy is an EOA (same account) → direct CTF.redeemPositions. Otherwise FUNDER_ADDRESS
+    // is treated as a Safe contract → approveHash + execTransaction as owner.
     let wallet_addr = wallet.address();
     let use_safe = funder_address
         .map(|f| f != wallet_addr)

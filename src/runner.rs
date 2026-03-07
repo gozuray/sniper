@@ -740,9 +740,12 @@ async fn redeem_run_once(
                 info!("[Redeem] no redeemable positions this run (Data API checked)");
                 return;
             }
+            let use_safe = funder_address.map(|f| f != wallet.address()).unwrap_or(false);
             info!(
-                "[Redeem] run: {} resolved market(s) to try",
-                condition_ids.len()
+                "[Redeem] run: {} resolved market(s) to try (signer from PRIVATE_KEY={:#x}, {} path)",
+                condition_ids.len(),
+                wallet.address(),
+                if use_safe { "Safe" } else { "EOA" }
             );
             for cid in &condition_ids {
                 match redeem::redeem_positions(wallet, rpc_url, cid, funder_address).await {
