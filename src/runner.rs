@@ -756,7 +756,7 @@ async fn redeem_run_once(
                     }
                     Err(e) => {
                         warn!(
-                            "[Redeem] failed condition_id={}..: {}",
+                            "[Redeem] failed condition_id={}..: {:?}",
                             &cid[..cid.len().min(18)],
                             e
                         );

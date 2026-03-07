@@ -38,6 +38,7 @@ abigen!(
     r#"[
         function nonce() external view returns (uint256)
         function getTransactionHash(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, uint256 _nonce) external view returns (bytes32)
+        function approveHash(bytes32 hashToApprove) external
         function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) external payable returns (bool success)
     ]"#
 );
@@ -177,26 +178,36 @@ async fn redeem_positions_via_safe(
         .await
         .context("Safe getTransactionHash")?;
 
-    let hash_bytes: [u8; 32] = tx_hash
-        .as_ref()
-        .try_into()
-        .context("tx_hash to bytes")?;
-    let sig = wallet.sign_hash(hash_bytes.into()).context("sign Safe tx hash")?;
+    // Polymarket Safe expects approved-hash flow: 1) approveHash(txHash) on-chain, 2) execTransaction with v=1 signature (r=owner padded, s=0, v=1).
+    let provider2 = Provider::<Http>::try_from(rpc_url).context("Polygon RPC provider 2")?;
+    let client2 = SignerMiddleware::new(provider2, wallet.clone());
+    let safe_signer = GnosisSafe::new(safe_address, client2.into());
+
+    let approve_call = safe_signer.approve_hash(tx_hash);
+    let approve_with_gas = approve_call.gas_price(gas_price);
+    let approve_pending = approve_with_gas
+        .send()
+        .await
+        .context("Safe approveHash")?;
+    if let Ok(Some(receipt)) = approve_pending.await {
+        if !receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false) {
+            anyhow::bail!("Safe approveHash tx reverted");
+        }
+    } else {
+        anyhow::bail!("Safe approveHash tx failed or dropped");
+    }
+
+    let owner = wallet.address();
     let mut r_b = [0u8; 32];
-    sig.r.to_big_endian(&mut r_b);
-    let mut s_b = [0u8; 32];
-    sig.s.to_big_endian(&mut s_b);
-    let v = sig.v as u8;
+    r_b[12..32].copy_from_slice(owner.as_bytes());
+    let s_b = [0u8; 32];
+    let v = 1u8; // approved hash signature type
     let signature_bytes: Vec<u8> = r_b
         .iter()
         .chain(s_b.iter())
         .chain(std::iter::once(&v))
         .copied()
         .collect();
-
-    let provider2 = Provider::<Http>::try_from(rpc_url).context("Polygon RPC provider 2")?;
-    let client2 = SignerMiddleware::new(provider2, wallet.clone());
-    let safe_signer = GnosisSafe::new(safe_address, client2.into());
 
     let exec_call = safe_signer.exec_transaction(
         ctf_addr,
