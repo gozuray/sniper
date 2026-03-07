@@ -18,8 +18,8 @@ const USDC_E_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const PARENT_COLLECTION_ID: [u8; 32] = [0u8; 32];
 /// Binary markets: redeem both outcome index sets (only winning pays out).
 const INDEX_SETS: [u64; 2] = [1, 2];
-/// Default gas price for redeem txs (gwei). Polygon often requires >= 25 gwei.
-const DEFAULT_REDEEM_GAS_PRICE_GWEI: u64 = 30;
+/// Default gas price for redeem txs (gwei). Must be >= block base fee (Polygon can be 100+ gwei when busy).
+const DEFAULT_REDEEM_GAS_PRICE_GWEI: u64 = 150;
 
 abigen!(
     ConditionalTokens,
@@ -114,6 +114,14 @@ pub async fn redeem_positions(
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_REDEEM_GAS_PRICE_GWEI)
         .max(25);
+    let gas_price_gwei = if let Some(max_gwei) = std::env::var("REDEEM_GAS_PRICE_MAX_GWEI")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        gas_price_gwei.min(max_gwei)
+    } else {
+        gas_price_gwei
+    };
     let gas_price = ethers::types::U256::from(gas_price_gwei) * ethers::types::U256::from(1_000_000_000u64);
 
     let parent_b32: [u8; 32] = PARENT_COLLECTION_ID;
