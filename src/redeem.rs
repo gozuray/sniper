@@ -23,8 +23,6 @@ const INDEX_SETS: [u64; 2] = [1, 2];
 const DEFAULT_REDEEM_GAS_PRICE_GWEI: u64 = 150;
 /// Operation.Call for Safe execTransaction.
 const SAFE_OP_CALL: u8 = 0;
-/// Gas for inner Safe tx (redeemPositions).
-const SAFE_TX_GAS: u64 = 500_000;
 
 abigen!(
     ConditionalTokens,
@@ -161,15 +159,18 @@ async fn redeem_positions_via_safe(
     let safe = GnosisSafe::new(safe_address, client.into());
     let nonce = safe.nonce().call().await.context("Safe nonce")?;
     let zero = Address::zero();
+    let safe_tx_gas = U256::zero();
+    let base_gas = U256::zero();
+    let safe_gas_price = U256::zero();
     let tx_hash = safe
         .get_transaction_hash(
             ctf_addr,
             U256::zero(),
             calldata.clone(),
             SAFE_OP_CALL,
-            SAFE_TX_GAS.into(),
-            U256::zero(),
-            gas_price,
+            safe_tx_gas,
+            base_gas,
+            safe_gas_price,
             zero,
             zero,
             nonce,
@@ -178,25 +179,33 @@ async fn redeem_positions_via_safe(
         .await
         .context("Safe getTransactionHash")?;
 
-    // Polymarket Safe expects approved-hash flow: 1) approveHash(txHash) on-chain, 2) execTransaction with v=1 signature (r=owner padded, s=0, v=1).
+    // Polymarket Safe: 1) approveHash(txHash), 2) execTransaction(CTF, 0, redeem_calldata, CALL, 0, 0, 0, 0, 0, signatures). Both txs from EOA (PRIVATE_KEY).
     let provider2 = Provider::<Http>::try_from(rpc_url).context("Polygon RPC provider 2")?;
     let client2 = SignerMiddleware::new(provider2, wallet.clone());
     let safe_signer = GnosisSafe::new(safe_address, client2.into());
 
+    // Step 1: approveHash(txHash)
     let approve_call = safe_signer.approve_hash(tx_hash);
     let approve_with_gas = approve_call.gas_price(gas_price);
     let approve_pending = approve_with_gas
         .send()
         .await
-        .context("Safe approveHash")?;
-    if let Ok(Some(receipt)) = approve_pending.await {
-        if !receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false) {
-            anyhow::bail!("Safe approveHash tx reverted");
-        }
-    } else {
-        anyhow::bail!("Safe approveHash tx failed or dropped");
+        .context("Safe approveHash send")?;
+    info!(
+        "[Redeem] Safe approveHash() tx submitted condition_id={}.. tx_hash={:?}",
+        &condition_id[..condition_id.len().min(18)],
+        approve_pending.tx_hash()
+    );
+    let approve_receipt = approve_pending
+        .await
+        .context("Safe approveHash await")?
+        .context("Safe approveHash no receipt")?;
+    if !approve_receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false) {
+        anyhow::bail!("Safe approveHash tx reverted");
     }
+    info!("[Redeem] Safe approveHash() confirmed block={:?}", approve_receipt.block_number);
 
+    // Step 2: execTransaction(CTF, 0, calldata, CALL, 0, 0, 0, address(0), address(0), signatures)
     let owner = wallet.address();
     let mut r_b = [0u8; 32];
     r_b[12..32].copy_from_slice(owner.as_bytes());
@@ -214,21 +223,25 @@ async fn redeem_positions_via_safe(
         U256::zero(),
         calldata,
         SAFE_OP_CALL,
-        SAFE_TX_GAS.into(),
-        U256::zero(),
-        gas_price,
+        U256::zero(), // safeTxGas = 0
+        U256::zero(), // baseGas = 0
+        U256::zero(), // gasPrice = 0 (Safe internal)
         zero,
         zero,
         signature_bytes.into(),
     );
     let with_gas = exec_call.gas_price(gas_price);
+    info!(
+        "[Redeem] Safe execTransaction() sending condition_id={}..",
+        &condition_id[..condition_id.len().min(18)]
+    );
     let pending = with_gas
         .send()
         .await
-        .context("Safe execTransaction")?;
+        .context("Safe execTransaction send")?;
     let hash = pending.tx_hash();
     info!(
-        "[Redeem] redeemPositions via Safe submitted condition_id={}.. tx_hash={:?}",
+        "[Redeem] Safe execTransaction() tx submitted condition_id={}.. tx_hash={:?}",
         &condition_id[..condition_id.len().min(18)],
         hash
     );
