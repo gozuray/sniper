@@ -2198,7 +2198,8 @@ pub async fn run() -> Result<()> {
                         }
 
                         // 2) Place GTC limit at best_bid when we have no resting SL order and remaining to sell.
-                        if state.sl_limit_order_id.is_none() && remaining >= DUST_THRESHOLD {
+                        // Require last_buy_order.is_some() so we skip placing after "already matched" cleanup in same tick.
+                        if state.sl_limit_order_id.is_none() && state.last_buy_order.is_some() && remaining >= DUST_THRESHOLD {
                             if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
                                 // Already closed above (WS detected 100%)
                             } else {
