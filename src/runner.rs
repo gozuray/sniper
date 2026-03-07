@@ -177,6 +177,10 @@ struct RunnerState {
     pending_gtc_price: Option<Decimal>,
     pending_gtc_requested_size: Option<Decimal>,
     pending_gtc_timestamp_ms: Option<u64>,
+    /// Last filled size we observed for the pending GTC (for logging partial fill deltas).
+    pending_gtc_last_observed_filled: Option<Decimal>,
+    /// Per-tick fill deltas for the pending GTC order (for log line "N partials: a, b, c").
+    pending_gtc_fill_deltas: Vec<Decimal>,
     /// Cached result of get_available_balance for the current position token (TTL 3s).
     allowance_cache: Option<(Decimal, Instant)>,
 }
@@ -874,6 +878,8 @@ pub async fn run() -> Result<()> {
         pending_gtc_price: None,
         pending_gtc_requested_size: None,
         pending_gtc_timestamp_ms: None,
+        pending_gtc_last_observed_filled: None,
+        pending_gtc_fill_deltas: vec![],
         allowance_cache: None,
     };
 
@@ -940,6 +946,19 @@ pub async fn run() -> Result<()> {
                             _ => from_ws,
                         }
                     };
+                    // Log each partial fill (for "N partials: a, b, c" in final BUY line); no logic change.
+                    let last = state.pending_gtc_last_observed_filled.unwrap_or(Decimal::ZERO);
+                    if filled > last {
+                        let delta = filled.clone() - last;
+                        state.pending_gtc_fill_deltas.push(delta);
+                        state.pending_gtc_last_observed_filled = Some(filled.clone());
+                        info!(
+                            "[IntervalSniper] GTC partial fill: +{} (total {}/{})",
+                            fmt_decimal_2(&delta),
+                            fmt_decimal_2(&filled),
+                            fmt_decimal_2(&requested)
+                        );
+                    }
                     // Allow partial fill: set TP/SL for actual filled size so we don't place TP for more than we have (and avoid balance error → cancel).
                     if filled >= MIN_SELL_SIZE
                         && state.pending_gtc_token_id.is_some()
@@ -1008,21 +1027,30 @@ pub async fn run() -> Result<()> {
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
+                        let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
+                            let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
+                            format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
+                        } else {
+                            String::new()
+                        };
                         state.pending_gtc_order_id = None;
                         state.pending_gtc_token_id = None;
                         state.pending_gtc_side = None;
                         state.pending_gtc_price = None;
                         state.pending_gtc_requested_size = None;
                         state.pending_gtc_timestamp_ms = None;
+                        state.pending_gtc_last_observed_filled = None;
+                        state.pending_gtc_fill_deltas.clear();
                         let side_str = match entry_side {
                             EntrySide::Up => "Up  ",
                             EntrySide::Down => "Down",
                         };
                         info!(
-                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: WS {})   fill_lag={}ms   TP size={} ({}%)   SL size={} ({}%)",
+                            "[IntervalSniper]  BUY   {}  @ {}   size={}{} (fill first: WS {})   fill_lag={}ms   TP size={} ({}%)   SL size={} ({}%)",
                             side_str,
                             fmt_decimal_2(&entry_price),
                             fmt_decimal_2(&filled),
+                            partials_str,
                             ws_event_type,
                             fill_lag_ms,
                             fmt_decimal_2(&tp_size),
@@ -1070,6 +1098,12 @@ pub async fn run() -> Result<()> {
                             _ => None,
                         };
                         if let Some(filled) = rest_order_filled {
+                            let last = state.pending_gtc_last_observed_filled.unwrap_or(Decimal::ZERO);
+                            if filled > last {
+                                let delta = filled.clone() - last;
+                                state.pending_gtc_fill_deltas.push(delta);
+                                state.pending_gtc_last_observed_filled = Some(filled.clone());
+                            }
                             let entry_side = state.pending_gtc_side.unwrap();
                             let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
                             state.trades_this_interval += 1;
@@ -1129,21 +1163,30 @@ pub async fn run() -> Result<()> {
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
+                            let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
+                                let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
+                                format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
+                            } else {
+                                String::new()
+                            };
                             state.pending_gtc_order_id = None;
                             state.pending_gtc_token_id = None;
                             state.pending_gtc_side = None;
                             state.pending_gtc_price = None;
                             state.pending_gtc_requested_size = None;
                             state.pending_gtc_timestamp_ms = None;
+                            state.pending_gtc_last_observed_filled = None;
+                            state.pending_gtc_fill_deltas.clear();
                             let side_str = match entry_side {
                                 EntrySide::Up => "Up  ",
                                 EntrySide::Down => "Down",
                             };
                             info!(
-                                "[IntervalSniper]  BUY   {}  @ {}   size={} (fill: REST get_order)   TP size={} ({}%)   SL size={} ({}%)",
+                                "[IntervalSniper]  BUY   {}  @ {}   size={}{} (fill: REST get_order)   TP size={} ({}%)   SL size={} ({}%)",
                                 side_str,
                                 fmt_decimal_2(&entry_price),
                                 fmt_decimal_2(&filled),
+                                partials_str,
                                 fmt_decimal_2(&tp_size),
                                 state.config.auto_sell_quantity_percent,
                                 fmt_decimal_2(&sl_size),
@@ -1171,6 +1214,12 @@ pub async fn run() -> Result<()> {
                             let threshold = (requested.clone() * dec!(0.99)).max(requested.clone() - dec!(0.01));
                             if av >= threshold && av >= MIN_SELL_SIZE {
                                 let filled = av.min(requested);
+                                let last = state.pending_gtc_last_observed_filled.unwrap_or(Decimal::ZERO);
+                                if filled > last {
+                                    let delta = filled.clone() - last;
+                                    state.pending_gtc_fill_deltas.push(delta);
+                                    state.pending_gtc_last_observed_filled = Some(filled.clone());
+                                }
                                 let entry_side = state.pending_gtc_side.unwrap();
                                 let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
                                 state.trades_this_interval += 1;
@@ -1230,21 +1279,30 @@ pub async fn run() -> Result<()> {
                                 state.allowance_cache = None;
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;
+                                let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
+                                    let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
+                                    format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
+                                } else {
+                                    String::new()
+                                };
                                 state.pending_gtc_order_id = None;
                                 state.pending_gtc_token_id = None;
                                 state.pending_gtc_side = None;
                                 state.pending_gtc_price = None;
                                 state.pending_gtc_requested_size = None;
                                 state.pending_gtc_timestamp_ms = None;
+                                state.pending_gtc_last_observed_filled = None;
+                                state.pending_gtc_fill_deltas.clear();
                                 let side_str = match entry_side {
                                     EntrySide::Up => "Up  ",
                                     EntrySide::Down => "Down",
                                 };
                                 info!(
-                                    "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: {})   TP size={} ({}%)   SL size={} ({}%)",
+                                    "[IntervalSniper]  BUY   {}  @ {}   size={}{} (fill first: {})   TP size={} ({}%)   SL size={} ({}%)",
                                     side_str,
                                     fmt_decimal_2(&entry_price),
                                     fmt_decimal_2(&filled),
+                                    partials_str,
                                     bal_source,
                                     fmt_decimal_2(&tp_size),
                                     state.config.auto_sell_quantity_percent,
@@ -1297,6 +1355,12 @@ pub async fn run() -> Result<()> {
                         _ => None,
                     };
                     if let Some(filled) = rest_order_filled {
+                        let last = state.pending_gtc_last_observed_filled.unwrap_or(Decimal::ZERO);
+                        if filled > last {
+                            let delta = filled.clone() - last;
+                            state.pending_gtc_fill_deltas.push(delta);
+                            state.pending_gtc_last_observed_filled = Some(filled.clone());
+                        }
                         let entry_side = state.pending_gtc_side.unwrap();
                         let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
                         state.trades_this_interval += 1;
@@ -1354,21 +1418,30 @@ pub async fn run() -> Result<()> {
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
+                        let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
+                            let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
+                            format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
+                        } else {
+                            String::new()
+                        };
                         state.pending_gtc_order_id = None;
                         state.pending_gtc_token_id = None;
                         state.pending_gtc_side = None;
                         state.pending_gtc_price = None;
                         state.pending_gtc_requested_size = None;
                         state.pending_gtc_timestamp_ms = None;
+                        state.pending_gtc_last_observed_filled = None;
+                        state.pending_gtc_fill_deltas.clear();
                         let side_str = match entry_side {
                             EntrySide::Up => "Up  ",
                             EntrySide::Down => "Down",
                         };
                         info!(
-                            "[IntervalSniper]  BUY   {}  @ {}   size={} (fill: REST get_order, no WS)   TP size={} ({}%)   SL size={} ({}%)",
+                            "[IntervalSniper]  BUY   {}  @ {}   size={}{} (fill: REST get_order, no WS)   TP size={} ({}%)   SL size={} ({}%)",
                             side_str,
                             fmt_decimal_2(&entry_price),
                             fmt_decimal_2(&filled),
+                            partials_str,
                             fmt_decimal_2(&tp_size),
                             state.config.auto_sell_quantity_percent,
                             fmt_decimal_2(&sl_size),
@@ -1387,6 +1460,12 @@ pub async fn run() -> Result<()> {
                         let threshold = (requested.clone() * dec!(0.99)).max(requested.clone() - dec!(0.01));
                         if av >= threshold && av >= MIN_SELL_SIZE {
                             let filled = av.min(requested);
+                            let last = state.pending_gtc_last_observed_filled.unwrap_or(Decimal::ZERO);
+                            if filled > last {
+                                let delta = filled.clone() - last;
+                                state.pending_gtc_fill_deltas.push(delta);
+                                state.pending_gtc_last_observed_filled = Some(filled.clone());
+                            }
                             let entry_side = state.pending_gtc_side.unwrap();
                             let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
                             state.trades_this_interval += 1;
@@ -1446,21 +1525,30 @@ pub async fn run() -> Result<()> {
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
+                            let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
+                                let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
+                                format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
+                            } else {
+                                String::new()
+                            };
                             state.pending_gtc_order_id = None;
                             state.pending_gtc_token_id = None;
                             state.pending_gtc_side = None;
                             state.pending_gtc_price = None;
                             state.pending_gtc_requested_size = None;
                             state.pending_gtc_timestamp_ms = None;
+                            state.pending_gtc_last_observed_filled = None;
+                            state.pending_gtc_fill_deltas.clear();
                             let side_str = match entry_side {
                                 EntrySide::Up => "Up  ",
                                 EntrySide::Down => "Down",
                             };
                             info!(
-                                "[IntervalSniper]  BUY   {}  @ {}   size={} (fill first: REST, no WS)   TP size={} ({}%)   SL size={} ({}%)",
+                                "[IntervalSniper]  BUY   {}  @ {}   size={}{} (fill first: REST, no WS)   TP size={} ({}%)   SL size={} ({}%)",
                                 side_str,
                                 fmt_decimal_2(&entry_price),
                                 fmt_decimal_2(&filled),
+                                partials_str,
                                 fmt_decimal_2(&tp_size),
                                 state.config.auto_sell_quantity_percent,
                                 fmt_decimal_2(&sl_size),
@@ -1746,6 +1834,8 @@ pub async fn run() -> Result<()> {
                     state.pending_gtc_price = None;
                     state.pending_gtc_requested_size = None;
                     state.pending_gtc_timestamp_ms = None;
+                    state.pending_gtc_last_observed_filled = None;
+                    state.pending_gtc_fill_deltas.clear();
                     state.pending_auto_sell = None;
                     state.pending_stop_loss = None;
                     state.auto_sell_placed = false;
@@ -3304,6 +3394,8 @@ pub async fn run() -> Result<()> {
                                 state.pending_gtc_price = Some(effective_price.clone());
                                 state.pending_gtc_requested_size = Some(size.clone());
                                 state.pending_gtc_timestamp_ms = Some(now_ms_u);
+                                state.pending_gtc_last_observed_filled = None;
+                                state.pending_gtc_fill_deltas.clear();
                                 let side_str = match side {
                                     EntrySide::Up => "Up  ",
                                     EntrySide::Down => "Down",
