@@ -721,7 +721,15 @@ async fn redeem_run_once(
     rpc_url: &str,
     wallet: &ethers::signers::LocalWallet,
 ) {
-    let user_addr = format!("{:#x}", wallet.address());
+    // Use FUNDER_ADDRESS (proxy wallet) for positions API if set; otherwise EOA. Positions are under proxy on Polymarket.
+    let user_addr = std::env::var("FUNDER_ADDRESS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let s = s.trim().trim_start_matches("0x");
+            format!("0x{}", s)
+        })
+        .unwrap_or_else(|| format!("{:#x}", wallet.address()));
     match redeem::fetch_resolved_condition_ids_from_positions(http, clob_host, &user_addr).await {
         Ok(condition_ids) => {
             if condition_ids.is_empty() {
