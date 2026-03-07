@@ -2751,29 +2751,67 @@ pub async fn run() -> Result<()> {
                                     "[IntervalSniper] TP limit calculation: position_size={}, available={:?}, effective_size={}, MIN_SELL_SIZE={}, DUST_THRESHOLD={}",
                                     position_size_real, available, size, MIN_SELL_SIZE, DUST_THRESHOLD
                                 );
-                                // Remaining is below API minimum order size (e.g. 0.01 < 5): unsellable dust after partial TP fill.
-                                // Close the position immediately rather than spamming the API with rejected orders.
+                                // Remaining is below API minimum order size (e.g. 0.01 < 5): unsellable dust.
+                                // Distinguish: dust after partial TP fill vs dust after SL (SL sold most, left unsellable remainder).
                                 if size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE {
-                                    info!(
-                                        "[IntervalSniper] TP remaining {} below API minimum {} — dust after partial fill, closing position",
-                                        fmt_decimal_2(&size), fmt_decimal_2(&CLOB_DEFAULT_MIN_ORDER_SIZE)
-                                    );
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let exit_price = target;
-                                        let filled = state.tp_cumulative_filled.clone();
-                                        let pnl = (exit_price - buy.price) * filled.clone();
-                                        let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
-                                        let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                    let dust_after_sl = state.pending_stop_loss.is_some() && state.tp_cumulative_filled.is_zero();
+                                    if dust_after_sl {
+                                        // Dust left after SL filled (e.g. SL size was 5.99, left 0.01). Do not report as TP.
+                                        let exit_price = state.sl_limit_order_price.unwrap_or(target);
+                                        let total_filled = tp.size.clone() - available.unwrap_or(Decimal::ZERO);
                                         info!(
-                                            "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (partial fill, dust remainder)",
-                                            match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                            fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
-                                            fmt_decimal_2(&filled), pnl, roi_pct, held_sec
+                                            "[IntervalSniper] TP remaining {} below API minimum {} — dust after SL fill, closing position",
+                                            fmt_decimal_2(&size), fmt_decimal_2(&CLOB_DEFAULT_MIN_ORDER_SIZE)
                                         );
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let pnl = (exit_price - buy.price) * total_filled.clone();
+                                            let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                            let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                            info!(
+                                                "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (dust remainder)",
+                                                match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                                fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
+                                            );
+                                        }
+                                        if let Some(ref mut log) = state.session_log {
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let _ = log.log_position_close(
+                                                    &market.slug, market.interval_start_unix, market.close_time_unix,
+                                                    buy.side, buy.price, exit_price,
+                                                    buy.timestamp_ms, now_ms_u,
+                                                    ExitType::StopLoss, total_filled.clone(), None,
+                                                    buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
+                                                    state.interval_min_bid_up, state.interval_max_bid_up,
+                                                    state.interval_min_bid_down, state.interval_max_bid_down,
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                        state.re_entry_allowed_after_sl = true;
+                                    } else {
+                                        // Real dust after partial TP fill: report as TP with filled amount.
+                                        info!(
+                                            "[IntervalSniper] TP remaining {} below API minimum {} — dust after partial fill, closing position",
+                                            fmt_decimal_2(&size), fmt_decimal_2(&CLOB_DEFAULT_MIN_ORDER_SIZE)
+                                        );
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let exit_price = target;
+                                            let filled = state.tp_cumulative_filled.clone();
+                                            let pnl = (exit_price - buy.price) * filled.clone();
+                                            let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                            let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                            info!(
+                                                "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (partial fill, dust remainder)",
+                                                match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                                fmt_decimal_2(&filled), pnl, roi_pct, held_sec
+                                            );
+                                        }
+                                        state.re_entry_allowed_after_sl = false;
                                     }
                                     state.auto_sell_placed = true;
                                     state.stop_loss_placed = true;
-                                    state.re_entry_allowed_after_sl = false;
                                     state.tp_limit_order_id = None;
                                     state.tp_placed_size = None;
                                     state.tp_cumulative_filled = Decimal::ZERO;
