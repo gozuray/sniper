@@ -1029,6 +1029,15 @@ pub async fn run() -> Result<()> {
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
+                        // Reset SL/TP cumulative state for new position (re-entry); otherwise log_clob_balance caps by previous position's sl_cumulative_filled.
+                        state.sl_cumulative_filled = Decimal::ZERO;
+                        state.sl_last_order_filled = Decimal::ZERO;
+                        state.tp_cumulative_filled = Decimal::ZERO;
+                        state.tp_last_order_filled = Decimal::ZERO;
+                        state.tp_limit_order_id = None;
+                        state.tp_placed_size = None;
+                        state.sl_limit_order_id = None;
+                        state.sl_limit_order_price = None;
                         let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
                             let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
                             format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
@@ -1165,6 +1174,14 @@ pub async fn run() -> Result<()> {
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
+                            state.sl_cumulative_filled = Decimal::ZERO;
+                            state.sl_last_order_filled = Decimal::ZERO;
+                            state.tp_cumulative_filled = Decimal::ZERO;
+                            state.tp_last_order_filled = Decimal::ZERO;
+                            state.tp_limit_order_id = None;
+                            state.tp_placed_size = None;
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
                             let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
                                 let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
                                 format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
@@ -1281,6 +1298,15 @@ pub async fn run() -> Result<()> {
                                 state.allowance_cache = None;
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;
+                                // Reset SL/TP cumulative state for new position (re-entry).
+                                state.sl_cumulative_filled = Decimal::ZERO;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.tp_cumulative_filled = Decimal::ZERO;
+                                state.tp_last_order_filled = Decimal::ZERO;
+                                state.tp_limit_order_id = None;
+                                state.tp_placed_size = None;
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
                                 let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
                                     let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
                                     format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
@@ -1420,6 +1446,14 @@ pub async fn run() -> Result<()> {
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
+                        state.sl_cumulative_filled = Decimal::ZERO;
+                        state.sl_last_order_filled = Decimal::ZERO;
+                        state.tp_cumulative_filled = Decimal::ZERO;
+                        state.tp_last_order_filled = Decimal::ZERO;
+                        state.tp_limit_order_id = None;
+                        state.tp_placed_size = None;
+                        state.sl_limit_order_id = None;
+                        state.sl_limit_order_price = None;
                         let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
                             let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
                             format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
@@ -1527,6 +1561,14 @@ pub async fn run() -> Result<()> {
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
+                            state.sl_cumulative_filled = Decimal::ZERO;
+                            state.sl_last_order_filled = Decimal::ZERO;
+                            state.tp_cumulative_filled = Decimal::ZERO;
+                            state.tp_last_order_filled = Decimal::ZERO;
+                            state.tp_limit_order_id = None;
+                            state.tp_placed_size = None;
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
                             let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
                                 let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
                                 format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
