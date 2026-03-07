@@ -1950,14 +1950,14 @@ pub async fn run() -> Result<()> {
 
                             // Detect fill via WS user (partial or full for this order).
                             if let Some(ws_user) = ws_user_ref {
-                                if let Some(filled_this_order) = ws_user.get_order_filled_size_sell(oid).await {
+                                if let Some((filled_this_order, fill_event_type)) = ws_user.get_order_filled_size_sell_with_type(oid).await {
                                     let delta = filled_this_order - state.sl_last_order_filled;
                                     if delta > Decimal::ZERO {
                                         state.sl_cumulative_filled += delta;
                                         state.sl_last_order_filled = filled_this_order;
                                         info!(
-                                            "[IntervalSniper] SL fill via WS: +{} (total {}/{}), order_id={}",
-                                            fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
+                                            "[IntervalSniper] SL fill via WS ({}): +{} (total {}/{}), order_id={}",
+                                            fill_event_type, fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
                                         );
                                     }
                                 }
@@ -2407,7 +2407,7 @@ pub async fn run() -> Result<()> {
                             if best_bid > Decimal::ZERO && best_bid < entry_price {
                                 // HFT: WS first — get partial fill before cancel to track tp_cumulative_filled.
                                 if let Some(ws_user) = ws_user_ref {
-                                    if let Some(filled) = ws_user.get_order_filled_size_sell(oid).await {
+                                    if let Some((filled, fill_event_type)) = ws_user.get_order_filled_size_sell_with_type(oid).await {
                                         if filled > state.tp_last_order_filled {
                                             let delta = filled.clone() - state.tp_last_order_filled.clone();
                                             state.tp_cumulative_filled += delta.clone();
@@ -2418,8 +2418,8 @@ pub async fn run() -> Result<()> {
                                                     let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
                                                     let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
                                                     info!(
-                                                        "[IntervalSniper] TP partial fill (price at entry): +{} @ {} (total TP filled {}/{}), pnl={:+.4} ({:+.2}%) held={}s",
-                                                        fmt_decimal_2(&delta), fmt_price(Some(&target)),
+                                                        "[IntervalSniper] TP partial fill via WS ({}) (price at entry): +{} @ {} (total TP filled {}/{}), pnl={:+.4} ({:+.2}%) held={}s",
+                                                        fill_event_type, fmt_decimal_2(&delta), fmt_price(Some(&target)),
                                                         fmt_decimal_2(&state.tp_cumulative_filled), fmt_decimal_2(&tp.size), pnl, roi_pct, held_sec
                                                     );
                                                     if let Some(ref mut log) = state.session_log {
@@ -2528,16 +2528,16 @@ pub async fn run() -> Result<()> {
                         if let Some(ws_user) = ws_user_ref {
                             if let Some(ref oid) = state.tp_limit_order_id {
                                 let tp_size_for_check = state.tp_placed_size.unwrap_or(tp.size.clone());
-                                match ws_user.get_order_filled_size_sell(oid).await {
-                                    Some(filled) if filled >= tp_size_for_check * dec!(0.99) => {
+                                match ws_user.get_order_filled_size_sell_with_type(oid).await {
+                                    Some((filled, fill_event_type)) if filled >= tp_size_for_check * dec!(0.99) => {
                                         // WS fill event (TRADE/UPDATE) is authoritative — close immediately.
                                         // REST may lag 1-5s; requiring confirmation causes missed/delayed detection.
                                         {
                                             tp_detected_by_ws = true;
                                             let close_size = filled.clone();
 
-                                            info!("[IntervalSniper] ✓ TP fill via WS (TRADE/UPDATE event): {}/{} filled",
-                                                fmt_decimal_2(&close_size), fmt_decimal_2(&tp_size_for_check));
+                                            info!("[IntervalSniper] ✓ TP fill via WS ({}): {}/{} filled",
+                                                fill_event_type, fmt_decimal_2(&close_size), fmt_decimal_2(&tp_size_for_check));
 
                                             if let Some(ref buy) = state.last_buy_order {
                                                 let exit_price = target;

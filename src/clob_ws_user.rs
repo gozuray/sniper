@@ -324,6 +324,22 @@ impl ClobWsUser {
             .map(|s| s.size_matched)
     }
 
+    /// Same as `get_order_filled_size_sell` but also returns the event type ("TRADE" | "UPDATE" | "CANCELLATION").
+    pub async fn get_order_filled_size_sell_with_type(&self, order_id: &str) -> Option<(Decimal, String)> {
+        let key = normalize_order_id(order_id);
+        let map = self.state.read().await;
+        map.get(&key)
+            .filter(|s| s.size_matched > Decimal::ZERO)
+            .filter(|s| {
+                let is_sell = s.side == "SELL";
+                let is_executed = s.order_type == "UPDATE"
+                    || s.order_type == "TRADE"
+                    || s.order_type == "CANCELLATION";
+                is_sell && is_executed
+            })
+            .map(|s| (s.size_matched, s.order_type.clone()))
+    }
+
     /// Return the filled size for an order only if it is a confirmed SELL fill.
     /// Requires side == "SELL" AND order has been executed (UPDATE/TRADE/CANCELLATION).
     /// PLACEMENT events (even with size_matched > 0) are excluded because they can be
