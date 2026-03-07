@@ -2843,9 +2843,20 @@ pub async fn run() -> Result<()> {
                                 );
                                 // Remaining is below API minimum order size (e.g. 0.01 < 5): unsellable dust.
                                 // Distinguish: dust after partial TP fill vs dust after SL (SL sold most, left unsellable remainder).
+                                // On re-entry after SL, we must not treat the new position as "dust after SL": require sl_cumulative_filled > 0
+                                // so only the remainder from an SL that already filled counts. Also skip closing when position_remaining >= MIN
+                                // but available is stale (e.g. WS balance not yet updated after new fill).
                                 if size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE {
-                                    let dust_after_sl = state.pending_stop_loss.is_some() && state.tp_cumulative_filled.is_zero();
-                                    if dust_after_sl {
+                                    let dust_after_sl = state.pending_stop_loss.is_some()
+                                        && state.sl_cumulative_filled > Decimal::ZERO
+                                        && state.tp_cumulative_filled.is_zero();
+                                    let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
+                                    if stale_available && !dust_after_sl {
+                                        debug!(
+                                            "[IntervalSniper] TP skip: position_remaining {} >= MIN but available gives size {} (stale balance?), waiting",
+                                            fmt_decimal_2(&position_size_real), fmt_decimal_2(&size)
+                                        );
+                                    } else if dust_after_sl {
                                         // Dust left after SL filled (e.g. SL size was 5.99, left 0.01). Do not report as TP.
                                         let exit_price = state.sl_limit_order_price.unwrap_or(target);
                                         let total_filled = tp.size.clone() - available.unwrap_or(Decimal::ZERO);
