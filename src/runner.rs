@@ -785,6 +785,7 @@ async fn redeem_loop(
     redeem_run_once(&http, &clob_host, &rpc_url, &wallet).await;
 
     let mut interval = tokio::time::interval(Duration::from_secs(redeem_interval_sec));
+    interval.tick().await; // consume the immediate first tick so we don't run twice at startup
     loop {
         interval.tick().await;
         redeem_run_once(&http, &clob_host, &rpc_url, &wallet).await;
