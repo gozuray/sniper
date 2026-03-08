@@ -1,7 +1,7 @@
 //! Main loop: interval switch, top-of-book, buy in range, TP/SL.
 
 #[allow(unused_imports)]
-use crate::clob::{ClobClient, LimitOrderParams, OrderSide, OrderType};
+use crate::clob::{parse_sell_order_usd_received, ClobClient, LimitOrderParams, OrderSide, OrderType};
 use crate::clob_ws_book::ClobWsBook;
 use crate::clob_ws_user::ClobWsUser;
 use crate::config::{current_5min_slug, load_config};
@@ -264,6 +264,26 @@ fn effective_sell_size(
     } else {
         result
     }
+}
+
+/// Retry GET /order until takingAmount is available (real exit value). No terminal logs.
+async fn fetch_real_exit_usd_with_retry(
+    clob: &dyn ClobClient,
+    exit_order_id: &str,
+) -> Option<Decimal> {
+    const MAX_ATTEMPTS: u32 = 15;
+    const DELAY_MS: u64 = 2000;
+    for _ in 0..MAX_ATTEMPTS {
+        if let Ok(j) = clob.get_order(exit_order_id).await {
+            if let Some(usd) = parse_sell_order_usd_received(&j) {
+                if usd > Decimal::ZERO {
+                    return Some(usd);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
+    }
+    None
 }
 
 fn fmt_price(p: Option<&Decimal>) -> String {
@@ -1786,6 +1806,9 @@ pub async fn run() -> Result<()> {
                                 state.interval_min_bid_down,
                                 state.interval_max_bid_down,
                                 None,
+                                None,
+                                None,
+                                false,
                             );
                         }
                     }
@@ -2259,6 +2282,11 @@ pub async fn run() -> Result<()> {
                                         fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
                                     );
                                 }
+                                let real_exit_usd = if let Some(oid) = state.sl_limit_order_id.as_deref() {
+                                    fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
+                                } else {
+                                    None
+                                };
                                 if let Some(ref mut log) = state.session_log {
                                     if let Some(ref buy) = state.last_buy_order {
                                         let _ = log.log_position_close(
@@ -2269,6 +2297,9 @@ pub async fn run() -> Result<()> {
                                             state.interval_min_bid_up, state.interval_max_bid_up,
                                             state.interval_min_bid_down, state.interval_max_bid_down,
                                             None,
+                                            None,
+                                            real_exit_usd,
+                                            true,
                                         );
                                     }
                                 }
@@ -2343,6 +2374,7 @@ pub async fn run() -> Result<()> {
                                             fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
                                         );
                                     }
+                                    let real_exit_usd = fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await;
                                     if let Some(ref mut log) = state.session_log {
                                         if let Some(ref buy) = state.last_buy_order {
                                             let _ = log.log_position_close(
@@ -2353,6 +2385,9 @@ pub async fn run() -> Result<()> {
                                                 state.interval_min_bid_up, state.interval_max_bid_up,
                                                 state.interval_min_bid_down, state.interval_max_bid_down,
                                                 None,
+                                                None,
+                                                real_exit_usd,
+                                                true,
                                             );
                                         }
                                     }
@@ -2546,6 +2581,9 @@ pub async fn run() -> Result<()> {
                                         state.interval_min_bid_up, state.interval_max_bid_up,
                                         state.interval_min_bid_down, state.interval_max_bid_down,
                                         None,
+                                        None,
+                                        None,
+                                        false,
                                     );
                                 }
                             }
@@ -2647,6 +2685,7 @@ pub async fn run() -> Result<()> {
                                                         fill_event_type, fmt_decimal_2(&delta), fmt_price(Some(&target)),
                                                         fmt_decimal_2(&state.tp_cumulative_filled), fmt_decimal_2(&tp.size), pnl, roi_pct, held_sec
                                                     );
+                                                    let real_exit_usd = fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await;
                                                     if let Some(ref mut log) = state.session_log {
                                                         let _ = log.log_position_close(
                                                             &market.slug, market.interval_start_unix, market.close_time_unix,
@@ -2656,6 +2695,9 @@ pub async fn run() -> Result<()> {
                                                             state.interval_min_bid_up, state.interval_max_bid_up,
                                                             state.interval_min_bid_down, state.interval_max_bid_down,
                                                             None,
+                                                            None,
+                                                            real_exit_usd,
+                                                            true,
                                                         );
                                                     }
                                                 }
@@ -2689,6 +2731,7 @@ pub async fn run() -> Result<()> {
                                                 "[IntervalSniper] ✓ TP limit filled @ {} — position closed (cancel returned already matched)",
                                                 fmt_price(Some(&target))
                                             );
+                                            let real_exit_usd = fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await;
                                             if let Some(ref mut log) = state.session_log {
                                                 if let Some(ref buy) = state.last_buy_order {
                                                     let _ = log.log_position_close(
@@ -2710,6 +2753,9 @@ pub async fn run() -> Result<()> {
                                                         state.interval_min_bid_down,
                                                         state.interval_max_bid_down,
                                                         None,
+                                                        None,
+                                                        real_exit_usd,
+                                                        true,
                                                     );
                                                 }
                                             }
@@ -2778,6 +2824,11 @@ pub async fn run() -> Result<()> {
                                                 );
                                             }
 
+                                            let real_exit_usd = if let Some(oid) = state.tp_limit_order_id.as_deref() {
+                                                fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
+                                            } else {
+                                                None
+                                            };
                                             if let Some(ref mut log) = state.session_log {
                                                 if let Some(ref buy) = state.last_buy_order {
                                                     let _ = log.log_position_close(
@@ -2788,6 +2839,9 @@ pub async fn run() -> Result<()> {
                                                         state.interval_min_bid_up, state.interval_max_bid_up,
                                                         state.interval_min_bid_down, state.interval_max_bid_down,
                                                         None,
+                                                        None,
+                                                        real_exit_usd,
+                                                        true,
                                                     );
                                                 }
                                             }
@@ -2867,6 +2921,11 @@ pub async fn run() -> Result<()> {
                                                     );
                                                 }
 
+                                                let real_exit_usd = if let Some(ref oid) = state.tp_limit_order_id {
+                                                    fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
+                                                } else {
+                                                    None
+                                                };
                                                 if let Some(ref mut log) = state.session_log {
                                                     if let Some(ref buy) = state.last_buy_order {
                                                         let _ = log.log_position_close(
@@ -2877,6 +2936,9 @@ pub async fn run() -> Result<()> {
                                                             state.interval_min_bid_up, state.interval_max_bid_up,
                                                             state.interval_min_bid_down, state.interval_max_bid_down,
                                                             None,
+                                                            None,
+                                                            real_exit_usd,
+                                                            true,
                                                         );
                                                     }
                                                 }
@@ -3054,8 +3116,11 @@ pub async fn run() -> Result<()> {
                                                     ExitType::StopLoss, total_filled.clone(), None,
                                                     buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
                                                     state.interval_min_bid_up, state.interval_max_bid_up,
-                                                    state.interval_min_bid_down, state.interval_max_bid_down,
-                                                    None,
+                                        state.interval_min_bid_down, state.interval_max_bid_down,
+                                        None,
+                                        None,
+                                        None,
+                                        false,
                                                 );
                                             }
                                         }
@@ -3189,6 +3254,11 @@ pub async fn run() -> Result<()> {
                                                     "[IntervalSniper] ✓ TP emergency FOK sell filled @ {} — position closed",
                                                     fmt_price(Some(&fok_price))
                                                 );
+                                                let real_exit_usd = if let Some(oid) = fok_result.order_id.as_deref() {
+                                                    fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
+                                                } else {
+                                                    None
+                                                };
                                                 if let Some(ref mut log) = state.session_log {
                                                     if let Some(ref buy) = state.last_buy_order {
                                                         let _ = log.log_position_close(
@@ -3210,6 +3280,9 @@ pub async fn run() -> Result<()> {
                                                             state.interval_min_bid_down,
                                                             state.interval_max_bid_down,
                                                             None,
+                                                            None,
+                                                            real_exit_usd,
+                                                            true,
                                                         );
                                                     }
                                                 }

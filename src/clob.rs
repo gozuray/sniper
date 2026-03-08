@@ -63,6 +63,20 @@ pub struct CancelOrdersResult {
     pub not_canceled: std::collections::HashMap<String, String>,
 }
 
+/// Parse USDC received from a SELL order response (GET /order). For SELL, takingAmount = USDC in 6 decimals.
+/// Returns None if field missing or parse error (caller falls back to computed size*price).
+pub fn parse_sell_order_usd_received(order_json: &serde_json::Value) -> Option<Decimal> {
+    let raw = order_json
+        .get("takingAmount")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| Decimal::from_str(s).ok())
+                .or_else(|| v.as_i64().map(Decimal::from))
+                .or_else(|| v.as_u64().map(Decimal::from))
+        })?;
+    Some(raw / dec!(1000000))
+}
+
 /// Abstraction for CLOB order placement (dry-run or live).
 #[async_trait::async_trait]
 pub trait ClobClient: Send + Sync {

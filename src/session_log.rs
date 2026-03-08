@@ -204,12 +204,16 @@ impl SessionLog {
         min_bid_down: Option<Decimal>,
         max_bid_down: Option<Decimal>,
         max_bid_at_exit: Option<Decimal>,
+        real_entry_value_usd: Option<Decimal>,
+        real_exit_value_usd: Option<Decimal>,
+        only_send_telegram_if_real_exit: bool,
     ) -> Result<()> {
         let duration_sec = (exit_time_ms.saturating_sub(entry_time_ms)) / 1000;
         let pnl = executed_size * (exit_price - entry_price);
-        // Real transaction values as shown in Polymarket history / blockchain (USDC).
-        let entry_value_usd = executed_size * entry_price;
-        let exit_value_usd = executed_size * exit_price;
+        // Use API-reported values when available (Polymarket history), else computed.
+        let entry_value_usd = real_entry_value_usd.unwrap_or_else(|| executed_size * entry_price);
+        let exit_value_usd = real_exit_value_usd.unwrap_or_else(|| executed_size * exit_price);
+        let skip_telegram = only_send_telegram_if_real_exit && real_exit_value_usd.is_none();
 
         match exit_type {
             ExitType::TakeProfit => self.tp_count += 1,
@@ -256,9 +260,10 @@ impl SessionLog {
         });
         self.write_line(&obj)?;
         if let Some(ref t) = self.telegram {
-            let interval_label = format!("{} · {}", asset_from_slug(slug), interval_lisbon_time(interval_start_unix));
-            // Real USDC values (as in Polymarket history): cost = size*entry_price, proceeds = size*exit_price.
-            let msg = match self.telegram_msg_format {
+            if !skip_telegram {
+                let interval_label = format!("{} · {}", asset_from_slug(slug), interval_lisbon_time(interval_start_unix));
+                // Real USDC values (as in Polymarket history): cost = size*entry_price, proceeds = size*exit_price.
+                let msg = match self.telegram_msg_format {
                 1 => format!(
                     "📌 Close\n{} · {} {}\n├ Entrada: ${}  →  Venta: ${}\n└ PnL: ${}",
                     interval_label,
@@ -288,7 +293,8 @@ impl SessionLog {
                     interval_label
                 ),
             };
-            t.send(msg);
+                t.send(msg);
+            }
         }
         Ok(())
     }
