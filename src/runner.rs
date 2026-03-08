@@ -3139,6 +3139,43 @@ pub async fn run() -> Result<()> {
                                                 );
                                                 break;
                                             }
+                                            // Cancel retries if price dropped back to entry or below (no point placing TP above market).
+                                            let top_current = if let Some(ref ws) = state.ws_book {
+                                                ws.get_top_of_book().await
+                                            } else {
+                                                match fetch_top_of_book(
+                                                    &http,
+                                                    &clob_host,
+                                                    &market.token_id_up,
+                                                    &market.token_id_down,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(t) => t,
+                                                    Err(_) => top_tp.clone(),
+                                                }
+                                            };
+                                            let current_best_bid = if is_up {
+                                                top_current
+                                                    .token_id_up
+                                                    .as_ref()
+                                                    .and_then(|s| s.best_bid)
+                                                    .unwrap_or(Decimal::ZERO)
+                                            } else {
+                                                top_current
+                                                    .token_id_down
+                                                    .as_ref()
+                                                    .and_then(|s| s.best_bid)
+                                                    .unwrap_or(Decimal::ZERO)
+                                            };
+                                            if current_best_bid <= entry_price {
+                                                info!(
+                                                    "[IntervalSniper] TP limit retries cancelled: price dropped to {} (at or below entry {})",
+                                                    fmt_price(Some(&current_best_bid)),
+                                                    fmt_price(Some(&entry_price))
+                                                );
+                                                break;
+                                            }
                                             state.allowance_cache = None;
                                             let rest_balance = clob.get_available_balance(&tp.token_id).await.ok().flatten();
                                             let size_to_place = if let Some(av) = rest_balance {
