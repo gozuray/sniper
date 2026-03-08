@@ -46,6 +46,8 @@ const TP_SL_DUST_SIZE: Decimal = dec!(0.01);
 const TINY_FILL_THRESHOLD: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
+/// Retry interval (ms) when placing TP/SL after WS fill until REST balance reflects the fill or interval ends.
+const TP_SL_BALANCE_RETRY_MS: u64 = 200;
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
 const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
 /// When WS is present: wait this long before using REST get_order/balance fallback. WS can take 1–3 ticks to deliver the fill; this gives it priority so we log "fill first: user WS" when possible.
@@ -2180,15 +2182,18 @@ pub async fn run() -> Result<()> {
                             state.tp_placed_size = None;
                             state.tp_limit_balance_retries = 0;
                             state.allowance_cache = None;
-                            for _ in 0..20 {
+                            // Wait for REST balance to reflect fill (same as TP): retry every 200ms until interval ends or balance >= fill size.
+                            loop {
+                                if now_unix() >= market.close_time_unix {
+                                    break;
+                                }
+                                state.allowance_cache = None;
                                 let freed = clob.get_available_balance(&sl.token_id).await.ok().flatten();
                                 if freed.map_or(false, |a| a >= sl.size * dec!(0.90)) {
                                     break;
                                 }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
                             }
-                            // Extra delay so CLOB/allowance reflects cancel before first SL place (prioritise WS; REST may lag).
-                            tokio::time::sleep(Duration::from_millis(150)).await;
                             state.allowance_cache = None;
                             info!(
                                 "[IntervalSniper] SL TRIGGERED: bid {} in SL zone (trigger {} + margin) — placing limit at best_bid (cancel+replace if bid drops)",
@@ -2455,6 +2460,98 @@ pub async fn run() -> Result<()> {
                                     );
                                 }
                             }
+                        } else if state.sl_limit_order_id.is_some() && best_bid > sl.trigger_price + SL_TRIGGER_MARGIN {
+                            // Price recovered above SL zone: cancel resting SL limit so balance is freed and we can place TP again.
+                            // (If bid were above our SL limit price, the CLOB would fill our sell immediately; if not yet filled,
+                            // we're back in "TP territory" so we cancel and release balance for TP.)
+                            let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
+                            if let Some(ws_user) = ws_user_ref {
+                                if let Some(ref oid) = state.sl_limit_order_id {
+                                    if let Some(final_fill) = ws_user.get_order_filled_size_sell(oid).await {
+                                        let delta = final_fill - state.sl_last_order_filled;
+                                        if delta > Decimal::ZERO {
+                                            state.sl_cumulative_filled += delta;
+                                        }
+                                    }
+                                }
+                            }
+                            let sl_filled_via_cancel = cancel_result
+                                .as_ref()
+                                .ok()
+                                .and_then(|res| state.sl_limit_order_id.as_ref().and_then(|oid| res.not_canceled.get(oid.as_str())))
+                                .map(|r| {
+                                    let lower = r.to_lowercase();
+                                    lower.contains("matched")
+                                })
+                                .unwrap_or(false);
+                            if sl_filled_via_cancel {
+                                state.sl_cumulative_filled = sl.size.clone();
+                                let order_price = state.sl_limit_order_price.unwrap_or(best_bid);
+                                let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
+                                    sl.size.clone() - state.tp_cumulative_filled.clone()
+                                } else {
+                                    state.sl_cumulative_filled.clone()
+                                };
+                                if let Some(ref buy) = state.last_buy_order {
+                                    let pnl = (order_price - buy.price) * total_filled.clone();
+                                    let roi_pct = ((order_price / buy.price) - Decimal::ONE) * dec!(100);
+                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                    info!(
+                                        "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (filled when price recovered)",
+                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&order_price),
+                                        fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
+                                    );
+                                }
+                                if let Some(ref mut log) = state.session_log {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let _ = log.log_position_close(
+                                            &market.slug, market.interval_start_unix, market.close_time_unix,
+                                            buy.side, buy.price, order_price, buy.timestamp_ms, now_ms_u,
+                                            ExitType::StopLoss, total_filled.clone(), None,
+                                            buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
+                                            state.interval_min_bid_up, state.interval_max_bid_up,
+                                            state.interval_min_bid_down, state.interval_max_bid_down,
+                                            None, None, None, false,
+                                        );
+                                    }
+                                }
+                                info!("[IntervalSniper] ✓ SL limit filled on recovery (order matched on cancel), position closed");
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.re_entry_allowed_after_sl = true;
+                                state.tp_limit_order_id = None;
+                                state.tp_placed_size = None;
+                                state.tp_cumulative_filled = Decimal::ZERO;
+                                state.tp_last_order_filled = Decimal::ZERO;
+                                state.tp_limit_balance_retries = 0;
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
+                                state.sl_cumulative_filled = Decimal::ZERO;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.sl_limit_last_rest_check_ms = None;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.allowance_cache = None;
+                                state.last_buy_order = None;
+                                state.balance_reflected_at_ms = None;
+                                state.balance_delay_clob_logged = false;
+                                state.last_logged_balance_up = None;
+                                state.last_logged_balance_down = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                                if let Some(ws) = ws_user_ref {
+                                    ws.clear_token_state(&sl.token_id).await;
+                                }
+                            } else {
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.allowance_cache = None;
+                                info!(
+                                    "[IntervalSniper] SL limit canceled (price recovered bid {} > trigger {}), balance freed for TP",
+                                    fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
+                                );
+                            }
                         }
 
                         // 2) Place GTC limit at best_bid when we have no resting SL order and remaining to sell.
@@ -2552,12 +2649,17 @@ pub async fn run() -> Result<()> {
                                                         break;
                                                     }
                                                     warn!(
-                                                        "[IntervalSniper] SL 'not enough balance' but balance={} — allowance lag, retrying",
-                                                        fmt_decimal_2(&balance_check.unwrap_or(Decimal::ZERO))
+                                                        "[IntervalSniper] SL 'not enough balance' but balance={} — allowance lag, retrying every {}ms",
+                                                        fmt_decimal_2(&balance_check.unwrap_or(Decimal::ZERO)),
+                                                        TP_SL_BALANCE_RETRY_MS
                                                     );
                                                 }
                                             }
-                                            tokio::time::sleep(Duration::from_millis(150)).await;
+                                            if now_unix() >= market.close_time_unix {
+                                                trace!("[IntervalSniper] SL place deferred: interval ended");
+                                                break;
+                                            }
+                                            tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
                                             state.allowance_cache = None;
                                             result = clob
                                                 .place_sell_order(
@@ -2993,7 +3095,9 @@ pub async fn run() -> Result<()> {
 
                         // 2) Place GTC limit at target only when price has touched TP - 0.01; cancel if it drops back to entry.
                         // Skip if we just detected TP fill this iteration (position already closed; avoid "not enough balance").
-                        if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() {
+                        // Skip if we have a resting SL limit order: the CLOB locks balance for that order, so placing TP
+                        // would get "not enough balance" (TP and SL are mutually exclusive for the same position).
+                        if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() && state.sl_limit_order_id.is_none() {
                             let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
                                 let position_remaining = tp.size.clone() - state.tp_cumulative_filled.clone();
@@ -3014,34 +3118,42 @@ pub async fn run() -> Result<()> {
                                 // On re-entry after SL, we must not treat the new position as "dust after SL": require sl_cumulative_filled > 0
                                 // so only the remainder from an SL that already filled counts. Also skip closing when position_remaining >= MIN
                                 // but available is stale (e.g. WS balance not yet updated after new fill).
-                                if size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE {
-                                    let dust_after_sl = state.pending_stop_loss.is_some()
-                                        && state.sl_cumulative_filled > Decimal::ZERO
-                                        && state.tp_cumulative_filled.is_zero();
-                                    let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
+                                // BUG FIX: when size == 0 (e.g. REST balance still 0 after WS fill), we must still use the stale_available
+                                // path — otherwise we never place TP until REST catches up, which can be too late or never.
+                                let dust_after_sl = state.pending_stop_loss.is_some()
+                                    && state.sl_cumulative_filled > Decimal::ZERO
+                                    && state.tp_cumulative_filled.is_zero();
+                                let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
+                                if (size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE) || (size.is_zero() && stale_available && !dust_after_sl) {
                                     if stale_available && !dust_after_sl {
-                                        // Balance not yet updated after re-entry (e.g. WS still shows 0.01 from previous SL dust).
-                                        // Same as first buy: only place TP with position_size when CLOB has had time to update.
-                                        // If fill was very recent, skip this tick so next tick balance may have propagated (avoids 400 "not enough balance").
-                                        const TP_WAIT_AFTER_FILL_MS: u64 = 500;
-                                        let fill_very_recent = state
-                                            .last_buy_order
-                                            .as_ref()
-                                            .map_or(false, |b| now_ms_u.saturating_sub(b.timestamp_ms) < TP_WAIT_AFTER_FILL_MS);
-                                        let size_to_place = floor_to_decimals(
+                                        // Balance not yet updated after WS fill: retry every 200ms until interval ends or REST balance matches fill size (same rounding as WS balance after fill).
+                                        let expected_size = floor_to_decimals(
                                             position_size_real.min(state.config.size_shares),
                                             SELL_SIZE_DECIMALS,
                                         );
-                                        if fill_very_recent {
-                                            debug!(
-                                                "[IntervalSniper] TP: skip placing with position_size this tick (fill {}ms ago, wait for CLOB balance to propagate)",
-                                                state.last_buy_order.as_ref().map_or(0, |b| now_ms_u.saturating_sub(b.timestamp_ms))
-                                            );
-                                        } else if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
-                                            debug!(
-                                                "[IntervalSniper] TP using position size {} (available stale {}) — placing limit",
-                                                fmt_decimal_2(&size_to_place), fmt_decimal_2(&size)
-                                            );
+                                        let mut tp_placed = false;
+                                        while !tp_placed {
+                                            if now_unix() >= market.close_time_unix {
+                                                debug!(
+                                                    "[IntervalSniper] TP place deferred: interval ended, will retry next tick"
+                                                );
+                                                break;
+                                            }
+                                            state.allowance_cache = None;
+                                            let rest_balance = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                                            let size_to_place = if let Some(av) = rest_balance {
+                                                if av >= expected_size * dec!(0.99) {
+                                                    floor_to_decimals(expected_size.min(av), SELL_SIZE_DECIMALS)
+                                                } else {
+                                                    expected_size.clone()
+                                                }
+                                            } else {
+                                                expected_size.clone()
+                                            };
+                                            if size_to_place < CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                continue;
+                                            }
                                             let price = target;
                                             let result = clob
                                                 .place_sell_order(
@@ -3056,7 +3168,7 @@ pub async fn run() -> Result<()> {
                                                     &market.slug,
                                                     market.interval_start_unix,
                                                     market.close_time_unix,
-                                                    now_ms_u,
+                                                    now_ms(),
                                                     &tp.token_id,
                                                     "SELL",
                                                     "GTC",
@@ -3079,38 +3191,24 @@ pub async fn run() -> Result<()> {
                                                     result.order_id,
                                                     fmt_price(Some(&entry_price))
                                                 );
+                                                tp_placed = true;
                                             } else if is_position_closed_error(result.error_msg.as_deref()) {
                                                 state.tp_limit_balance_retries += 1;
                                                 if state.tp_limit_balance_retries == 1 {
                                                     warn!(
-                                                        "[IntervalSniper] TP limit balance/allowance error (retry {}), will retry with actual balance next tick (do not cancel — would cancel resting GTC entry)",
-                                                        state.tp_limit_balance_retries
+                                                        "[IntervalSniper] TP limit balance/allowance error — retrying every {}ms until REST balance reflects fill or interval ends",
+                                                        TP_SL_BALANCE_RETRY_MS
                                                     );
                                                     state.allowance_cache = None;
-                                                    match clob.get_balance_allowance(&tp.token_id).await {
-                                                        Ok(raw) => {
-                                                            let hint = format_balance_allowance_hint(&raw);
-                                                            warn!(
-                                                                "[IntervalSniper] balance-allowance for TP token: {}{}",
-                                                                raw.chars().take(300).collect::<String>(),
-                                                                hint
-                                                            );
-                                                        }
-                                                        Err(e) => warn!(
-                                                            "[IntervalSniper] could not fetch balance-allowance: {}",
-                                                            e
-                                                        ),
-                                                    }
                                                 }
+                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
                                             } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
                                                 state.tp_limit_balance_retries += 1;
                                                 state.allowance_cache = None;
+                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                            } else {
+                                                break;
                                             }
-                                        } else {
-                                            debug!(
-                                                "[IntervalSniper] TP skip: position_remaining {} >= MIN but available gives size {} (stale balance?), waiting",
-                                                fmt_decimal_2(&position_size_real), fmt_decimal_2(&size)
-                                            );
                                         }
                                     } else if dust_after_sl {
                                         // Dust left after SL filled (e.g. SL size was 5.99, left 0.01). Do not report as TP.
