@@ -48,6 +48,15 @@ fn exit_type_str(t: ExitType) -> &'static str {
     }
 }
 
+/// Emoji + label for Telegram: ✅ TP, ❌ SL, or MARKET_CLOSE.
+fn exit_type_telegram_display(t: ExitType) -> String {
+    match t {
+        ExitType::TakeProfit => "✅ TP".to_string(),
+        ExitType::StopLoss => "❌ SL".to_string(),
+        ExitType::MarketClose => "MARKET_CLOSE".to_string(),
+    }
+}
+
 fn side_str(side: EntrySide) -> &'static str {
     match side {
         EntrySide::Up => "Up",
@@ -263,12 +272,13 @@ impl SessionLog {
             if !skip_telegram {
                 let interval_label = format!("{} · {}", asset_from_slug(slug), interval_lisbon_time(interval_start_unix));
                 // Real USDC values (as in Polymarket history): cost = size*entry_price, proceeds = size*exit_price.
+                let exit_display = exit_type_telegram_display(exit_type);
                 let msg = match self.telegram_msg_format {
                 1 => format!(
                     "📌 Close\n{} · {} {}\n├ Entrada: ${}  →  Venta: ${}\n└ PnL: ${}",
                     interval_label,
                     side_str(side),
-                    exit_type_str(exit_type),
+                    exit_display,
                     fmt_decimal_2(&entry_value_usd),
                     fmt_decimal_2(&exit_value_usd),
                     fmt_decimal_2(&pnl)
@@ -278,15 +288,15 @@ impl SessionLog {
                     asset_from_slug(slug),
                     interval_lisbon_time(interval_start_unix),
                     side_str(side),
-                    exit_type_str(exit_type),
+                    exit_display,
                     fmt_decimal_2(&entry_value_usd),
                     fmt_decimal_2(&exit_value_usd),
                     fmt_decimal_2(&pnl)
                 ),
                 _ => format!(
-                    "✓ {} {}  Entrada ${} → Venta ${}  PnL ${}  ({})",
+                    "{} {}  Entrada ${} → Venta ${}  PnL ${}  ({})",
                     side_str(side),
-                    exit_type_str(exit_type),
+                    exit_display,
                     fmt_decimal_2(&entry_value_usd),
                     fmt_decimal_2(&exit_value_usd),
                     fmt_decimal_2(&pnl),
