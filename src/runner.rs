@@ -1,7 +1,7 @@
 //! Main loop: interval switch, top-of-book, buy in range, TP/SL.
 
 #[allow(unused_imports)]
-use crate::clob::{parse_sell_order_usd_received, ClobClient, LimitOrderParams, OrderSide, OrderType};
+use crate::clob::{ClobClient, LimitOrderParams, OrderSide, OrderType};
 use crate::clob_ws_book::ClobWsBook;
 use crate::clob_ws_user::ClobWsUser;
 use crate::config::{current_5min_slug, load_config};
@@ -289,27 +289,6 @@ fn effective_sell_size(
     } else {
         result
     }
-}
-
-/// Retry GET /order until takingAmount is available (real exit value). No terminal logs.
-/// Polls every 20s so that when the exchange reports the real trade value (sometimes ~3 min), we send it to Telegram.
-async fn fetch_real_exit_usd_with_retry(
-    clob: &dyn ClobClient,
-    exit_order_id: &str,
-) -> Option<Decimal> {
-    const DELAY_SECS: u64 = 20;
-    const MAX_ATTEMPTS: u32 = 15; // 15 * 20s = up to 5 min wait for real value
-    for _ in 0..MAX_ATTEMPTS {
-        if let Ok(j) = clob.get_order(exit_order_id).await {
-            if let Some(usd) = parse_sell_order_usd_received(&j) {
-                if usd > Decimal::ZERO {
-                    return Some(usd);
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(DELAY_SECS)).await;
-    }
-    None
 }
 
 fn fmt_price(p: Option<&Decimal>) -> String {
@@ -2322,11 +2301,7 @@ pub async fn run() -> Result<()> {
                                         fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
                                     );
                                 }
-                                let real_exit_usd = if let Some(oid) = state.sl_limit_order_id.as_deref() {
-                                    fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
-                                } else {
-                                    None
-                                };
+                                // Don't block on real_exit_usd: session_log uses computed value (size*exit_price); Telegram gets message immediately.
                                 if let Some(ref mut log) = state.session_log {
                                     if let Some(ref buy) = state.last_buy_order {
                                         let _ = log.log_position_close(
@@ -2338,8 +2313,8 @@ pub async fn run() -> Result<()> {
                                             state.interval_min_bid_down, state.interval_max_bid_down,
                                             None,
                                             None,
-                                            real_exit_usd,
-                                            true,
+                                            None,
+                                            false,
                                         );
                                     }
                                 }
@@ -2414,7 +2389,6 @@ pub async fn run() -> Result<()> {
                                             fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
                                         );
                                     }
-                                    let real_exit_usd = fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await;
                                     if let Some(ref mut log) = state.session_log {
                                         if let Some(ref buy) = state.last_buy_order {
                                             let _ = log.log_position_close(
@@ -2426,8 +2400,8 @@ pub async fn run() -> Result<()> {
                                                 state.interval_min_bid_down, state.interval_max_bid_down,
                                                 None,
                                                 None,
-                                                real_exit_usd,
-                                                true,
+                                                None,
+                                                false,
                                             );
                                         }
                                     }
@@ -2725,7 +2699,6 @@ pub async fn run() -> Result<()> {
                                                         fill_event_type, fmt_decimal_2(&delta), fmt_price(Some(&target)),
                                                         fmt_decimal_2(&state.tp_cumulative_filled), fmt_decimal_2(&tp.size), pnl, roi_pct, held_sec
                                                     );
-                                                    let real_exit_usd = fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await;
                                                     if let Some(ref mut log) = state.session_log {
                                                         let _ = log.log_position_close(
                                                             &market.slug, market.interval_start_unix, market.close_time_unix,
@@ -2736,8 +2709,8 @@ pub async fn run() -> Result<()> {
                                                             state.interval_min_bid_down, state.interval_max_bid_down,
                                                             None,
                                                             None,
-                                                            real_exit_usd,
-                                                            true,
+                                                            None,
+                                                            false,
                                                         );
                                                     }
                                                 }
@@ -2771,7 +2744,6 @@ pub async fn run() -> Result<()> {
                                                 "[IntervalSniper] ✓ TP limit filled @ {} — position closed (cancel returned already matched)",
                                                 fmt_price(Some(&target))
                                             );
-                                            let real_exit_usd = fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await;
                                             if let Some(ref mut log) = state.session_log {
                                                 if let Some(ref buy) = state.last_buy_order {
                                                     let _ = log.log_position_close(
@@ -2794,8 +2766,8 @@ pub async fn run() -> Result<()> {
                                                         state.interval_max_bid_down,
                                                         None,
                                                         None,
-                                                        real_exit_usd,
-                                                        true,
+                                                        None,
+                                                        false,
                                                     );
                                                 }
                                             }
@@ -2864,11 +2836,6 @@ pub async fn run() -> Result<()> {
                                                 );
                                             }
 
-                                            let real_exit_usd = if let Some(oid) = state.tp_limit_order_id.as_deref() {
-                                                fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
-                                            } else {
-                                                None
-                                            };
                                             if let Some(ref mut log) = state.session_log {
                                                 if let Some(ref buy) = state.last_buy_order {
                                                     let _ = log.log_position_close(
@@ -2880,8 +2847,8 @@ pub async fn run() -> Result<()> {
                                                         state.interval_min_bid_down, state.interval_max_bid_down,
                                                         None,
                                                         None,
-                                                        real_exit_usd,
-                                                        true,
+                                                        None,
+                                                        false,
                                                     );
                                                 }
                                             }
@@ -2961,11 +2928,6 @@ pub async fn run() -> Result<()> {
                                                     );
                                                 }
 
-                                                let real_exit_usd = if let Some(ref oid) = state.tp_limit_order_id {
-                                                    fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
-                                                } else {
-                                                    None
-                                                };
                                                 if let Some(ref mut log) = state.session_log {
                                                     if let Some(ref buy) = state.last_buy_order {
                                                         let _ = log.log_position_close(
@@ -2977,8 +2939,8 @@ pub async fn run() -> Result<()> {
                                                             state.interval_min_bid_down, state.interval_max_bid_down,
                                                             None,
                                                             None,
-                                                            real_exit_usd,
-                                                            true,
+                                                            None,
+                                                            false,
                                                         );
                                                     }
                                                 }
@@ -3313,11 +3275,6 @@ pub async fn run() -> Result<()> {
                                                     "[IntervalSniper] ✓ TP emergency FOK sell filled @ {} — position closed",
                                                     fmt_price(Some(&fok_price))
                                                 );
-                                                let real_exit_usd = if let Some(oid) = fok_result.order_id.as_deref() {
-                                                    fetch_real_exit_usd_with_retry(clob.as_ref().as_ref(), oid).await
-                                                } else {
-                                                    None
-                                                };
                                                 if let Some(ref mut log) = state.session_log {
                                                     if let Some(ref buy) = state.last_buy_order {
                                                         let _ = log.log_position_close(
@@ -3340,8 +3297,8 @@ pub async fn run() -> Result<()> {
                                                             state.interval_max_bid_down,
                                                             None,
                                                             None,
-                                                            real_exit_usd,
-                                                            true,
+                                                            None,
+                                                            false,
                                                         );
                                                     }
                                                 }
