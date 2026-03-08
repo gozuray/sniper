@@ -261,6 +261,14 @@ impl ClobWsUser {
 
             if let Some(order_id) = id {
                 let key = normalize_order_id(&order_id);
+                let mut map = state.write().await;
+                // Never decrease size_matched: TRADE events may have already accumulated partial fills (e.g. 10+2=12);
+                // if this ORDER UPDATE has a stale or partial size_matched, keep the higher value.
+                let size_matched = if let Some(existing) = map.get(&key) {
+                    size_matched.max(existing.size_matched)
+                } else {
+                    size_matched
+                };
                 let entry = UserOrderState {
                     order_id: key.clone(),
                     asset_id,
@@ -269,7 +277,6 @@ impl ClobWsUser {
                     size_matched,
                     order_type: order_type.clone(),
                 };
-                let mut map = state.write().await;
                 map.insert(key, entry);
             }
         } else if event_type == "trade" {
@@ -294,16 +301,21 @@ impl ClobWsUser {
                     let key = normalize_order_id(&oid);
                     let mut map = state.write().await;
                     if let Some(existing) = map.get_mut(&key) {
-                        // Never add: use max so duplicate trade events for the same fill don't double-count.
-                        // (Exchange may send multiple "trade" events for one fill; we want at most the fill size once per order.)
-                        let new_matched = existing.size_matched.max(trade_size);
-                        existing.size_matched = new_matched;
+                        // Accumulate: each trade event is one partial fill; Polymarket sends one event per fill (e.g. 10 then 2 → total 12).
+                        // Cap by original_size when known so we never exceed order size and duplicate events don't double-count.
+                        let new_matched = existing.size_matched + trade_size;
+                        existing.size_matched = if existing.original_size > Decimal::ZERO {
+                            new_matched.min(existing.original_size)
+                        } else {
+                            new_matched
+                        };
                     } else {
+                        // New order known only from this trade; don't set original_size so we don't cap future partials until we get an ORDER event.
                         map.insert(key.clone(), UserOrderState {
                             order_id: key,
                             asset_id,
                             side,
-                            original_size: trade_size,
+                            original_size: Decimal::ZERO,
                             size_matched: trade_size,
                             order_type: "TRADE".to_string(),
                         });
