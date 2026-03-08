@@ -267,12 +267,13 @@ fn effective_sell_size(
 }
 
 /// Retry GET /order until takingAmount is available (real exit value). No terminal logs.
+/// Polls every 20s so that when the exchange reports the real trade value (sometimes ~3 min), we send it to Telegram.
 async fn fetch_real_exit_usd_with_retry(
     clob: &dyn ClobClient,
     exit_order_id: &str,
 ) -> Option<Decimal> {
-    const MAX_ATTEMPTS: u32 = 15;
-    const DELAY_MS: u64 = 2000;
+    const DELAY_SECS: u64 = 20;
+    const MAX_ATTEMPTS: u32 = 15; // 15 * 20s = up to 5 min wait for real value
     for _ in 0..MAX_ATTEMPTS {
         if let Ok(j) = clob.get_order(exit_order_id).await {
             if let Some(usd) = parse_sell_order_usd_received(&j) {
@@ -281,7 +282,7 @@ async fn fetch_real_exit_usd_with_retry(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
+        tokio::time::sleep(Duration::from_secs(DELAY_SECS)).await;
     }
     None
 }
