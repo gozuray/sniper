@@ -184,12 +184,37 @@ struct RunnerState {
     pending_gtc_last_observed_filled: Option<Decimal>,
     /// Per-tick fill deltas for the pending GTC order (for log line "N partials: a, b, c").
     pending_gtc_fill_deltas: Vec<Decimal>,
-    /// Cached result of get_available_balance for the current position token (TTL 3s).
-    allowance_cache: Option<(Decimal, Instant)>,
+    /// Cached result of get_available_balance per token (TTL 3s). (token_id, value, instant).
+    allowance_cache: Option<(String, Decimal, Instant)>,
     /// Optional Telegram log: enqueues messages in background (no delay in hot path).
     telegram: Option<TelegramLog>,
     /// Keep the Telegram sender task alive.
     telegram_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Parse balance from balance-allowance raw JSON; balance is in 6-decimal raw units (6620 = 0.00662 shares).
+fn format_balance_allowance_hint(raw: &str) -> String {
+    let json: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(j) => j,
+        Err(_) => return String::new(),
+    };
+    let raw_val: Decimal = match json.get("balance") {
+        Some(serde_json::Value::String(s)) => match Decimal::from_str(s) {
+            Ok(d) => d,
+            Err(_) => return String::new(),
+        },
+        Some(serde_json::Value::Number(n)) => match n.as_u64().map(Decimal::from).or_else(|| n.as_i64().map(Decimal::from)) {
+            Some(d) => d,
+            None => return String::new(),
+        },
+        _ => return String::new(),
+    };
+    let shares = raw_val / dec!(1000000);
+    format!(
+        " (balance {} raw = {} shares — if low, CLOB has not updated after fill yet)",
+        raw_val,
+        fmt_decimal_2(&shares)
+    )
 }
 
 fn now_unix() -> u64 {
@@ -344,7 +369,7 @@ async fn get_available_for_sell(
     clob: &dyn ClobClient,
     ws_user: Option<&ClobWsUser>,
     token_id: &str,
-    cache: &mut Option<(Decimal, Instant)>,
+    cache: &mut Option<(String, Decimal, Instant)>,
     sl_loop: bool,
 ) -> Option<Decimal> {
     let ws_balance = if let Some(ws) = ws_user {
@@ -354,20 +379,20 @@ async fn get_available_for_sell(
     };
 
     const REST_CACHE_TTL: Duration = Duration::from_secs(3);
-    let rest_effective = if let Some((cached_val, cached_at)) = cache {
-        if cached_at.elapsed() < REST_CACHE_TTL {
+    let rest_effective = if let Some((cached_token, cached_val, cached_at)) = cache {
+        if cached_token == token_id && cached_at.elapsed() < REST_CACHE_TTL {
             Some(*cached_val)
         } else {
             let fresh = clob.get_available_balance(token_id).await.ok().flatten();
             if let Some(v) = fresh {
-                *cache = Some((v, Instant::now()));
+                *cache = Some((token_id.to_string(), v, Instant::now()));
             }
             fresh
         }
     } else {
         let fresh = clob.get_available_balance(token_id).await.ok().flatten();
         if let Some(v) = fresh {
-            *cache = Some((v, Instant::now()));
+            *cache = Some((token_id.to_string(), v, Instant::now()));
         }
         fresh
     };
@@ -3027,12 +3052,23 @@ pub async fn run() -> Result<()> {
                                     let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
                                     if stale_available && !dust_after_sl {
                                         // Balance not yet updated after re-entry (e.g. WS still shows 0.01 from previous SL dust).
-                                        // Place TP using position size from state so we don't block TP until balance propagates.
+                                        // Same as first buy: only place TP with position_size when CLOB has had time to update.
+                                        // If fill was very recent, skip this tick so next tick balance may have propagated (avoids 400 "not enough balance").
+                                        const TP_WAIT_AFTER_FILL_MS: u64 = 500;
+                                        let fill_very_recent = state
+                                            .last_buy_order
+                                            .as_ref()
+                                            .map_or(false, |b| now_ms_u.saturating_sub(b.timestamp_ms) < TP_WAIT_AFTER_FILL_MS);
                                         let size_to_place = floor_to_decimals(
                                             position_size_real.min(state.config.size_shares),
                                             SELL_SIZE_DECIMALS,
                                         );
-                                        if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                        if fill_very_recent {
+                                            debug!(
+                                                "[IntervalSniper] TP: skip placing with position_size this tick (fill {}ms ago, wait for CLOB balance to propagate)",
+                                                state.last_buy_order.as_ref().map_or(0, |b| now_ms_u.saturating_sub(b.timestamp_ms))
+                                            );
+                                        } else if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
                                             debug!(
                                                 "[IntervalSniper] TP using position size {} (available stale {}) — placing limit",
                                                 fmt_decimal_2(&size_to_place), fmt_decimal_2(&size)
@@ -3083,10 +3119,14 @@ pub async fn run() -> Result<()> {
                                                     );
                                                     state.allowance_cache = None;
                                                     match clob.get_balance_allowance(&tp.token_id).await {
-                                                        Ok(raw) => warn!(
-                                                            "[IntervalSniper] balance-allowance for TP token: {}",
-                                                            raw.chars().take(300).collect::<String>()
-                                                        ),
+                                                        Ok(raw) => {
+                                                            let hint = format_balance_allowance_hint(&raw);
+                                                            warn!(
+                                                                "[IntervalSniper] balance-allowance for TP token: {}{}",
+                                                                raw.chars().take(300).collect::<String>(),
+                                                                hint
+                                                            );
+                                                        }
                                                         Err(e) => warn!(
                                                             "[IntervalSniper] could not fetch balance-allowance: {}",
                                                             e
@@ -3230,10 +3270,14 @@ pub async fn run() -> Result<()> {
                                             state.allowance_cache = None;
                                             // Log raw balance-allowance JSON so we know if it's balance=0 or allowance=0.
                                             match clob.get_balance_allowance(&tp.token_id).await {
-                                                Ok(raw) => warn!(
-                                                    "[IntervalSniper] balance-allowance for TP token: {}",
-                                                    raw.chars().take(300).collect::<String>()
-                                                ),
+                                                Ok(raw) => {
+                                                    let hint = format_balance_allowance_hint(&raw);
+                                                    warn!(
+                                                        "[IntervalSniper] balance-allowance for TP token: {}{}",
+                                                        raw.chars().take(300).collect::<String>(),
+                                                        hint
+                                                    );
+                                                }
                                                 Err(e) => warn!(
                                                     "[IntervalSniper] could not fetch balance-allowance: {}",
                                                     e
