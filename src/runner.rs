@@ -1035,8 +1035,20 @@ pub async fn run() -> Result<()> {
                             fmt_decimal_2(&requested)
                         );
                     }
-                    // Allow partial fill: set TP/SL for actual filled size so we don't place TP for more than we have (and avoid balance error → cancel).
+                    // Place TP/SL on any fill >= MIN; if fill grows (partials), update position and replace TP/SL with new total size.
+                    let prev_filled = state
+                        .last_buy_order
+                        .as_ref()
+                        .and_then(|b| {
+                            if b.order_id.as_ref() == state.pending_gtc_order_id.as_ref() {
+                                Some(b.size.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(Decimal::ZERO);
                     if filled >= MIN_SELL_SIZE
+                        && filled > prev_filled
                         && state.pending_gtc_token_id.is_some()
                         && state.pending_gtc_side.is_some()
                         && state.pending_gtc_price.is_some()
@@ -1045,8 +1057,20 @@ pub async fn run() -> Result<()> {
                         let token_id = state.pending_gtc_token_id.as_ref().unwrap().clone();
                         let entry_side = state.pending_gtc_side.unwrap();
                         let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
-                        state.trades_this_interval += 1;
-                        state.total_shares_this_interval += filled.clone();
+                        let is_additional_fill = prev_filled >= MIN_SELL_SIZE;
+                        if is_additional_fill {
+                            // Fill grew (e.g. 11 -> 12): cancel only TP/SL orders so we replace with total size (do not cancel resting GTC buy).
+                            if let Some(ref oid) = state.tp_limit_order_id {
+                                let _ = clob.cancel_order(oid).await;
+                            }
+                            if let Some(ref oid) = state.sl_limit_order_id {
+                                let _ = clob.cancel_order(oid).await;
+                            }
+                            state.total_shares_this_interval += filled.clone() - prev_filled.clone();
+                        } else {
+                            state.trades_this_interval += 1;
+                            state.total_shares_this_interval += filled.clone();
+                        }
                         state.last_buy_order = Some(LastBuyOrder {
                             order_id: state.pending_gtc_order_id.clone(),
                             token_id: token_id.clone(),
@@ -1055,16 +1079,18 @@ pub async fn run() -> Result<()> {
                             price: entry_price.clone(),
                             timestamp_ms: state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u),
                         });
-                        if let Some(ref mut log) = state.session_log {
-                            let _ = log.log_order_filled(
-                                &market.slug,
-                                market.interval_start_unix,
-                                market.close_time_unix,
-                                now_ms_u,
-                                &order_id_full,
-                                filled.clone(),
-                                "ws_user",
-                            );
+                        if !is_additional_fill {
+                            if let Some(ref mut log) = state.session_log {
+                                let _ = log.log_order_filled(
+                                    &market.slug,
+                                    market.interval_start_unix,
+                                    market.close_time_unix,
+                                    now_ms_u,
+                                    &order_id_full,
+                                    filled.clone(),
+                                    "ws_user",
+                                );
+                            }
                         }
                         let fill_lag_ms = now_ms_u.saturating_sub(state.pending_gtc_timestamp_ms.unwrap_or(now_ms_u));
                         let target_price = if state.config.auto_sell_at_max_price {
@@ -1118,14 +1144,17 @@ pub async fn run() -> Result<()> {
                         } else {
                             String::new()
                         };
-                        state.pending_gtc_order_id = None;
-                        state.pending_gtc_token_id = None;
-                        state.pending_gtc_side = None;
-                        state.pending_gtc_price = None;
-                        state.pending_gtc_requested_size = None;
-                        state.pending_gtc_timestamp_ms = None;
-                        state.pending_gtc_last_observed_filled = None;
-                        state.pending_gtc_fill_deltas.clear();
+                        // Clear GTC state only when order is fully filled, so we keep polling for more partials.
+                        if filled >= requested {
+                            state.pending_gtc_order_id = None;
+                            state.pending_gtc_token_id = None;
+                            state.pending_gtc_side = None;
+                            state.pending_gtc_price = None;
+                            state.pending_gtc_requested_size = None;
+                            state.pending_gtc_timestamp_ms = None;
+                            state.pending_gtc_last_observed_filled = None;
+                            state.pending_gtc_fill_deltas.clear();
+                        }
                         let side_str = match entry_side {
                             EntrySide::Up => "Up  ",
                             EntrySide::Down => "Down",
