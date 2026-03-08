@@ -3129,6 +3129,14 @@ pub async fn run() -> Result<()> {
                         if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() && state.sl_limit_order_id.is_none() {
                             let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
+                                // Log reactivation when we're retrying after balance/retry was cancelled (e.g. price dropped to entry then came back)
+                                if state.tp_limit_balance_retries > 0 {
+                                    info!(
+                                        "[IntervalSniper] TP reactivation: price back at target (bid {} >= {}), retrying placement",
+                                        fmt_price(Some(&best_bid)),
+                                        fmt_price(Some(&tp_activation_price))
+                                    );
+                                }
                                 let position_remaining = tp.size.clone() - state.tp_cumulative_filled.clone();
                                 let position_size_real = position_remaining;
                                 let available =
@@ -3199,10 +3207,11 @@ pub async fn run() -> Result<()> {
                                             };
                                             if current_best_bid <= entry_price {
                                                 info!(
-                                                    "[IntervalSniper] TP limit retries cancelled: price dropped to {} (at or below entry {})",
+                                                    "[IntervalSniper] TP limit retries cancelled: price dropped to {} (at or below entry {}) — will retry placement when price returns to target (next tick)",
                                                     fmt_price(Some(&current_best_bid)),
                                                     fmt_price(Some(&entry_price))
                                                 );
+                                                state.allowance_cache = None; // so next tick gets fresh balance when we re-enter
                                                 break;
                                             }
                                             state.allowance_cache = None;
