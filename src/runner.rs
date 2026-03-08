@@ -502,7 +502,7 @@ async fn log_balance_after_buy(
 }
 
 /// Fetch CLOB balance for both tokens and log every BALANCE_LOG_INTERVAL_MS when holding a position.
-/// When balance is from WS: logs "[IntervalSniper] WS balance after fill: Up=X Down=Y (0ms)". When from REST: logs CLOB balance and delay until reflected.
+/// "WS balance after fill" / "Balance from fill (instant)" only when the position was bought this interval; otherwise "WS balance" or "CLOB balance (REST)".
 async fn log_clob_balance_if_due(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
@@ -633,6 +633,13 @@ async fn log_clob_balance_if_due(
             }
         }
     }
+    // Only say "after fill" when the position came from a buy in *this* interval. WS can still
+    // return balance for the other token from previous intervals, so avoid misleading "after fill".
+    let fill_in_this_interval = state
+        .last_buy_order
+        .as_ref()
+        .map_or(false, |b| (b.timestamp_ms / 1000) >= market.interval_start_unix);
+
     let up_str = up
         .as_ref()
         .map(fmt_decimal_2)
@@ -643,18 +650,23 @@ async fn log_clob_balance_if_due(
         .unwrap_or_else(|| "-".to_string());
     let balance_changed = up != state.last_logged_balance_up || down != state.last_logged_balance_down;
     if balance_changed {
-        if balance_from_ws {
+        if balance_from_ws && fill_in_this_interval {
             info!(
                 "[IntervalSniper] WS balance after fill:  Up={}  Down={}  (0ms)",
                 up_str, down_str
             );
             state.balance_delay_clob_logged = true;
-        } else if balance_from_fill_instant {
+        } else if balance_from_fill_instant && fill_in_this_interval {
             info!(
                 "[IntervalSniper] Balance from fill (instant)  Up={}  Down={}  (0ms)",
                 up_str, down_str
             );
             state.balance_delay_clob_logged = true;
+        } else if balance_from_ws || balance_from_fill_instant {
+            info!(
+                "[IntervalSniper] WS balance:  Up={}  Down={}",
+                up_str, down_str
+            );
         } else {
             info!(
                 "[IntervalSniper] CLOB balance (REST)  Up={}  Down={}",
@@ -1873,13 +1885,15 @@ pub async fn run() -> Result<()> {
                             }
                         }
                     }
-                    // Clear accumulated WS fill state for old tokens so balance
-                    // calculations start fresh for the new interval.
-                    if let Some(ref old_market) = state.market {
-                        if let Some(ref ws) = state.ws_user {
+                    // Clear accumulated WS fill state so each interval starts at 0:
+                    // old tokens (previous interval) and new tokens (this interval).
+                    if let Some(ref ws) = state.ws_user {
+                        if let Some(ref old_market) = state.market {
                             ws.clear_token_state(&old_market.token_id_up).await;
                             ws.clear_token_state(&old_market.token_id_down).await;
                         }
+                        ws.clear_token_state(&market.token_id_up).await;
+                        ws.clear_token_state(&market.token_id_down).await;
                     }
                     state.market = Some(market.clone());
                     if !config.dry_run {
