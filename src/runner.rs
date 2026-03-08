@@ -589,7 +589,7 @@ async fn log_clob_balance_if_due(
 
     // Cap position-token balance by inferred remaining when in SL: WS can aggregate stale orders
     // or miss the SELL fill, showing e.g. 72.13 instead of ~0 after SL fill. Use min(ws, inferred).
-    let (up, down) = if let (Some(tid), Some(ref _sl), Some(ref buy)) = (
+    let (mut up, mut down) = if let (Some(tid), Some(ref _sl), Some(ref buy)) = (
         position_token_id,
         state.pending_stop_loss.as_ref(),
         state.last_buy_order.as_ref(),
@@ -644,6 +644,19 @@ async fn log_clob_balance_if_due(
         .last_buy_order
         .as_ref()
         .map_or(false, |b| (b.timestamp_ms / 1000) >= market.interval_start_unix);
+
+    // When WS returns 0 for the position token right after a buy (e.g. re-entry: WS still has
+    // previous SL sell, new BUY not yet reflected), show at least known_fill so we don't display misleading 0.
+    if fill_in_this_interval {
+        if let (Some(ref kf), Some(tid)) = (known_fill_for_position.as_ref(), position_token_id) {
+            let known = (*kf).clone();
+            if *tid == market.token_id_up && up.as_ref().map_or(true, |u| *u < known) {
+                up = Some(known.clone());
+            } else if *tid == market.token_id_down && down.as_ref().map_or(true, |d| *d < known) {
+                down = Some(known);
+            }
+        }
+    }
 
     let up_str = up
         .as_ref()
