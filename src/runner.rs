@@ -2210,6 +2210,97 @@ pub async fn run() -> Result<()> {
                             state.sl_limit_order_id = None;
                             state.sl_limit_order_price = None;
                         }
+                    } else if best_bid > sl.trigger_price + SL_TRIGGER_MARGIN && state.sl_limit_order_id.is_some() {
+                        // Price recovered above SL zone: cancel resting SL limit so balance is freed and we can place TP again.
+                        let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
+                        if let Some(ws_user) = ws_user_ref {
+                            if let Some(ref oid) = state.sl_limit_order_id {
+                                if let Some(final_fill) = ws_user.get_order_filled_size_sell(oid).await {
+                                    let delta = final_fill - state.sl_last_order_filled;
+                                    if delta > Decimal::ZERO {
+                                        state.sl_cumulative_filled += delta;
+                                    }
+                                }
+                            }
+                        }
+                        let sl_filled_via_cancel = cancel_result
+                            .as_ref()
+                            .ok()
+                            .and_then(|res| state.sl_limit_order_id.as_ref().and_then(|oid| res.not_canceled.get(oid.as_str())))
+                            .map(|r| {
+                                let lower = r.to_lowercase();
+                                lower.contains("matched")
+                            })
+                            .unwrap_or(false);
+                        if sl_filled_via_cancel {
+                            state.sl_cumulative_filled = sl.size.clone();
+                            let order_price = state.sl_limit_order_price.unwrap_or(best_bid);
+                            let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
+                                sl.size.clone() - state.tp_cumulative_filled.clone()
+                            } else {
+                                state.sl_cumulative_filled.clone()
+                            };
+                            if let Some(ref buy) = state.last_buy_order {
+                                let pnl = (order_price - buy.price) * total_filled.clone();
+                                let roi_pct = ((order_price / buy.price) - Decimal::ONE) * dec!(100);
+                                let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                info!(
+                                    "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (filled when price recovered)",
+                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&order_price),
+                                    fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
+                                );
+                            }
+                            if let Some(ref mut log) = state.session_log {
+                                if let Some(ref buy) = state.last_buy_order {
+                                    let _ = log.log_position_close(
+                                        &market.slug, market.interval_start_unix, market.close_time_unix,
+                                        buy.side, buy.price, order_price, buy.timestamp_ms, now_ms_u,
+                                        ExitType::StopLoss, total_filled.clone(), None,
+                                        buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
+                                        state.interval_min_bid_up, state.interval_max_bid_up,
+                                        state.interval_min_bid_down, state.interval_max_bid_down,
+                                        None, None, None, false,
+                                    );
+                                }
+                            }
+                            info!("[IntervalSniper] ✓ SL limit filled on recovery (order matched on cancel), position closed");
+                            state.stop_loss_placed = true;
+                            state.auto_sell_placed = true;
+                            state.re_entry_allowed_after_sl = true;
+                            state.tp_limit_order_id = None;
+                            state.tp_placed_size = None;
+                            state.tp_cumulative_filled = Decimal::ZERO;
+                            state.tp_last_order_filled = Decimal::ZERO;
+                            state.tp_limit_balance_retries = 0;
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
+                            state.sl_cumulative_filled = Decimal::ZERO;
+                            state.sl_last_order_filled = Decimal::ZERO;
+                            state.sl_limit_last_rest_check_ms = None;
+                            state.pending_auto_sell = None;
+                            state.pending_stop_loss = None;
+                            state.allowance_cache = None;
+                            state.last_buy_order = None;
+                            clear_pending_gtc(&mut state);
+                            state.balance_reflected_at_ms = None;
+                            state.balance_delay_clob_logged = false;
+                            state.last_logged_balance_up = None;
+                            state.last_logged_balance_down = None;
+                            state.total_shares_this_interval = Decimal::ZERO;
+                            if let Some(ws) = ws_user_ref {
+                                ws.clear_token_state(&sl.token_id).await;
+                            }
+                        } else {
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
+                            state.sl_last_order_filled = Decimal::ZERO;
+                            state.allowance_cache = None;
+                            info!(
+                                "[IntervalSniper] SL limit canceled (price recovered bid {} > trigger {}), balance freed for TP",
+                                fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
+                            );
+                        }
                     } else if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price + SL_TRIGGER_MARGIN {
                         // In SL zone (bid <= trigger + margin): try to place SL limit every tick while we have position and no resting SL order.
                         // First time in zone: cancel TP so balance is free for SL limit order.
@@ -2505,99 +2596,6 @@ pub async fn run() -> Result<()> {
                                         fmt_price(Some(&best_bid)), fmt_price(Some(&order_price))
                                     );
                                 }
-                            }
-                        } else if state.sl_limit_order_id.is_some() && best_bid > sl.trigger_price + SL_TRIGGER_MARGIN {
-                            // Price recovered above SL zone: cancel resting SL limit so balance is freed and we can place TP again.
-                            // (If bid were above our SL limit price, the CLOB would fill our sell immediately; if not yet filled,
-                            // we're back in "TP territory" so we cancel and release balance for TP.)
-                            let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
-                            if let Some(ws_user) = ws_user_ref {
-                                if let Some(ref oid) = state.sl_limit_order_id {
-                                    if let Some(final_fill) = ws_user.get_order_filled_size_sell(oid).await {
-                                        let delta = final_fill - state.sl_last_order_filled;
-                                        if delta > Decimal::ZERO {
-                                            state.sl_cumulative_filled += delta;
-                                        }
-                                    }
-                                }
-                            }
-                            let sl_filled_via_cancel = cancel_result
-                                .as_ref()
-                                .ok()
-                                .and_then(|res| state.sl_limit_order_id.as_ref().and_then(|oid| res.not_canceled.get(oid.as_str())))
-                                .map(|r| {
-                                    let lower = r.to_lowercase();
-                                    lower.contains("matched")
-                                })
-                                .unwrap_or(false);
-                            if sl_filled_via_cancel {
-                                state.sl_cumulative_filled = sl.size.clone();
-                                let order_price = state.sl_limit_order_price.unwrap_or(best_bid);
-                                let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
-                                    sl.size.clone() - state.tp_cumulative_filled.clone()
-                                } else {
-                                    state.sl_cumulative_filled.clone()
-                                };
-                                if let Some(ref buy) = state.last_buy_order {
-                                    let pnl = (order_price - buy.price) * total_filled.clone();
-                                    let roi_pct = ((order_price / buy.price) - Decimal::ONE) * dec!(100);
-                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
-                                    info!(
-                                        "[CLOSED] SL  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (filled when price recovered)",
-                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&order_price),
-                                        fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
-                                    );
-                                }
-                                if let Some(ref mut log) = state.session_log {
-                                    if let Some(ref buy) = state.last_buy_order {
-                                        let _ = log.log_position_close(
-                                            &market.slug, market.interval_start_unix, market.close_time_unix,
-                                            buy.side, buy.price, order_price, buy.timestamp_ms, now_ms_u,
-                                            ExitType::StopLoss, total_filled.clone(), None,
-                                            buy.order_id.as_deref(), state.sl_limit_order_id.as_deref(),
-                                            state.interval_min_bid_up, state.interval_max_bid_up,
-                                            state.interval_min_bid_down, state.interval_max_bid_down,
-                                            None, None, None, false,
-                                        );
-                                    }
-                                }
-                                info!("[IntervalSniper] ✓ SL limit filled on recovery (order matched on cancel), position closed");
-                                state.stop_loss_placed = true;
-                                state.auto_sell_placed = true;
-                                state.re_entry_allowed_after_sl = true;
-                                state.tp_limit_order_id = None;
-                                state.tp_placed_size = None;
-                                state.tp_cumulative_filled = Decimal::ZERO;
-                                state.tp_last_order_filled = Decimal::ZERO;
-                                state.tp_limit_balance_retries = 0;
-                                state.sl_limit_order_id = None;
-                                state.sl_limit_order_price = None;
-                                state.sl_cumulative_filled = Decimal::ZERO;
-                                state.sl_last_order_filled = Decimal::ZERO;
-                                state.sl_limit_last_rest_check_ms = None;
-                                state.pending_auto_sell = None;
-                                state.pending_stop_loss = None;
-                                state.allowance_cache = None;
-                                state.last_buy_order = None;
-                                clear_pending_gtc(&mut state);
-                                state.balance_reflected_at_ms = None;
-                                state.balance_delay_clob_logged = false;
-                                state.last_logged_balance_up = None;
-                                state.last_logged_balance_down = None;
-                                state.total_shares_this_interval = Decimal::ZERO;
-                                if let Some(ws) = ws_user_ref {
-                                    ws.clear_token_state(&sl.token_id).await;
-                                }
-                            } else {
-                                state.sl_limit_order_id = None;
-                                state.sl_limit_order_price = None;
-                                state.sl_last_order_filled = Decimal::ZERO;
-                                state.allowance_cache = None;
-                                info!(
-                                    "[IntervalSniper] SL limit canceled (price recovered bid {} > trigger {}), balance freed for TP",
-                                    fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
-                                );
                             }
                         }
 
