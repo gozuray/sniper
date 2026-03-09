@@ -1802,7 +1802,57 @@ pub async fn run() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            warn!("[IntervalSniper] could not check TP order at interval close: {}", e);
+                            let err_str = e.to_string();
+                            let is_404 = err_str.contains("404");
+                            if is_404 {
+                                // 404 at interval close usually means: order was cancelled when market resolved,
+                                // or (rarely) order was filled and API no longer returns it. Use balance as fallback.
+                                if let Some(ref tp) = state.pending_auto_sell {
+                                    if let Ok(Some(bal)) = clob.get_available_balance(&tp.token_id).await {
+                                        if bal < DUST_THRESHOLD {
+                                            // Balance ~0 → position was closed (TP filled or settled at resolution)
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let exit_price = round_to_tick(tp.target_price.clone());
+                                                let pnl = (exit_price.clone() - buy.price) * buy.size.clone();
+                                                let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                                let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                info!(
+                                                    "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (inferred at interval close: get_order 404, balance≈0)",
+                                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price),
+                                                    fmt_decimal_2(&buy.size), pnl, roi_pct, held_sec
+                                                );
+                                            }
+                                            info!("[IntervalSniper] ✓ TP inferred filled @ interval boundary (get_order 404, balance≈0)");
+                                            state.tp_limit_order_id = None;
+                                            state.tp_placed_size = None;
+                                            state.tp_cumulative_filled = Decimal::ZERO;
+                                            state.tp_last_order_filled = Decimal::ZERO;
+                                            state.tp_limit_balance_retries = 0;
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_cumulative_filled = Decimal::ZERO;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.last_buy_order = None;
+                                            clear_pending_gtc(&mut state);
+                                            state.allowance_cache = None;
+                                        } else {
+                                            warn!(
+                                                "[IntervalSniper] TP order returned 404 at interval close (order likely cancelled when market resolved); balance={} — position still open",
+                                                fmt_decimal_2(&bal)
+                                            );
+                                        }
+                                    } else {
+                                        warn!("[IntervalSniper] could not check TP order at interval close: {} (get_order 404; balance check failed)", e);
+                                    }
+                                } else {
+                                    warn!("[IntervalSniper] could not check TP order at interval close: {}", e);
+                                }
+                            } else {
+                                warn!("[IntervalSniper] could not check TP order at interval close: {}", e);
+                            }
                         }
                     }
                 }
@@ -3290,13 +3340,66 @@ pub async fn run() -> Result<()> {
                                         );
                                         let mut tp_placed = false;
                                         while !tp_placed {
-                                            if now_unix() >= market.close_time_unix {
-                                                debug!(
-                                                    "[IntervalSniper] TP place deferred: interval ended, will retry next tick"
-                                                );
+                                            let interval_ended = now_unix() >= market.close_time_unix;
+                                            if interval_ended {
+                                                // No "next tick" for this market: next iteration is need_new_market and we skip TP block.
+                                                // So do one final placement attempt instead of deferring.
+                                                state.allowance_cache = None;
+                                                let rest_balance = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                                                let size_to_place = if let Some(av) = rest_balance {
+                                                    if av >= expected_size * dec!(0.99) {
+                                                        floor_to_decimals(expected_size.min(av), SELL_SIZE_DECIMALS)
+                                                    } else {
+                                                        expected_size.clone()
+                                                    }
+                                                } else {
+                                                    expected_size.clone()
+                                                };
+                                                if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                    let price = target;
+                                                    let result = clob
+                                                        .place_sell_order(
+                                                            &tp.token_id,
+                                                            price,
+                                                            size_to_place.clone(),
+                                                            crate::types::SellOrderTimeInForce::Gtc,
+                                                        )
+                                                        .await?;
+                                                    if let Some(ref mut log) = state.session_log {
+                                                        let _ = log.log_order_submitted(
+                                                            &market.slug,
+                                                            market.interval_start_unix,
+                                                            market.close_time_unix,
+                                                            now_ms(),
+                                                            &tp.token_id,
+                                                            "SELL",
+                                                            "GTC",
+                                                            price,
+                                                            size_to_place.clone(),
+                                                            result.order_id.as_deref(),
+                                                            result.http_status,
+                                                            result.success,
+                                                            result.error_msg.as_deref(),
+                                                        );
+                                                    }
+                                                    if result.success {
+                                                        state.tp_limit_order_id = result.order_id.clone();
+                                                        state.tp_placed_size = Some(size_to_place.clone());
+                                                        state.tp_limit_balance_retries = 0;
+                                                        info!(
+                                                            "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (final attempt at interval end)",
+                                                            fmt_price(Some(&price)),
+                                                            fmt_decimal_2(&size_to_place),
+                                                            result.order_id
+                                                        );
+                                                        tp_placed = true;
+                                                    }
+                                                }
                                                 break;
                                             }
-                                            // Cancel retries if price dropped back to entry or below (no point placing TP above market).
+                                            // Cancel retries only when price has dropped into SL zone (so SL logic takes over).
+                                            // Do NOT cancel just because price touched entry — keep retrying so balance can update and we place TP
+                                            // when price is at/above target (avoids missing TP when price briefly dips to entry then recovers).
                                             let top_current = if let Some(ref ws) = state.ws_book {
                                                 ws.get_top_of_book().await
                                             } else {
@@ -3325,15 +3428,18 @@ pub async fn run() -> Result<()> {
                                                     .and_then(|s| s.best_bid)
                                                     .unwrap_or(Decimal::ZERO)
                                             };
-                                            // Only cancel retries when price has dropped *below* entry. If bid == entry we keep
-                                            // retrying so we can place TP when balance is ready (TP limit will rest until price reaches target).
-                                            if current_best_bid < entry_price {
+                                            let sl_zone_upper = state
+                                                .pending_stop_loss
+                                                .as_ref()
+                                                .map(|sl| sl.trigger_price + SL_TRIGGER_MARGIN)
+                                                .unwrap_or(entry_price);
+                                            if current_best_bid <= sl_zone_upper {
                                                 info!(
-                                                    "[IntervalSniper] TP limit retries cancelled: price dropped to {} (below entry {}) — will retry placement when price returns to target (next tick)",
+                                                    "[IntervalSniper] TP limit retries cancelled: price in SL zone (bid {} <= {}), SL will take over — will retry TP when price returns to target (next tick)",
                                                     fmt_price(Some(&current_best_bid)),
-                                                    fmt_price(Some(&entry_price))
+                                                    fmt_price(Some(&sl_zone_upper))
                                                 );
-                                                state.allowance_cache = None; // so next tick gets fresh balance when we re-enter
+                                                state.allowance_cache = None;
                                                 break;
                                             }
                                             state.allowance_cache = None;
