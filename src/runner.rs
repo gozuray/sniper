@@ -30,6 +30,10 @@ const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
 /// Delay between SL FAK retries on no-match or transient errors (ms).
 const SL_FOK_RETRY_DELAY_MS: u64 = 20;
+/// When SL limit is placed, recheck bid this often (ms) and cancel+replace if bid dropped — fast follow-down.
+const SL_FOLLOW_DOWN_MS: u64 = 50;
+/// Max follow-down retries so we don't block the main loop (e.g. 20 × 50ms = 1s of tight follow).
+const SL_FOLLOW_DOWN_MAX_RETRIES: u32 = 20;
 /// Sell size precision (Polymarket CLOB): 4 decimals; quantity bought is rounded to this when selling TP/SL.
 const SELL_SIZE_DECIMALS: u32 = 4;
 /// Minimum valid sell size accepted by API in this bot.
@@ -2712,6 +2716,106 @@ pub async fn run() -> Result<()> {
                                                     crate::types::SellOrderTimeInForce::Gtc,
                                                 )
                                                 .await?;
+                                        }
+                                        // Fast follow-down: recheck bid every SL_FOLLOW_DOWN_MS and cancel+replace if it dropped again.
+                                        for _ in 0..SL_FOLLOW_DOWN_MAX_RETRIES {
+                                            tokio::time::sleep(Duration::from_millis(SL_FOLLOW_DOWN_MS)).await;
+                                            if now_unix() >= market.close_time_unix
+                                                || current_5min_slug(config.interval_market) != market.slug
+                                            {
+                                                break;
+                                            }
+                                            let oid = match &state.sl_limit_order_id {
+                                                Some(id) => id.clone(),
+                                                None => break,
+                                            };
+                                            if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                                                break;
+                                            }
+                                            let order_price = state.sl_limit_order_price.unwrap_or(Decimal::ZERO);
+                                            let top_fd = if let Some(ref ws) = state.ws_book {
+                                                ws.get_top_of_book().await
+                                            } else {
+                                                match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
+                                                    Ok(t) => t,
+                                                    Err(_) => break,
+                                                }
+                                            };
+                                            let side_fd = if is_up { &top_fd.token_id_up } else { &top_fd.token_id_down };
+                                            let bid_fd = side_fd.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                            if bid_fd >= order_price || bid_fd <= Decimal::ZERO {
+                                                break;
+                                            }
+                                            let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
+                                            if let Some(ws_user) = ws_user_ref {
+                                                if let Some(final_fill) = ws_user.get_order_filled_size_sell(&oid).await {
+                                                    let delta = final_fill - state.sl_last_order_filled;
+                                                    if delta > Decimal::ZERO {
+                                                        state.sl_cumulative_filled += delta;
+                                                    }
+                                                }
+                                            }
+                                            let sl_filled_via_cancel = cancel_result
+                                                .as_ref()
+                                                .ok()
+                                                .and_then(|res| res.not_canceled.get(oid.as_str()))
+                                                .map(|r| r.to_lowercase().contains("matched"))
+                                                .unwrap_or(false);
+                                            if sl_filled_via_cancel {
+                                                state.sl_cumulative_filled = sl.size.clone();
+                                                state.sl_limit_order_id = None;
+                                                break;
+                                            }
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.allowance_cache = None;
+                                            let remaining_fd = sl.size.clone() - state.sl_cumulative_filled.clone();
+                                            if remaining_fd < DUST_THRESHOLD {
+                                                break;
+                                            }
+                                            let available_fd = get_available_for_sell(
+                                                clob.as_ref().as_ref(),
+                                                ws_user_ref,
+                                                &sl.token_id,
+                                                &mut state.allowance_cache,
+                                                true,
+                                            )
+                                            .await;
+                                            let size_fd = if available_fd.map_or(false, |a| a > SL_BALANCE_DUST_CLOSE) {
+                                                effective_sell_size(
+                                                    remaining_fd.clone(),
+                                                    available_fd,
+                                                    CLOB_DEFAULT_MIN_ORDER_SIZE,
+                                                )
+                                            } else {
+                                                floor_to_decimals(remaining_fd.clone(), SELL_SIZE_DECIMALS)
+                                            };
+                                            if size_fd < MIN_SELL_SIZE || size_fd < DUST_THRESHOLD {
+                                                break;
+                                            }
+                                            let price_fd = round_to_tick(bid_fd);
+                                            let replace_result = clob
+                                                .place_sell_order(
+                                                    &sl.token_id,
+                                                    price_fd,
+                                                    size_fd.clone(),
+                                                    crate::types::SellOrderTimeInForce::Gtc,
+                                                )
+                                                .await?;
+                                            if replace_result.success {
+                                                state.sl_limit_order_id = replace_result.order_id.clone();
+                                                state.sl_limit_order_price = Some(price_fd);
+                                                state.sl_last_order_filled = Decimal::ZERO;
+                                                info!(
+                                                    "[IntervalSniper] SL limit replaced @ {} size={} (follow-down, bid dropped)",
+                                                    fmt_price(Some(&price_fd)),
+                                                    fmt_decimal_2(&size_fd)
+                                                );
+                                            } else {
+                                                state.sl_limit_order_id = None;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
