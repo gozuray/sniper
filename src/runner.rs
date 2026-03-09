@@ -1793,7 +1793,7 @@ pub async fn run() -> Result<()> {
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
                                 state.last_buy_order = None;
-                                clear_pending_gtc(state);
+                                clear_pending_gtc(&mut state);
                                 state.allowance_cache = None;
                             }
                         }
@@ -2131,10 +2131,7 @@ pub async fn run() -> Result<()> {
         let token_id_up = market.token_id_up.clone();
         let token_id_down = market.token_id_down.clone();
         update_interval_bids(&mut state, &token_id_up, &token_id_down, &top);
-        let market = state
-            .market
-            .as_ref()
-            .expect("market set after need_new_market check");
+        // market is already the clone from above; do not re-borrow state.market so clear_pending_gtc(&mut state) is allowed later
 
         // Periodic log: order book scan (real-time visibility) — debug only so terminal shows only buy/sell events
         if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
@@ -2397,7 +2394,7 @@ pub async fn run() -> Result<()> {
                                 state.pending_stop_loss = None;
                                 state.allowance_cache = None;
                                 state.last_buy_order = None;
-                                clear_pending_gtc(state);
+                                clear_pending_gtc(&mut state);
                                 state.balance_reflected_at_ms = None;
                                 state.balance_delay_clob_logged = false;
                                 state.last_logged_balance_up = None;
@@ -2485,7 +2482,7 @@ pub async fn run() -> Result<()> {
                                     state.pending_stop_loss = None;
                                     state.allowance_cache = None;
                                     state.last_buy_order = None;
-                                    clear_pending_gtc(state);
+                                    clear_pending_gtc(&mut state);
                                     state.balance_reflected_at_ms = None;
                                     state.balance_delay_clob_logged = false;
                                     state.last_logged_balance_up = None;
@@ -2579,7 +2576,7 @@ pub async fn run() -> Result<()> {
                                 state.pending_stop_loss = None;
                                 state.allowance_cache = None;
                                 state.last_buy_order = None;
-                                clear_pending_gtc(state);
+                                clear_pending_gtc(&mut state);
                                 state.balance_reflected_at_ms = None;
                                 state.balance_delay_clob_logged = false;
                                 state.last_logged_balance_up = None;
@@ -2774,7 +2771,7 @@ pub async fn run() -> Result<()> {
                             state.pending_stop_loss = None;
                             state.allowance_cache = None;
                             state.last_buy_order = None;
-                            clear_pending_gtc(state);
+                            clear_pending_gtc(&mut state);
                             state.balance_reflected_at_ms = None;
                             state.balance_delay_clob_logged = false;
                             state.last_logged_balance_up = None;
@@ -2944,7 +2941,7 @@ pub async fn run() -> Result<()> {
                                             state.pending_stop_loss = None;
                                             state.allowance_cache = None;
                                             state.last_buy_order = None;
-                                            clear_pending_gtc(state);
+                                            clear_pending_gtc(&mut state);
                                             state.balance_reflected_at_ms = None;
                                             state.balance_delay_clob_logged = false;
                                             state.last_logged_balance_up = None;
@@ -3030,7 +3027,7 @@ pub async fn run() -> Result<()> {
                                             state.pending_stop_loss = None;
                                             state.allowance_cache = None;
                                             state.last_buy_order = None;
-                                            clear_pending_gtc(state);
+                                            clear_pending_gtc(&mut state);
                                             state.balance_reflected_at_ms = None;
                                             state.balance_delay_clob_logged = false;
                                             state.last_logged_balance_up = None;
@@ -3123,7 +3120,7 @@ pub async fn run() -> Result<()> {
                                                 state.pending_stop_loss = None;
                                                 state.allowance_cache = None;
                                                 state.last_buy_order = None;
-                                                clear_pending_gtc(state);
+                                                clear_pending_gtc(&mut state);
                                                 state.balance_reflected_at_ms = None;
                                                 state.balance_delay_clob_logged = false;
                                                 state.last_logged_balance_up = None;
@@ -3380,7 +3377,7 @@ pub async fn run() -> Result<()> {
                                     state.pending_stop_loss = None;
                                     state.allowance_cache = None;
                                     state.last_buy_order = None;
-                                    clear_pending_gtc(state);
+                                    clear_pending_gtc(&mut state);
                                     state.balance_reflected_at_ms = None;
                                     state.balance_delay_clob_logged = false;
                                     state.last_logged_balance_up = None;
@@ -3521,7 +3518,7 @@ pub async fn run() -> Result<()> {
                                                 state.pending_stop_loss = None;
                                                 state.allowance_cache = None;
                                                 state.last_buy_order = None;
-                                                clear_pending_gtc(state);
+                                                clear_pending_gtc(&mut state);
                                                 state.balance_reflected_at_ms = None;
                                                 state.balance_delay_clob_logged = false;
                                                 state.last_logged_balance_up = None;
@@ -3561,7 +3558,7 @@ pub async fn run() -> Result<()> {
                                             state.pending_stop_loss = None;
                                             state.allowance_cache = None;
                                             state.last_buy_order = None;
-                                            clear_pending_gtc(state);
+                                            clear_pending_gtc(&mut state);
                                             state.balance_reflected_at_ms = None;
                                             state.balance_delay_clob_logged = false;
                                             state.last_logged_balance_up = None;
