@@ -134,7 +134,7 @@ struct RunnerState {
     pending_stop_loss: Option<PendingStopLoss>,
     auto_sell_placed: bool,
     stop_loss_placed: bool,
-    /// Order ID of the GTC TP limit order when placed (cancel when price drops to entry).
+    /// Order ID of the GTC TP limit order when placed (cancel when price drops below entry).
     tp_limit_order_id: Option<String>,
     /// Size actually placed for the current TP limit order (used for fill detection when there was partial SL).
     tp_placed_size: Option<Decimal>,
@@ -2831,7 +2831,7 @@ pub async fn run() -> Result<()> {
                         let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
                         let mut tp_filled_this_iteration = false;
-                        // 1) If we have a TP limit order resting: cancel when price drops to entry, or detect fill via ws_user.
+                        // 1) If we have a TP limit order resting: cancel when price drops below entry; then wait for target or SL.
                         let tp_order_id = state.tp_limit_order_id.clone();
                         if let Some(ref oid) = tp_order_id {
                             if best_bid > Decimal::ZERO && best_bid < entry_price {
@@ -2952,7 +2952,7 @@ pub async fn run() -> Result<()> {
                                 }
                                 if !tp_filled_this_iteration {
                                     trace!(
-                                        "[IntervalSniper] TP limit canceled (price at entry {}), waiting for target again",
+                                        "[IntervalSniper] TP limit canceled (price below entry {}), waiting for target or SL",
                                         fmt_price(Some(&entry_price))
                                     );
                                 }
@@ -3140,7 +3140,7 @@ pub async fn run() -> Result<()> {
                         // We do NOT infer TP filled from "available balance is dust" while a TP order is resting: the API can
                         // report available=0 because balance is locked in the open order, causing a false positive "TP filled".
 
-                        // 2) Place GTC limit at target only when price has touched TP - 0.01; cancel if it drops back to entry.
+                        // 2) Place GTC limit at target only when price has touched TP - 0.01; cancel if it drops below entry.
                         // Skip if we just detected TP fill this iteration (position already closed; avoid "not enough balance").
                         // Skip if we have a resting SL limit order: the CLOB locks balance for that order, so placing TP
                         // would get "not enough balance" (TP and SL are mutually exclusive for the same position).
@@ -3223,9 +3223,11 @@ pub async fn run() -> Result<()> {
                                                     .and_then(|s| s.best_bid)
                                                     .unwrap_or(Decimal::ZERO)
                                             };
-                                            if current_best_bid <= entry_price {
+                                            // Only cancel retries when price has dropped *below* entry. If bid == entry we keep
+                                            // retrying so we can place TP when balance is ready (TP limit will rest until price reaches target).
+                                            if current_best_bid < entry_price {
                                                 info!(
-                                                    "[IntervalSniper] TP limit retries cancelled: price dropped to {} (at or below entry {}) — will retry placement when price returns to target (next tick)",
+                                                    "[IntervalSniper] TP limit retries cancelled: price dropped to {} (below entry {}) — will retry placement when price returns to target (next tick)",
                                                     fmt_price(Some(&current_best_bid)),
                                                     fmt_price(Some(&entry_price))
                                                 );
