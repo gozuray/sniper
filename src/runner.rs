@@ -339,6 +339,39 @@ fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
     })
 }
 
+/// Verify that a placed order is actually on the book (GET /order). The API can return 200+success+orderID
+/// but reject the order asynchronously (e.g. balance check), so we only consider TP "placed" after verification.
+/// Returns true if order is confirmed live/matched/filled, false if 404 or rejected (caller should retry).
+async fn tp_order_verified_on_book(clob: &dyn crate::clob::ClobClient, order_id: &str) -> bool {
+    let json = match clob.get_order(order_id).await {
+        Ok(j) => j,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not supported") {
+                return true; // dry-run: skip verification
+            }
+            tracing::warn!(
+                "[IntervalSniper] TP limit API returned success but order not on book (get_order: {}) — possible async rejection",
+                msg.chars().take(120).collect::<String>()
+            );
+            return false;
+        }
+    };
+    let status = json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let on_book = status.contains("LIVE")
+        || status.contains("MATCHED")
+        || status.contains("FILLED")
+        || status.is_empty();
+    if !on_book && (status.contains("REJECT") || status.contains("CANCEL") || status.contains("EXPIRED")) {
+        tracing::warn!(
+            "[IntervalSniper] TP limit order status '{}' — order not resting, retrying",
+            status
+        );
+        return false;
+    }
+    on_book
+}
+
 /// Get available balance for a token for TP/SL.
 /// Priority: WS user fill state for *balance*, but always cap by REST allowance when WS is used,
 /// because the WS has no allowance info — the server enforces min(balance, allowance) on every sell.
@@ -3247,6 +3280,16 @@ pub async fn run() -> Result<()> {
                                                 );
                                             }
                                             if result.success {
+                                                let verified = if let Some(ref oid) = result.order_id {
+                                                    tp_order_verified_on_book(&**clob.as_ref(), oid).await
+                                                } else {
+                                                    true
+                                                };
+                                                if !verified {
+                                                    tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                    state.allowance_cache = None;
+                                                    continue;
+                                                }
                                                 state.tp_limit_order_id = result.order_id.clone();
                                                 state.tp_placed_size = Some(size_to_place.clone());
                                                 state.tp_limit_balance_retries = 0;
@@ -3383,16 +3426,26 @@ pub async fn run() -> Result<()> {
                                         );
                                     }
                                     if result.success {
-                                        state.tp_limit_order_id = result.order_id.clone();
-                                        state.tp_placed_size = Some(size.clone());
-                                        state.tp_limit_balance_retries = 0;
-                                        info!(
-                                            "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (cancel if price drops to entry {})",
-                                            fmt_price(Some(&price)),
-                                            fmt_decimal_2(&size),
-                                            result.order_id,
-                                            fmt_price(Some(&entry_price))
-                                        );
+                                        let verified = if let Some(ref oid) = result.order_id {
+                                            tp_order_verified_on_book(&**clob.as_ref(), oid).await
+                                        } else {
+                                            true
+                                        };
+                                        if verified {
+                                            state.tp_limit_order_id = result.order_id.clone();
+                                            state.tp_placed_size = Some(size.clone());
+                                            state.tp_limit_balance_retries = 0;
+                                            info!(
+                                                "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (cancel if price drops to entry {})",
+                                                fmt_price(Some(&price)),
+                                                fmt_decimal_2(&size),
+                                                result.order_id,
+                                                fmt_price(Some(&entry_price))
+                                            );
+                                        } else {
+                                            state.tp_limit_balance_retries += 1;
+                                            state.allowance_cache = None;
+                                        }
                                     } else if is_position_closed_error(result.error_msg.as_deref()) {
                                         state.tp_limit_balance_retries += 1;
                                         if state.tp_limit_balance_retries == 1 {
