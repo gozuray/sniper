@@ -1075,13 +1075,40 @@ pub async fn run() -> Result<()> {
                         let entry_side = state.pending_gtc_side.unwrap();
                         let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
                         let is_additional_fill = prev_filled >= MIN_SELL_SIZE;
-                        if is_additional_fill {
-                            // Fill grew (e.g. 11 -> 12): cancel only TP/SL orders so we replace with total size (do not cancel resting GTC buy).
+                        // BUG FIX: when is_additional_fill fires (entry fill grew e.g. 13.99→14.00 due to
+                        // REST cap releasing), the resting TP order may have already filled on the exchange.
+                        // If WS confirms the TP is filled, skip cancel-and-recreate: the TP detection block
+                        // later this iteration will detect the fill and close the position cleanly.
+                        let tp_already_filled_ws = if is_additional_fill {
                             if let Some(ref oid) = state.tp_limit_order_id {
-                                let _ = clob.cancel_order(oid).await;
+                                let tp_size_check =
+                                    state.tp_placed_size.unwrap_or(state.config.size_shares);
+                                ws_user
+                                    .get_order_filled_size_sell_with_type(oid)
+                                    .await
+                                    .map_or(false, |(ws_filled, _)| {
+                                        ws_filled >= tp_size_check * dec!(0.99)
+                                    })
+                            } else {
+                                false
                             }
-                            if let Some(ref oid) = state.sl_limit_order_id {
-                                let _ = clob.cancel_order(oid).await;
+                        } else {
+                            false
+                        };
+                        if is_additional_fill {
+                            if !tp_already_filled_ws {
+                                // Fill grew (e.g. 11 -> 12): cancel only TP/SL orders so we replace with total size (do not cancel resting GTC buy).
+                                if let Some(ref oid) = state.tp_limit_order_id {
+                                    let _ = clob.cancel_order(oid).await;
+                                }
+                                if let Some(ref oid) = state.sl_limit_order_id {
+                                    let _ = clob.cancel_order(oid).await;
+                                }
+                            } else {
+                                info!(
+                                    "[IntervalSniper] additional fill ({} -> {}): TP order already filled via WS — skipping cancel/recreate, TP detection will close position this iteration",
+                                    fmt_decimal_2(&prev_filled), fmt_decimal_2(&filled)
+                                );
                             }
                             state.total_shares_this_interval += filled.clone() - prev_filled.clone();
                         } else {
@@ -1130,6 +1157,7 @@ pub async fn run() -> Result<()> {
                         let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
                             .max(MIN_SELL_SIZE)
                             .min(base_sell_size);
+                        if !tp_already_filled_ws {
                         state.pending_auto_sell = Some(PendingAutoSell {
                             token_id: token_id.clone(),
                             target_price,
@@ -1155,6 +1183,7 @@ pub async fn run() -> Result<()> {
                         state.tp_placed_size = None;
                         state.sl_limit_order_id = None;
                         state.sl_limit_order_price = None;
+                        }
                         let partials_str = if state.pending_gtc_fill_deltas.len() >= 2 {
                             let parts: Vec<String> = state.pending_gtc_fill_deltas.iter().map(fmt_decimal_2).collect();
                             format!(" ({} partials: {})", state.pending_gtc_fill_deltas.len(), parts.join(", "))
@@ -3736,10 +3765,23 @@ pub async fn run() -> Result<()> {
                                                 state.total_shares_this_interval = Decimal::ZERO;
                                             } else {
                                                 warn!(
-                                                    "[IntervalSniper] TP emergency FOK also failed: {:?} — SL remains active",
+                                                    "[IntervalSniper] TP emergency FOK also failed: {:?} — treating position as closed to prevent spam",
                                                     fok_result.error_msg
                                                 );
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                                state.tp_limit_order_id = None;
+                                                state.tp_placed_size = None;
+                                                state.tp_cumulative_filled = Decimal::ZERO;
+                                                state.tp_last_order_filled = Decimal::ZERO;
                                                 state.tp_limit_balance_retries = 0;
+                                                state.sl_limit_order_id = None;
+                                                state.sl_limit_order_price = None;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.allowance_cache = None;
+                                                state.last_buy_order = None;
+                                                clear_pending_gtc(&mut state);
                                             }
                                         }
                                     } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
