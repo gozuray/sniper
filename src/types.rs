@@ -55,6 +55,7 @@ pub struct Config {
     pub max_buy_price: Decimal,
     pub allow_buy_up: bool,
     pub allow_buy_down: bool,
+    #[allow(dead_code)]
     pub min_btc_price_diff_usd: Decimal,
     pub dry_run: bool,
     pub order_strategy: OrderStrategy,
@@ -63,18 +64,21 @@ pub struct Config {
     pub take_profit_price: Decimal,
     pub auto_sell_at_max_price: bool,
     pub auto_sell_quantity_percent: u8,
+    #[allow(dead_code)]
     pub take_profit_time_in_force: SellOrderTimeInForce,
     pub enable_stop_loss: bool,
     /// Fixed price: sell when best_bid <= this (stop loss).
     pub stop_loss_price: Decimal,
     pub stop_loss_quantity_percent: u8,
     pub loop_ms: u64,
+    #[allow(dead_code)]
     pub cooldown_between_orders_ms: u64,
     pub no_window_all_intervals: bool,
     /// Block buy in the last N seconds of the interval (0 = disabled). E.g. 30 blocks buys when &lt; 30s to close.
     pub block_buy_last_seconds: u32,
     pub min_seconds_after_market_open: u32,
     pub min_seconds_after_buy_before_auto_sell: u32,
+    #[allow(dead_code)]
     pub take_profit_price_margin: Decimal,
     /// If true, append session events to a JSONL file in session_log_dir (close, interval_summary, session_summary).
     pub session_log_enabled: bool,
@@ -96,6 +100,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct ResolvedMarket {
     pub slug: String,
+    #[allow(dead_code)]
     pub condition_id: String,
     pub close_time_unix: u64,
     pub interval_start_unix: u64,
@@ -163,8 +168,10 @@ pub struct OrderBookRaw {
     pub bids: Option<Vec<BookLevel>>,
     pub asks: Option<Vec<BookLevel>>,
     #[serde(rename = "min_order_size")]
+    #[allow(dead_code)]
     pub min_order_size: Option<String>,
     #[serde(rename = "tick_size")]
+    #[allow(dead_code)]
     pub tick_size: Option<String>,
 }
 

@@ -55,6 +55,7 @@ pub fn current_5min_interval_start_unix() -> u64 {
 }
 
 /// Current 5min interval end (close time).
+#[allow(dead_code)]
 pub fn current_5min_interval_end_unix() -> u64 {
     current_5min_interval_start_unix() + BTC_5MIN_INTERVAL_SEC
 }

@@ -25,6 +25,7 @@ const PING_INTERVAL_SECS: u64 = 10;
 #[derive(Debug, serde::Deserialize)]
 pub struct WsBookMessage {
     #[serde(rename = "event_type")]
+    #[allow(dead_code)]
     pub event_type: String,
     #[serde(rename = "asset_id")]
     pub asset_id: String,
@@ -42,6 +43,7 @@ pub struct WsBookLevel {
 #[derive(Debug, serde::Deserialize)]
 pub struct WsBestBidAskMessage {
     #[serde(rename = "event_type")]
+    #[allow(dead_code)]
     pub event_type: String,
     #[serde(rename = "asset_id")]
     pub asset_id: String,
@@ -55,6 +57,7 @@ pub struct WsBestBidAskMessage {
 #[derive(Debug, serde::Deserialize)]
 pub struct WsPriceChangeMessage {
     #[serde(rename = "event_type")]
+    #[allow(dead_code)]
     pub event_type: String,
     #[serde(rename = "price_changes")]
     pub price_changes: Option<Vec<WsPriceChangeItem>>,

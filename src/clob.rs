@@ -21,6 +21,7 @@ const CONDITIONAL_BASE_FACTOR: Decimal = dec!(1000000);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderType {
     Gtc,
+    #[allow(dead_code)]
     Gtd,
     Fok,
     Fak,
@@ -46,6 +47,7 @@ pub struct LimitOrderParams {
     pub price: Decimal,
     pub size: Decimal,
     pub expiration_unix: Option<u64>,
+    #[allow(dead_code)]
     pub post_only: bool,
     pub fee_rate_bps: Option<u64>,
 }
@@ -65,6 +67,7 @@ pub struct CancelOrdersResult {
 
 /// Parse USDC received from a SELL order response (GET /order). For SELL, takingAmount = USDC in 6 decimals.
 /// Returns None if field missing or parse error (caller falls back to computed size*price).
+#[allow(dead_code)]
 pub fn parse_sell_order_usd_received(order_json: &serde_json::Value) -> Option<Decimal> {
     let raw = order_json
         .get("takingAmount")

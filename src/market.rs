@@ -46,6 +46,7 @@ pub async fn fetch_market_by_slug(
 }
 
 /// Fetch condition IDs for the last N closed 5-min intervals (for redeem). Skips 404/fail.
+#[allow(dead_code)]
 pub async fn fetch_resolved_condition_ids(
     client: &Client,
     base_url: &str,

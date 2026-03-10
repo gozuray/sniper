@@ -28,6 +28,7 @@ const CONNECT_TIMEOUT_SECS: u64 = 20;
 /// Per-order state from user channel (order events).
 #[derive(Debug, Clone)]
 pub struct UserOrderState {
+    #[allow(dead_code)]
     pub order_id: String,
     pub asset_id: String,
     pub side: String, // "BUY" | "SELL"
@@ -328,6 +329,7 @@ impl ClobWsUser {
     }
 
     /// Return the current filled size (size_matched) for an order, if known.
+    #[allow(dead_code)]
     pub async fn get_order_filled_size(&self, order_id: &str) -> Option<Decimal> {
         let key = normalize_order_id(order_id);
         let map = self.state.read().await;
@@ -423,6 +425,7 @@ impl ClobWsUser {
     }
 
     /// Return full order state for an order_id.
+    #[allow(dead_code)]
     pub async fn get_order_state(&self, order_id: &str) -> Option<UserOrderState> {
         let key = normalize_order_id(order_id);
         let map = self.state.read().await;

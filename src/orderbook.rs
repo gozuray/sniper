@@ -99,6 +99,7 @@ pub async fn fetch_top_of_book(
 }
 
 /// Min order size from raw book (default 5 if missing).
+#[allow(dead_code)]
 pub fn min_order_size_from_raw(raw: &OrderBookRaw) -> Decimal {
     raw.min_order_size
         .as_ref()

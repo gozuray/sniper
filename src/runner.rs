@@ -29,6 +29,7 @@ const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 /// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
 /// Delay between SL FAK retries on no-match or transient errors (ms).
+#[allow(dead_code)]
 const SL_FOK_RETRY_DELAY_MS: u64 = 20;
 /// When SL limit is placed, recheck bid this often (ms) and cancel+replace if bid dropped — fast follow-down.
 const SL_FOLLOW_DOWN_MS: u64 = 50;
@@ -47,6 +48,7 @@ const SL_TRIGGER_MARGIN: Decimal = dec!(0.01);
 /// Polymarket may reject small sell sizes with "invalid amounts"; below this treat as dust and consider position closed.
 const TP_SL_DUST_SIZE: Decimal = dec!(0.01);
 /// API reported fill below this is treated like 0 — run full WS/REST reconciliation (exchange often filled fully).
+#[allow(dead_code)]
 const TINY_FILL_THRESHOLD: Decimal = dec!(0.01);
 /// One base unit in shares (1e-6) — subtract from available so we never exceed balance after rounding.
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
@@ -118,6 +120,7 @@ fn update_interval_bids(
 }
 
 /// Maximum number of trades (buy + sell) allowed per interval; second trade only when the first was closed by SL.
+#[allow(dead_code)]
 const MAX_TRADES_PER_INTERVAL: u32 = 2;
 
 struct RunnerState {
@@ -3421,7 +3424,6 @@ pub async fn run() -> Result<()> {
                                                             fmt_decimal_2(&size_to_place),
                                                             result.order_id
                                                         );
-                                                        tp_placed = true;
                                                     }
                                                 }
                                                 break;
