@@ -2685,17 +2685,7 @@ pub async fn run() -> Result<()> {
                             if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
                                 // Already closed above (WS detected 100%)
                             } else {
-                                // With WS: only use MATCHED flow when we have matched buy for this token; else legacy retry loop.
-                                let confirmed_ok = match ws_user_ref {
-                                    Some(ws) => ws
-                                        .get_confirmed_buy_size(&sl.token_id)
-                                        .await
-                                        .map(|c| c >= remaining.clone() * dec!(0.99))
-                                        .unwrap_or(false),
-                                    None => false,
-                                };
-                                if confirmed_ok {
-                                    // SL: retry every 200ms until place_sell_order succeeds or interval ends or price exits SL zone.
+                                // SL: retry every 200ms until place_sell_order succeeds or interval ends or price exits SL zone.
                                     let expected_size = floor_to_decimals(remaining.clone().min(sl.size.clone()), SELL_SIZE_DECIMALS);
                                     let params = BalanceAllowanceParams {
                                         asset_type: AssetType::Conditional,
@@ -2863,216 +2853,6 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                     }
-                                } else {
-                                    // Legacy: no MATCHED or no WS — retry every 200ms until place or interval/price exit.
-                                    let available = get_available_for_sell(
-                                        clob.as_ref().as_ref(),
-                                        ws_user_ref,
-                                        &sl.token_id,
-                                        &mut state.allowance_cache,
-                                        true,
-                                    ).await;
-                                    if available.map_or(true, |a| a <= SL_BALANCE_DUST_CLOSE) && state.sl_cumulative_filled > Decimal::ZERO {
-                                        state.sl_cumulative_filled = sl.size.clone();
-                                        trace!(
-                                            "[IntervalSniper] SL balance dust/zero (WS filled) — skipping place, will close next tick"
-                                        );
-                                    } else {
-                                        let size = if available.map_or(false, |a| a > SL_BALANCE_DUST_CLOSE) {
-                                            effective_sell_size(
-                                                remaining.clone(),
-                                                available,
-                                                CLOB_DEFAULT_MIN_ORDER_SIZE,
-                                            )
-                                        } else {
-                                            floor_to_decimals(remaining.clone(), SELL_SIZE_DECIMALS)
-                                        };
-                                        if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
-                                            let price = round_to_tick(best_bid);
-                                            let mut result = clob
-                                                .place_sell_order(
-                                                    &sl.token_id,
-                                                    price,
-                                                    size.clone(),
-                                                    crate::types::SellOrderTimeInForce::Gtc,
-                                                )
-                                                .await?;
-                                            loop {
-                                                if result.success {
-                                                    state.sl_limit_order_id = result.order_id.clone();
-                                                    state.sl_limit_order_price = Some(price);
-                                                    state.sl_last_order_filled = Decimal::ZERO;
-                                                    info!(
-                                                        "[IntervalSniper] SL limit placed @ {} size={} order_id={:?} (cancel+replace if bid drops)",
-                                                        fmt_price(Some(&price)), fmt_decimal_2(&size), result.order_id
-                                                    );
-                                                    break;
-                                                }
-                                                if now_unix() >= market.close_time_unix
-                                                    || current_5min_slug(config.interval_market) != market.slug
-                                                {
-                                                    trace!("[IntervalSniper] SL place deferred: interval ended, will retry next tick");
-                                                    break;
-                                                }
-                                                let top_recheck = if let Some(ref ws) = state.ws_book {
-                                                    ws.get_top_of_book().await
-                                                } else {
-                                                    match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
-                                                        Ok(t) => t,
-                                                        Err(_) => top.clone(),
-                                                    }
-                                                };
-                                                let side_recheck = if is_up { &top_recheck.token_id_up } else { &top_recheck.token_id_down };
-                                                let recheck_bid = side_recheck.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
-                                                if recheck_bid > sl.trigger_price + SL_TRIGGER_MARGIN {
-                                                    trace!(
-                                                        "[IntervalSniper] SL place deferred: bid {} above target ({}), will retry next tick",
-                                                        fmt_price(Some(&recheck_bid)), fmt_price(Some(&sl.trigger_price))
-                                                    );
-                                                    break;
-                                                }
-                                                if is_position_closed_error(result.error_msg.as_deref()) {
-                                                    let ws_bal = if let Some(ws) = ws_user_ref {
-                                                        ws.get_balance_for_token(&sl.token_id).await
-                                                    } else {
-                                                        None
-                                                    };
-                                                    if ws_bal.map_or(false, |b| b > DUST_THRESHOLD) {
-                                                        debug!(
-                                                            "[IntervalSniper] SL 'not enough balance' but WS balance={} — allowance lag, retrying",
-                                                            fmt_decimal_2(&ws_bal.unwrap_or(Decimal::ZERO))
-                                                        );
-                                                    } else {
-                                                        state.allowance_cache = None;
-                                                        let balance_check = clob.get_available_balance(&sl.token_id).await.ok().flatten();
-                                                        if balance_check.map_or(true, |a| a <= DUST_THRESHOLD) {
-                                                            state.sl_cumulative_filled = sl.size.clone();
-                                                            break;
-                                                        }
-                                                        debug!(
-                                                            "[IntervalSniper] SL 'not enough balance' but balance={} — allowance lag, retrying every {}ms",
-                                                            fmt_decimal_2(&balance_check.unwrap_or(Decimal::ZERO)),
-                                                            TP_SL_BALANCE_RETRY_MS
-                                                        );
-                                                    }
-                                                }
-                                                if now_unix() >= market.close_time_unix {
-                                                    trace!("[IntervalSniper] SL place deferred: interval ended");
-                                                    break;
-                                                }
-                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
-                                                state.allowance_cache = None;
-                                                result = clob
-                                                    .place_sell_order(
-                                                        &sl.token_id,
-                                                        round_to_tick(recheck_bid),
-                                                        size.clone(),
-                                                        crate::types::SellOrderTimeInForce::Gtc,
-                                                    )
-                                                    .await?;
-                                            }
-                                            for _ in 0..SL_FOLLOW_DOWN_MAX_RETRIES {
-                                                tokio::time::sleep(Duration::from_millis(SL_FOLLOW_DOWN_MS)).await;
-                                                if now_unix() >= market.close_time_unix
-                                                    || current_5min_slug(config.interval_market) != market.slug
-                                                {
-                                                    break;
-                                                }
-                                                let oid = match &state.sl_limit_order_id {
-                                                    Some(id) => id.clone(),
-                                                    None => break,
-                                                };
-                                                if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
-                                                    break;
-                                                }
-                                                let order_price = state.sl_limit_order_price.unwrap_or(Decimal::ZERO);
-                                                let top_fd = if let Some(ref ws) = state.ws_book {
-                                                    ws.get_top_of_book().await
-                                                } else {
-                                                    match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
-                                                        Ok(t) => t,
-                                                        Err(_) => break,
-                                                    }
-                                                };
-                                                let side_fd = if is_up { &top_fd.token_id_up } else { &top_fd.token_id_down };
-                                                let bid_fd = side_fd.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
-                                                if bid_fd >= order_price || bid_fd <= Decimal::ZERO {
-                                                    break;
-                                                }
-                                                let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
-                                                if let Some(ws_user) = ws_user_ref {
-                                                    if let Some(final_fill) = ws_user.get_order_filled_size_sell(&oid).await {
-                                                        let delta = final_fill - state.sl_last_order_filled;
-                                                        if delta > Decimal::ZERO {
-                                                            state.sl_cumulative_filled += delta;
-                                                        }
-                                                    }
-                                                }
-                                                let sl_filled_via_cancel = cancel_result
-                                                    .as_ref()
-                                                    .ok()
-                                                    .and_then(|res| res.not_canceled.get(oid.as_str()))
-                                                    .map(|r| r.to_lowercase().contains("matched"))
-                                                    .unwrap_or(false);
-                                                if sl_filled_via_cancel {
-                                                    state.sl_cumulative_filled = sl.size.clone();
-                                                    state.sl_limit_order_id = None;
-                                                    break;
-                                                }
-                                                state.sl_limit_order_id = None;
-                                                state.sl_limit_order_price = None;
-                                                state.sl_last_order_filled = Decimal::ZERO;
-                                                state.allowance_cache = None;
-                                                let remaining_fd = sl.size.clone() - state.sl_cumulative_filled.clone();
-                                                if remaining_fd < DUST_THRESHOLD {
-                                                    break;
-                                                }
-                                                let available_fd = get_available_for_sell(
-                                                    clob.as_ref().as_ref(),
-                                                    ws_user_ref,
-                                                    &sl.token_id,
-                                                    &mut state.allowance_cache,
-                                                    true,
-                                                )
-                                                .await;
-                                                let size_fd = if available_fd.map_or(false, |a| a > SL_BALANCE_DUST_CLOSE) {
-                                                    effective_sell_size(
-                                                        remaining_fd.clone(),
-                                                        available_fd,
-                                                        CLOB_DEFAULT_MIN_ORDER_SIZE,
-                                                    )
-                                                } else {
-                                                    floor_to_decimals(remaining_fd.clone(), SELL_SIZE_DECIMALS)
-                                                };
-                                                if size_fd < MIN_SELL_SIZE || size_fd < DUST_THRESHOLD {
-                                                    break;
-                                                }
-                                                let price_fd = round_to_tick(bid_fd);
-                                                let replace_result = clob
-                                                    .place_sell_order(
-                                                        &sl.token_id,
-                                                        price_fd,
-                                                        size_fd.clone(),
-                                                        crate::types::SellOrderTimeInForce::Gtc,
-                                                    )
-                                                    .await?;
-                                                if replace_result.success {
-                                                    state.sl_limit_order_id = replace_result.order_id.clone();
-                                                    state.sl_limit_order_price = Some(price_fd);
-                                                    state.sl_last_order_filled = Decimal::ZERO;
-                                                    info!(
-                                                        "[IntervalSniper] SL limit replaced @ {} size={} (follow-down, bid dropped)",
-                                                        fmt_price(Some(&price_fd)),
-                                                        fmt_decimal_2(&size_fd)
-                                                    );
-                                                } else {
-                                                    state.sl_limit_order_id = None;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         }
 
@@ -3568,22 +3348,6 @@ pub async fn run() -> Result<()> {
                         if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() && state.sl_limit_order_id.is_none() {
                             let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
-                                let position_remaining = tp.size.clone() - state.tp_cumulative_filled.clone();
-                                let position_size_real = position_remaining.clone();
-                                // With WS: only place TP after MATCHED (fill on exchange); update_balance_allowance + backoff handles server cache.
-                                let confirmed_ok = match ws_user_ref {
-                                    Some(ws) => ws
-                                        .get_confirmed_buy_size(&tp.token_id)
-                                        .await
-                                        .map(|c| c >= position_size_real.clone() * dec!(0.99))
-                                        .unwrap_or(false),
-                                    None => true,
-                                };
-                                if !confirmed_ok {
-                                    tracing::debug!(
-                                        "[IntervalSniper] TP waiting for MATCHED (fill on exchange) for token before placing"
-                                    );
-                                } else {
                                 // Log reactivation when we're retrying after balance/retry was cancelled (e.g. price dropped to entry then came back)
                                 if state.tp_limit_balance_retries > 0 {
                                     info!(
@@ -4219,7 +3983,6 @@ pub async fn run() -> Result<()> {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
                                     }
                                 }
-                                } // end else (confirmed_ok)
                             }
                         }
                     }
