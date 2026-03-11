@@ -508,13 +508,6 @@ impl ClobWsUser {
         }
     }
 
-    /// Cumulative size of BUY trades with status MATCHED for this asset.
-    /// Use this to trigger TP/SL placement: only place when `get_confirmed_buy_size >= size` (then update_balance_allowance + backoff).
-    pub async fn get_confirmed_buy_size(&self, asset_id: &str) -> Option<Decimal> {
-        let confirmed = self.confirmed_buy.read().await;
-        confirmed.get(asset_id).copied().filter(|d| *d > Decimal::ZERO)
-    }
-
     /// Return full order state for an order_id.
     #[allow(dead_code)]
     pub async fn get_order_state(&self, order_id: &str) -> Option<UserOrderState> {
