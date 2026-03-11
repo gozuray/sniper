@@ -3174,6 +3174,38 @@ pub async fn run() -> Result<()> {
                         let target = round_to_tick(tp.target_price);
                         let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
+                        // Reconcile FAK fill from WS: when MATCHED trade events arrive, pending_auto_sell/size may be larger than actual filled;
+                        // downsize so TP/SL placement does not fail with "not enough balance".
+                        if state.pending_auto_sell.is_some() && state.pending_stop_loss.is_some() {
+                            if let (Some(buy), Some(ws_user)) = (
+                                state.last_buy_order.as_ref(),
+                                state.ws_user.as_ref().map(|a| a.as_ref()),
+                            ) {
+                                if let Some(ref oid) = buy.order_id {
+                                    if let Some((filled, _)) = ws_user.get_order_filled_size_with_type(oid).await {
+                                        let cap = filled.min(buy.size.clone());
+                                        let tp_size = state.pending_auto_sell.as_ref().unwrap().size.clone();
+                                        let sl_size = state.pending_stop_loss.as_ref().unwrap().size.clone();
+                                        if cap < tp_size || cap < sl_size {
+                                            let new_tp = tp_size.min(cap);
+                                            let new_sl = sl_size.min(cap);
+                                            state.pending_auto_sell.as_mut().unwrap().size = new_tp.clone();
+                                            state.pending_stop_loss.as_mut().unwrap().size = new_sl.clone();
+                                            info!(
+                                                "[IntervalSniper] FAK fill reconciled from WS: order_id={} actual_filled={} → TP size {}→{}  SL size {}→{}",
+                                                oid.chars().take(20).collect::<String>(),
+                                                fmt_decimal_2(&cap),
+                                                fmt_decimal_2(&tp_size),
+                                                fmt_decimal_2(&new_tp),
+                                                fmt_decimal_2(&sl_size),
+                                                fmt_decimal_2(&new_sl),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         let mut tp_filled_this_iteration = false;
                         // 1) If we have a TP limit order resting: cancel when price drops below entry OR when in SL zone (best_bid <= SL trigger).
                         //    Same `top` as main tick is used for SL and TP so one consistent book view per tick (HFT).
@@ -4477,11 +4509,33 @@ pub async fn run() -> Result<()> {
                                 );
                             } else {
                                 // Position must use actual filled_size from CLOB (FAK can be partial; TP/SL must sell only what we have).
-                                let filled = result
-                                    .filled_size
-                                    .filter(|s| *s > Decimal::ZERO && *s >= size.clone() * dec!(0.01))
-                                    .unwrap_or(size.clone());
-                                let filled = filled.min(size.clone());
+                                // FAK/FOK often return filled_size=None from API; query WS user channel for actual filled size before setting TP/SL.
+                                let filled = {
+                                    let from_api = result
+                                        .filled_size
+                                        .as_ref()
+                                        .filter(|s| **s > Decimal::ZERO && **s >= size.clone() * dec!(0.01))
+                                        .cloned();
+                                    let from_ws = if from_api.is_none() {
+                                        match (
+                                            result.order_id.as_deref(),
+                                            state.ws_user.as_ref().map(|a| a.as_ref()),
+                                        ) {
+                                            (Some(oid), Some(ws)) => {
+                                                ws.get_order_filled_size_with_type(oid)
+                                                    .await
+                                                    .map(|(s, _)| s)
+                                            }
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    from_api
+                                        .or(from_ws)
+                                        .unwrap_or_else(|| size.clone())
+                                        .min(size.clone())
+                                };
                                 state.trades_this_interval += 1;
                                 state.total_shares_this_interval += filled.clone();
                                 let entry_price = effective_price;
