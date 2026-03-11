@@ -2726,14 +2726,29 @@ pub async fn run() -> Result<()> {
                                                 .unwrap_or_else(|| expected_size.clone());
                                             if size_to_place >= MIN_SELL_SIZE && size_to_place >= DUST_THRESHOLD {
                                                 let price = round_to_tick(recheck_bid);
-                                                let result = clob
+                                                let result = match clob
                                                     .place_sell_order(
                                                         &sl.token_id,
                                                         price,
                                                         size_to_place.clone(),
                                                         crate::types::SellOrderTimeInForce::Gtc,
                                                     )
-                                                    .await?;
+                                                    .await
+                                                {
+                                                    Ok(r) => r,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "[IntervalSniper] SL place_sell_order error: {e}, retrying..."
+                                                        );
+                                                        if now_unix() >= market.close_time_unix
+                                                            || current_5min_slug(config.interval_market) != market.slug
+                                                        {
+                                                            break;
+                                                        }
+                                                        tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                        continue;
+                                                    }
+                                                };
                                                 if result.success {
                                                     state.sl_limit_order_id = result.order_id.clone();
                                                     state.sl_limit_order_price = Some(price);
@@ -2830,14 +2845,28 @@ pub async fn run() -> Result<()> {
                                                 break;
                                             }
                                             let price_fd = round_to_tick(bid_fd);
-                                            let replace_result = clob
+                                            let replace_result = match clob
                                                 .place_sell_order(
                                                     &sl.token_id,
                                                     price_fd,
                                                     size_fd.clone(),
                                                     crate::types::SellOrderTimeInForce::Gtc,
                                                 )
-                                                .await?;
+                                                .await
+                                            {
+                                                Ok(r) => r,
+                                                Err(e) => {
+                                                    warn!(
+                                                        "[IntervalSniper] SL place_sell_order error: {e}, retrying..."
+                                                    );
+                                                    if now_unix() >= market.close_time_unix
+                                                        || current_5min_slug(config.interval_market) != market.slug
+                                                    {
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                            };
                                             if replace_result.success {
                                                 state.sl_limit_order_id = replace_result.order_id.clone();
                                                 state.sl_limit_order_price = Some(price_fd);
@@ -3458,14 +3487,27 @@ pub async fn run() -> Result<()> {
                                                         .unwrap_or_else(|| expected_size.clone());
                                                     if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
                                                         let price = target.clone();
-                                                        let result = clob
+                                                        let result = match clob
                                                             .place_sell_order(
                                                                 &tp.token_id,
                                                                 price.clone(),
                                                                 size_to_place.clone(),
                                                                 crate::types::SellOrderTimeInForce::Gtc,
                                                             )
-                                                            .await?;
+                                                            .await
+                                                        {
+                                                            Ok(r) => r,
+                                                            Err(e) => {
+                                                                warn!(
+                                                                    "[IntervalSniper] TP place_sell_order error: {e}, retrying..."
+                                                                );
+                                                                if now_unix() >= market.close_time_unix {
+                                                                    break;
+                                                                }
+                                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                                continue;
+                                                            }
+                                                        };
                                                         if let Some(ref mut log) = state.session_log {
                                                             let _ = log.log_order_submitted(
                                                                 &market.slug,
@@ -3526,14 +3568,23 @@ pub async fn run() -> Result<()> {
                                                 };
                                                 if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
                                                     let price = target;
-                                                    let result = clob
+                                                    let result = match clob
                                                         .place_sell_order(
                                                             &tp.token_id,
                                                             price,
                                                             size_to_place.clone(),
                                                             crate::types::SellOrderTimeInForce::Gtc,
                                                         )
-                                                        .await?;
+                                                        .await
+                                                    {
+                                                        Ok(r) => r,
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "[IntervalSniper] TP place_sell_order error: {e}, retrying..."
+                                                            );
+                                                            break;
+                                                        }
+                                                    };
                                                     if let Some(ref mut log) = state.session_log {
                                                         let _ = log.log_order_submitted(
                                                             &market.slug,
@@ -3626,14 +3677,27 @@ pub async fn run() -> Result<()> {
                                                 continue;
                                             }
                                             let price = target;
-                                            let result = clob
+                                            let result = match clob
                                                 .place_sell_order(
                                                     &tp.token_id,
                                                     price,
                                                     size_to_place.clone(),
                                                     crate::types::SellOrderTimeInForce::Gtc,
                                                 )
-                                                .await?;
+                                                .await
+                                            {
+                                                Ok(r) => r,
+                                                Err(e) => {
+                                                    warn!(
+                                                        "[IntervalSniper] TP place_sell_order error: {e}, retrying..."
+                                                    );
+                                                    if now_unix() >= market.close_time_unix {
+                                                        break;
+                                                    }
+                                                    tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                    continue;
+                                                }
+                                            };
                                             if let Some(ref mut log) = state.session_log {
                                                 let _ = log.log_order_submitted(
                                                     &market.slug,
@@ -3764,14 +3828,24 @@ pub async fn run() -> Result<()> {
                                     state.total_shares_this_interval = Decimal::ZERO;
                                 } else if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
                                     let price = target;
-                                        let result = clob
+                                        let result = match clob
                                             .place_sell_order(
                                             &tp.token_id,
                                             price,
                                             size.clone(),
                                             crate::types::SellOrderTimeInForce::Gtc,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Ok(r) => Some(r),
+                                            Err(e) => {
+                                                warn!(
+                                                    "[IntervalSniper] TP place_sell_order error: {e}, retrying..."
+                                                );
+                                                None
+                                            }
+                                        };
+                                    if let Some(result) = result {
                                     if let Some(ref mut log) = state.session_log {
                                         let _ = log.log_order_submitted(
                                             &market.slug,
@@ -3829,14 +3903,24 @@ pub async fn run() -> Result<()> {
                                                 state.tp_limit_balance_retries
                                             );
                                             let fok_price = round_to_tick(best_bid);
-                                            let fok_result = clob
+                                            let fok_result = match clob
                                                 .place_sell_order(
                                                     &tp.token_id,
                                                     fok_price,
                                                     size.clone(),
                                                     crate::types::SellOrderTimeInForce::Fok,
                                                 )
-                                                .await?;
+                                                .await
+                                            {
+                                                Ok(r) => Some(r),
+                                                Err(e) => {
+                                                    warn!(
+                                                        "[IntervalSniper] TP place_sell_order error: {e}, retrying..."
+                                                    );
+                                                    None
+                                                }
+                                            };
+                                            if let Some(fok_result) = fok_result {
                                             if fok_result.success {
                                                 if let Some(ref buy) = state.last_buy_order {
                                                     let pnl = (fok_price - buy.price) * size.clone();
@@ -3923,6 +4007,7 @@ pub async fn run() -> Result<()> {
                                                 state.last_buy_order = None;
                                                 clear_pending_gtc(&mut state);
                                             }
+                                            }
                                         }
                                     } else if is_invalid_amounts_error(result.error_msg.as_deref()) {
                                         // Position may already be closed (TP or SL filled); remaining balance is dust below API minimum.
@@ -3981,6 +4066,7 @@ pub async fn run() -> Result<()> {
                                         }
                                     } else if let Some(ref msg) = result.error_msg {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
+                                    }
                                     }
                                 }
                             }
