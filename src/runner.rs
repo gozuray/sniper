@@ -4313,9 +4313,9 @@ pub async fn run() -> Result<()> {
                         let t_order_start = Instant::now();
                         let result = match clob.place_limit_order(params, order_type).await {
                             Ok(r) => r,
-                            Err(_e) => {
+                            Err(e) => {
                                 warn!(
-                                    "[IntervalSniper] BUY timeout — waiting {}s for WS fill before retrying",
+                                    "[IntervalSniper] BUY network error ({e}) — waiting {}s for WS fill",
                                     BUY_TIMEOUT_WAIT_SECS
                                 );
                                 tokio::time::sleep(Duration::from_secs(BUY_TIMEOUT_WAIT_SECS)).await;
