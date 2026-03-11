@@ -58,6 +58,21 @@ pub enum OrderSide {
     Sell,
 }
 
+/// Asset type for balance/allowance: COLLATERAL (USDC) or CONDITIONAL (outcome token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetType {
+    #[allow(dead_code)]
+    Collateral,
+    Conditional,
+}
+
+/// Params for get_balance_allowance and update_balance_allowance. token_id required when asset_type is Conditional.
+#[derive(Debug, Clone)]
+pub struct BalanceAllowanceParams {
+    pub asset_type: AssetType,
+    pub token_id: Option<String>,
+}
+
 /// Result of cancelling orders (e.g. cancel-market-orders).
 #[derive(Debug, Default)]
 pub struct CancelOrdersResult {
@@ -104,6 +119,11 @@ pub trait ClobClient: Send + Sync {
     /// Used when TP/SL returns 400 to debug balance/allowance.
     async fn get_balance_allowance(&self, _token_id: &str) -> Result<String> {
         Ok("(not available)".to_string())
+    }
+
+    /// Invalidates the server's balance/allowance cache for the given asset. Call after CONFIRMED trade so next get_balance_allowance returns fresh on-chain values.
+    async fn update_balance_allowance(&self, _params: &BalanceAllowanceParams) -> Result<()> {
+        Ok(())
     }
 
     /// Available balance for token (from balance-allowance endpoint). Returns None on error or parse failure.
@@ -386,7 +406,7 @@ impl LiveClob {
         })
     }
 
-    /// GET /balance-allowance with HMAC auth. L2 HMAC is over path only (no query), per py-clob-client.
+    /// GET /balance-allowance (same path as POST update). Query params: asset_type=CONDITIONAL&token_id=...&signature_type=... L2 HMAC over path only (no query), per py-clob-client.
     async fn get_balance_allowance_inner(&self, token_id: &str) -> Result<String> {
         let path_for_sig = "/balance-allowance";
         let timestamp = std::time::SystemTime::now()
@@ -424,6 +444,53 @@ impl LiveClob {
             );
         }
         Ok(text)
+    }
+
+    /// POST /balance-allowance (same path as GET) with L2 auth to invalidate server cache.
+    /// Body: { "asset_type": "CONDITIONAL", "token_id": "0x..." } for outcome tokens; { "asset_type": "COLLATERAL" } for USDC.
+    /// Per py-clob-client / clob-client: GET uses query params, POST uses this JSON body.
+    async fn update_balance_allowance_inner(&self, params: &BalanceAllowanceParams) -> Result<()> {
+        let asset_type_str = match params.asset_type {
+            AssetType::Collateral => "COLLATERAL",
+            AssetType::Conditional => "CONDITIONAL",
+        };
+        let body = match &params.token_id {
+            Some(tid) => serde_json::json!({ "asset_type": asset_type_str, "token_id": tid }),
+            None => serde_json::json!({ "asset_type": asset_type_str }),
+        };
+        let body_str = body.to_string();
+        let path = "/balance-allowance";
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sig = build_poly_hmac(&self.api_secret, timestamp, "POST", path, Some(&body_str))?;
+        let url = format!("{}{}", self.clob_host, path);
+        let signer_addr = format!("{:?}", self.wallet.address())
+            .trim_matches('"')
+            .to_string();
+        let res = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_ADDRESS", &signer_addr)
+            .header("POLY_SIGNATURE", &sig)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .body(body_str)
+            .send()
+            .await?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "update balance-allowance HTTP {}: {}",
+                status,
+                text.chars().take(200).collect::<String>()
+            );
+        }
+        Ok(())
     }
 
     /// Parse a single decimal field from a JSON value (string, int, or float).
@@ -671,6 +738,10 @@ impl ClobClient for LiveClob {
 
     async fn get_balance_allowance(&self, token_id: &str) -> Result<String> {
         self.get_balance_allowance_inner(token_id).await
+    }
+
+    async fn update_balance_allowance(&self, params: &BalanceAllowanceParams) -> Result<()> {
+        self.update_balance_allowance_inner(params).await
     }
 
     async fn get_available_balance(&self, token_id: &str) -> Result<Option<Decimal>> {

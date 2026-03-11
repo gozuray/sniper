@@ -58,8 +58,11 @@ fn normalize_order_id(id: &str) -> String {
 }
 
 /// Client for CLOB WebSocket user channel. Holds order fill state in a background task.
+/// Tracks CONFIRMED BUY trade sizes per asset so the runner can wait for on-chain balance before placing TP.
 pub struct ClobWsUser {
     state: Arc<RwLock<HashMap<String, UserOrderState>>>,
+    /// Cumulative size of BUY trades with status CONFIRMED per asset_id (on-chain balance ready for sell).
+    confirmed_buy: Arc<RwLock<HashMap<String, Decimal>>>,
     _join: tokio::task::JoinHandle<()>,
 }
 
@@ -84,7 +87,10 @@ impl ClobWsUser {
         let condition_ids = condition_ids.to_vec();
         let state: Arc<RwLock<HashMap<String, UserOrderState>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let confirmed_buy: Arc<RwLock<HashMap<String, Decimal>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let state_recv = Arc::clone(&state);
+        let confirmed_buy_recv = Arc::clone(&confirmed_buy);
 
         let join = tokio::spawn(async move {
             let mut attempt = 0u32;
@@ -167,7 +173,7 @@ impl ClobWsUser {
                                     last_msg_at = std::time::Instant::now();
                                     match msg {
                                         Message::Text(text) => {
-                                            if let Err(e) = Self::apply_message(&state_recv, &text).await {
+                                            if let Err(e) = Self::apply_message(&state_recv, &confirmed_buy_recv, &text).await {
                                                 let event_type = serde_json::from_str::<serde_json::Value>(&text)
                                                     .ok()
                                                     .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
@@ -214,7 +220,7 @@ impl ClobWsUser {
             }
         });
 
-        Ok(Self { state, _join: join })
+        Ok(Self { state, confirmed_buy, _join: join })
     }
 
     /// Build WebSocket user URL from REST host (same pattern as market WS).
@@ -227,7 +233,11 @@ impl ClobWsUser {
         }
     }
 
-    async fn apply_message(state: &RwLock<HashMap<String, UserOrderState>>, text: &str) -> Result<()> {
+    async fn apply_message(
+        state: &RwLock<HashMap<String, UserOrderState>>,
+        confirmed_buy: &RwLock<HashMap<String, Decimal>>,
+        text: &str,
+    ) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(text).context("parse JSON")?;
         let event_type = value
             .get("event_type")
@@ -295,6 +305,24 @@ impl ClobWsUser {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_uppercase();
+                let status = value
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+
+                // CONFIRMED = on-chain balance updated; use this as trigger for TP placement (no balance/allowance lag).
+                if status == "CONFIRMED" && side == "BUY" && !asset_id.is_empty() {
+                    let mut confirmed = confirmed_buy.write().await;
+                    let entry = confirmed.entry(asset_id.clone()).or_insert(Decimal::ZERO);
+                    *entry += trade_size;
+                    tracing::trace!(
+                        "[ClobWsUser] CONFIRMED BUY asset_id={} +{} → confirmed_buy={}",
+                        &asset_id[..asset_id.len().min(18)],
+                        trade_size,
+                        *entry
+                    );
+                }
 
                 // Try taker_order_id first (our FAK/FOK orders), then maker_order_id (our GTC orders).
                 let order_id = value.get("taker_order_id")
@@ -439,6 +467,13 @@ impl ClobWsUser {
         }
     }
 
+    /// Cumulative size of BUY trades with status CONFIRMED for this asset (on-chain balance ready for sell).
+    /// Use this to wait for CONFIRMED before placing TP: only place TP when `get_confirmed_buy_size >= tp_size`.
+    pub async fn get_confirmed_buy_size(&self, asset_id: &str) -> Option<Decimal> {
+        let confirmed = self.confirmed_buy.read().await;
+        confirmed.get(asset_id).copied().filter(|d| *d > Decimal::ZERO)
+    }
+
     /// Return full order state for an order_id.
     #[allow(dead_code)]
     pub async fn get_order_state(&self, order_id: &str) -> Option<UserOrderState> {
@@ -453,5 +488,7 @@ impl ClobWsUser {
     pub async fn clear_token_state(&self, asset_id: &str) {
         let mut map = self.state.write().await;
         map.retain(|_, v| v.asset_id != asset_id);
+        let mut confirmed = self.confirmed_buy.write().await;
+        confirmed.remove(asset_id);
     }
 }

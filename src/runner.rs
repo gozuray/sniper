@@ -1,7 +1,7 @@
 //! Main loop: interval switch, top-of-book, buy in range, TP/SL.
 
 #[allow(unused_imports)]
-use crate::clob::{ClobClient, LimitOrderParams, OrderSide, OrderType};
+use crate::clob::{AssetType, BalanceAllowanceParams, ClobClient, LimitOrderParams, OrderSide, OrderType};
 use crate::clob_ws_book::ClobWsBook;
 use crate::clob_ws_user::ClobWsUser;
 use crate::config::{current_5min_slug, load_config};
@@ -3357,6 +3357,22 @@ pub async fn run() -> Result<()> {
                         if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() && state.sl_limit_order_id.is_none() {
                             let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
+                                let position_remaining = tp.size.clone() - state.tp_cumulative_filled.clone();
+                                let position_size_real = position_remaining.clone();
+                                // With WS: only place TP after CONFIRMED (on-chain balance updated); avoids balance/allowance 400 storm.
+                                let confirmed_ok = match ws_user_ref {
+                                    Some(ws) => ws
+                                        .get_confirmed_buy_size(&tp.token_id)
+                                        .await
+                                        .map(|c| c >= position_size_real.clone() * dec!(0.99))
+                                        .unwrap_or(false),
+                                    None => true,
+                                };
+                                if !confirmed_ok {
+                                    tracing::debug!(
+                                        "[IntervalSniper] TP waiting for CONFIRMED (on-chain balance) for token before placing"
+                                    );
+                                } else {
                                 // Log reactivation when we're retrying after balance/retry was cancelled (e.g. price dropped to entry then came back)
                                 if state.tp_limit_balance_retries > 0 {
                                     info!(
@@ -3391,11 +3407,125 @@ pub async fn run() -> Result<()> {
                                 let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
                                 if (size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE) || (size.is_zero() && stale_available && !dust_after_sl) {
                                     if stale_available && !dust_after_sl {
-                                        // Balance not yet updated after WS fill: retry every 200ms until interval ends or REST balance matches fill size (same rounding as WS balance after fill).
+                                        // With CONFIRMED (ws_user): invalidate server cache, backoff get balance, place once — no polling loop.
                                         let expected_size = floor_to_decimals(
                                             position_size_real.min(state.config.size_shares),
                                             SELL_SIZE_DECIMALS,
                                         );
+                                        if ws_user_ref.is_some() {
+                                            // POST then GET each attempt; known issue: getBalanceAllowance can return 0 after update — fallback: try place_sell_order anyway.
+                                            let params = BalanceAllowanceParams {
+                                                asset_type: AssetType::Conditional,
+                                                token_id: Some(tp.token_id.clone()),
+                                            };
+                                            let delays = [100u64, 200, 400];
+                                            let mut tp_placed = false;
+                                            for (i, delay_ms) in delays.iter().enumerate() {
+                                                state.allowance_cache = None;
+                                                let _ = clob.as_ref().update_balance_allowance(&params).await;
+                                                let bal = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                                                if bal.as_ref().map(|b| *b >= expected_size.clone() * dec!(0.99)).unwrap_or(false) {
+                                                    let size_to_place = bal
+                                                        .map(|b| floor_to_decimals(expected_size.min(b), SELL_SIZE_DECIMALS))
+                                                        .unwrap_or_else(|| expected_size.clone());
+                                                    if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                        let price = target.clone();
+                                                        let result = clob
+                                                            .place_sell_order(
+                                                                &tp.token_id,
+                                                                price.clone(),
+                                                                size_to_place.clone(),
+                                                                crate::types::SellOrderTimeInForce::Gtc,
+                                                            )
+                                                            .await?;
+                                                        if let Some(ref mut log) = state.session_log {
+                                                            let _ = log.log_order_submitted(
+                                                                &market.slug,
+                                                                market.interval_start_unix,
+                                                                market.close_time_unix,
+                                                                now_ms(),
+                                                                &tp.token_id,
+                                                                "SELL",
+                                                                "GTC",
+                                                                price.clone(),
+                                                                size_to_place.clone(),
+                                                                result.order_id.as_deref(),
+                                                                result.http_status,
+                                                                result.success,
+                                                                result.error_msg.as_deref(),
+                                                            );
+                                                        }
+                                                        if result.success {
+                                                            state.tp_limit_order_id = result.order_id.clone();
+                                                            state.tp_placed_size = Some(size_to_place);
+                                                            state.tp_limit_balance_retries = 0;
+                                                            info!(
+                                                                "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (cancel if price drops to entry {})",
+                                                                fmt_price(Some(&price)),
+                                                                fmt_decimal_2(&size_to_place),
+                                                                result.order_id,
+                                                                fmt_price(Some(&entry_price))
+                                                            );
+                                                            tp_placed = true;
+                                                            break;
+                                                        }
+                                                        if is_position_closed_error(result.error_msg.as_deref()) {
+                                                            state.allowance_cache = None;
+                                                            state.tp_limit_balance_retries += 1;
+                                                        }
+                                                    }
+                                                }
+                                                if !tp_placed && i < delays.len() - 1 {
+                                                    tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                                                }
+                                            }
+                                            // Fallback: getBalanceAllowance sometimes returns 0 even after update (known GitHub issue). Try place once with expected_size.
+                                            if !tp_placed && expected_size >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                state.allowance_cache = None;
+                                                let price = target.clone();
+                                                let result = clob
+                                                    .place_sell_order(
+                                                        &tp.token_id,
+                                                        price.clone(),
+                                                        expected_size.clone(),
+                                                        crate::types::SellOrderTimeInForce::Gtc,
+                                                    )
+                                                    .await?;
+                                                if let Some(ref mut log) = state.session_log {
+                                                    let _ = log.log_order_submitted(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        now_ms(),
+                                                        &tp.token_id,
+                                                        "SELL",
+                                                        "GTC",
+                                                        price.clone(),
+                                                        expected_size.clone(),
+                                                        result.order_id.as_deref(),
+                                                        result.http_status,
+                                                        result.success,
+                                                        result.error_msg.as_deref(),
+                                                    );
+                                                }
+                                                if result.success {
+                                                    state.tp_limit_order_id = result.order_id.clone();
+                                                    state.tp_placed_size = Some(expected_size.clone());
+                                                    state.tp_limit_balance_retries = 0;
+                                                    info!(
+                                                        "[IntervalSniper] TP limit placed @ {} size={} (fallback: place without balance check)",
+                                                        fmt_price(Some(&price)),
+                                                        fmt_decimal_2(&expected_size)
+                                                    );
+                                                } else if is_position_closed_error(result.error_msg.as_deref()) {
+                                                    state.tp_limit_balance_retries += 1;
+                                                    tracing::debug!(
+                                                        "[IntervalSniper] TP fallback place failed (balance/allowance) — will retry next tick if price still at target"
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                        // No WS: legacy polling loop until REST balance reflects fill or interval ends.
                                         let mut tp_placed = false;
                                         while !tp_placed {
                                             let interval_ended = now_unix() >= market.close_time_unix;
@@ -3570,6 +3700,7 @@ pub async fn run() -> Result<()> {
                                                 break;
                                             }
                                         }
+                                        } // end legacy polling loop (no WS)
                                     } else if dust_after_sl {
                                         // Dust left after SL filled (e.g. SL size was 5.99, left 0.01). Do not report as TP.
                                         let exit_price = state.sl_limit_order_price.unwrap_or(target);
@@ -3871,6 +4002,7 @@ pub async fn run() -> Result<()> {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
                                     }
                                 }
+                                } // end else (confirmed_ok)
                             }
                         }
                     }
