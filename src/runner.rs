@@ -879,7 +879,8 @@ pub async fn run() -> Result<()> {
     let config = load_config()?;
     let clob_host = std::env::var("POLYMARKET_CLOB_HOST")
         .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
-    let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    // HFT: short timeout so the main loop is not blocked by slow REST (fail fast, retry next tick)
+    let http = Client::builder().timeout(Duration::from_secs(2)).build()?;
     let clob = Arc::new(crate::clob::create_clob_client(config.dry_run)?);
 
     if config.redeem_enabled && !config.dry_run {

@@ -242,8 +242,9 @@ impl LiveClob {
         let neg_risk = std::env::var("MM_NEG_RISK")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        // HFT: short timeout so the loop fails fast and can retry instead of blocking 15s
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(2))
             .build()?;
         Ok(Self {
             clob_host: clob_host.trim_end_matches('/').to_string(),
