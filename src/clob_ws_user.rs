@@ -229,7 +229,11 @@ impl ClobWsUser {
 
     async fn apply_message(state: &RwLock<HashMap<String, UserOrderState>>, text: &str) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(text).context("parse JSON")?;
-        let event_type = value.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+        let event_type = value
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
 
         if event_type == "order" {
             let id = value
@@ -310,8 +314,19 @@ impl ClobWsUser {
                         } else {
                             new_matched
                         };
+                        tracing::trace!(
+                            "[ClobWsUser] trade applied: order_id={} +{} → size_matched={}",
+                            key,
+                            trade_size,
+                            existing.size_matched
+                        );
                     } else {
                         // New order known only from this trade; don't set original_size so we don't cap future partials until we get an ORDER event.
+                        tracing::trace!(
+                            "[ClobWsUser] trade applied (new entry): order_id={} size={}",
+                            key,
+                            trade_size
+                        );
                         map.insert(key.clone(), UserOrderState {
                             order_id: key,
                             asset_id,

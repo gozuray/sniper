@@ -1018,6 +1018,8 @@ pub async fn run() -> Result<()> {
         let now_ms_u = now_ms();
 
         // Poll GTC fill first (before interval switch) so we never drop a fill when the interval boundary crosses this tick.
+        // Fill state comes from WS user channel (TRADE + order UPDATE events). If "GTC partial fill" never appears
+        // but the order filled on Polymarket, the WS may have missed the event (reconnect, event_type casing, or no TRADE/UPDATE received).
         if let Some(market) = state.market.as_ref().cloned() {
             if let (Some(ref order_id), Some(ws_user)) = (
                 state.pending_gtc_order_id.as_ref(),
@@ -2266,20 +2268,12 @@ pub async fn run() -> Result<()> {
 
         // Stop loss: limit-order style (like TP). When bid <= trigger + SL_TRIGGER_MARGIN, place GTC limit at best_bid
         // and keep trying every tick while in zone (no resting SL order). If bid drops before fill, cancel and replace.
-        // Detect 100% fill via WS user.
+        // Detect 100% fill via WS user. Use same `top` as main tick for consistent book and minimal latency (no extra WS/REST call).
         if state.config.enable_stop_loss {
             if let Some(ref sl) = state.pending_stop_loss.clone() {
                 if !state.stop_loss_placed {
-                    let top_sl = if let Some(ref ws) = state.ws_book {
-                        ws.get_top_of_book().await
-                    } else {
-                        match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
-                            Ok(t) => t,
-                            Err(_) => top.clone(),
-                        }
-                    };
                     let is_up = sl.token_id == market.token_id_up;
-                    let side_book = if is_up { &top_sl.token_id_up } else { &top_sl.token_id_down };
+                    let side_book = if is_up { &top.token_id_up } else { &top.token_id_down };
                     let best_bid = side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
 
                     // Interval ended: cancel SL order so we don't leave a resting order in wrong interval.
@@ -2745,7 +2739,7 @@ pub async fn run() -> Result<()> {
                                             } else {
                                                 match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
                                                     Ok(t) => t,
-                                                    Err(_) => top_sl.clone(),
+                                                    Err(_) => top.clone(),
                                                 }
                                             };
                                             let side_recheck = if is_up { &top_recheck.token_id_up } else { &top_recheck.token_id_down };
@@ -2982,26 +2976,12 @@ pub async fn run() -> Result<()> {
                         .unwrap_or(Decimal::ZERO);
                     let elapsed_sec = (now_ms_u - tp.placed_at_ms) / 1000;
                     if elapsed_sec >= state.config.min_seconds_after_buy_before_auto_sell as u64 {
-                        let top_tp = if let Some(ref ws) = state.ws_book {
-                            ws.get_top_of_book().await
-                        } else {
-                            match fetch_top_of_book(
-                                &http,
-                                &clob_host,
-                                &market.token_id_up,
-                                &market.token_id_down,
-                            )
-                            .await
-                            {
-                                Ok(t) => t,
-                                Err(_) => top.clone(),
-                            }
-                        };
+                        // Use same `top` as main tick (already WS when available) — one book snapshot per tick, no extra latency.
                         let is_up = tp.token_id == market.token_id_up;
                         let side_book = if is_up {
-                            &top_tp.token_id_up
+                            &top.token_id_up
                         } else {
-                            &top_tp.token_id_down
+                            &top.token_id_down
                         };
                         let best_bid = side_book
                             .as_ref()
@@ -3015,10 +2995,17 @@ pub async fn run() -> Result<()> {
                         let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
                         let mut tp_filled_this_iteration = false;
-                        // 1) If we have a TP limit order resting: cancel when price drops below entry; then wait for target or SL.
+                        // 1) If we have a TP limit order resting: cancel when price drops below entry OR when in SL zone (best_bid <= SL trigger).
+                        //    Same `top` as main tick is used for SL and TP so one consistent book view per tick (HFT).
+                        let in_sl_zone = state
+                            .pending_stop_loss
+                            .as_ref()
+                            .map(|sl| best_bid <= sl.trigger_price + SL_TRIGGER_MARGIN)
+                            .unwrap_or(false);
+                        let should_cancel_tp_below_level = best_bid < entry_price || in_sl_zone;
                         let tp_order_id = state.tp_limit_order_id.clone();
                         if let Some(ref oid) = tp_order_id {
-                            if best_bid > Decimal::ZERO && best_bid < entry_price {
+                            if best_bid > Decimal::ZERO && should_cancel_tp_below_level {
                                 // HFT: WS first — get partial fill before cancel to track tp_cumulative_filled.
                                 if let Some(ws_user) = ws_user_ref {
                                     if let Some((filled, fill_event_type)) = ws_user.get_order_filled_size_sell_with_type(oid).await {
@@ -3135,10 +3122,17 @@ pub async fn run() -> Result<()> {
                                     }
                                 }
                                 if !tp_filled_this_iteration {
-                                    trace!(
-                                        "[IntervalSniper] TP limit canceled (price below entry {}), waiting for target or SL",
-                                        fmt_price(Some(&entry_price))
-                                    );
+                                    if in_sl_zone {
+                                        trace!(
+                                            "[IntervalSniper] TP limit canceled (bid {} in SL zone), waiting for target or SL",
+                                            fmt_price(Some(&best_bid))
+                                        );
+                                    } else {
+                                        trace!(
+                                            "[IntervalSniper] TP limit canceled (price below entry {}), waiting for target or SL",
+                                            fmt_price(Some(&entry_price))
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -3474,7 +3468,7 @@ pub async fn run() -> Result<()> {
                                                 .await
                                                 {
                                                     Ok(t) => t,
-                                                    Err(_) => top_tp.clone(),
+                                                    Err(_) => top.clone(),
                                                 }
                                             };
                                             let current_best_bid = if is_up {
