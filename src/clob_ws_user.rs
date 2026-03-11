@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,11 +58,13 @@ fn normalize_order_id(id: &str) -> String {
 }
 
 /// Client for CLOB WebSocket user channel. Holds order fill state in a background task.
-/// Tracks CONFIRMED BUY trade sizes per asset so the runner can wait for on-chain balance before placing TP.
+/// Tracks MATCHED BUY trade sizes per asset so the runner can trigger TP/SL placement (update_balance_allowance + backoff).
 pub struct ClobWsUser {
     state: Arc<RwLock<HashMap<String, UserOrderState>>>,
-    /// Cumulative size of BUY trades with status CONFIRMED per asset_id (on-chain balance ready for sell).
+    /// Cumulative size of BUY trades with status MATCHED per asset_id (used as trigger for TP/SL placement).
     confirmed_buy: Arc<RwLock<HashMap<String, Decimal>>>,
+    /// Token IDs for the current market; [Blockchain] trade log is emitted only when asset_id is in this set (empty = log all).
+    active_token_ids: Arc<RwLock<HashSet<String>>>,
     _join: tokio::task::JoinHandle<()>,
 }
 
@@ -89,8 +91,10 @@ impl ClobWsUser {
             Arc::new(RwLock::new(HashMap::new()));
         let confirmed_buy: Arc<RwLock<HashMap<String, Decimal>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let active_token_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
         let state_recv = Arc::clone(&state);
         let confirmed_buy_recv = Arc::clone(&confirmed_buy);
+        let active_token_ids_recv = Arc::clone(&active_token_ids);
 
         let join = tokio::spawn(async move {
             let mut attempt = 0u32;
@@ -173,7 +177,7 @@ impl ClobWsUser {
                                     last_msg_at = std::time::Instant::now();
                                     match msg {
                                         Message::Text(text) => {
-                                            if let Err(e) = Self::apply_message(&state_recv, &confirmed_buy_recv, &text).await {
+                                            if let Err(e) = Self::apply_message(&state_recv, &confirmed_buy_recv, &active_token_ids_recv, &text).await {
                                                 let event_type = serde_json::from_str::<serde_json::Value>(&text)
                                                     .ok()
                                                     .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
@@ -220,7 +224,7 @@ impl ClobWsUser {
             }
         });
 
-        Ok(Self { state, confirmed_buy, _join: join })
+        Ok(Self { state, confirmed_buy, active_token_ids, _join: join })
     }
 
     /// Build WebSocket user URL from REST host (same pattern as market WS).
@@ -233,9 +237,15 @@ impl ClobWsUser {
         }
     }
 
+    /// Set token IDs for the current market. [Blockchain] trade logs are emitted only for trades whose asset_id is in this set. Empty = log all trades.
+    pub async fn set_active_token_ids(&self, ids: impl IntoIterator<Item = String>) {
+        *self.active_token_ids.write().await = ids.into_iter().collect();
+    }
+
     async fn apply_message(
         state: &RwLock<HashMap<String, UserOrderState>>,
         confirmed_buy: &RwLock<HashMap<String, Decimal>>,
+        active_token_ids: &RwLock<HashSet<String>>,
         text: &str,
     ) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(text).context("parse JSON")?;
@@ -311,13 +321,44 @@ impl ClobWsUser {
                     .unwrap_or("")
                     .to_uppercase();
 
-                // CONFIRMED = on-chain balance updated; use this as trigger for TP placement (no balance/allowance lag).
-                if status == "CONFIRMED" && side == "BUY" && !asset_id.is_empty() {
+                let trade_id = value.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let price = value
+                    .get("price")
+                    .and_then(parse_decimal_value)
+                    .unwrap_or(Decimal::ZERO);
+                let timestamp = value
+                    .get("timestamp")
+                    .or_else(|| value.get("last_update"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                            .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                let should_log = {
+                    let ids = active_token_ids.read().await;
+                    ids.is_empty() || ids.contains(&asset_id)
+                };
+                if should_log {
+                    tracing::info!(
+                        "[Blockchain] trade {} → {} | {} {} @ {} | t={}",
+                        trade_id,
+                        status,
+                        side,
+                        trade_size,
+                        price,
+                        timestamp
+                    );
+                }
+
+                // MATCHED = fill on exchange; use this as trigger for TP/SL placement (update_balance_allowance + backoff handles server cache).
+                if status == "MATCHED" && side == "BUY" && !asset_id.is_empty() {
                     let mut confirmed = confirmed_buy.write().await;
                     let entry = confirmed.entry(asset_id.clone()).or_insert(Decimal::ZERO);
                     *entry += trade_size;
                     tracing::trace!(
-                        "[ClobWsUser] CONFIRMED BUY asset_id={} +{} → confirmed_buy={}",
+                        "[ClobWsUser] MATCHED BUY asset_id={} +{} → confirmed_buy={}",
                         &asset_id[..asset_id.len().min(18)],
                         trade_size,
                         *entry
@@ -467,8 +508,8 @@ impl ClobWsUser {
         }
     }
 
-    /// Cumulative size of BUY trades with status CONFIRMED for this asset (on-chain balance ready for sell).
-    /// Use this to wait for CONFIRMED before placing TP: only place TP when `get_confirmed_buy_size >= tp_size`.
+    /// Cumulative size of BUY trades with status MATCHED for this asset.
+    /// Use this to trigger TP/SL placement: only place when `get_confirmed_buy_size >= size` (then update_balance_allowance + backoff).
     pub async fn get_confirmed_buy_size(&self, asset_id: &str) -> Option<Decimal> {
         let confirmed = self.confirmed_buy.read().await;
         confirmed.get(asset_id).copied().filter(|d| *d > Decimal::ZERO)
