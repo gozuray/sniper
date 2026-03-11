@@ -3144,16 +3144,16 @@ pub async fn run() -> Result<()> {
                         }
 
                         // PRIORIDAD 1: WS User (instant, 0ms latency). Verificar con REST antes de cerrar para evitar falsos positivos.
+                        // Log each TP partial fill via WS; when cumulative reaches 99%+, same close logic as single fill.
                         let mut tp_detected_by_ws = false;
 
                         if let Some(ws_user) = ws_user_ref {
                             if let Some(ref oid) = state.tp_limit_order_id {
                                 let tp_size_for_check = state.tp_placed_size.unwrap_or(tp.size.clone());
                                 match ws_user.get_order_filled_size_sell_with_type(oid).await {
-                                    Some((filled, fill_event_type)) if filled >= tp_size_for_check * dec!(0.99) => {
-                                        // WS fill event (TRADE/UPDATE) is authoritative — close immediately.
-                                        // REST may lag 1-5s; requiring confirmation causes missed/delayed detection.
-                                        {
+                                    Some((filled, fill_event_type)) => {
+                                        if filled >= tp_size_for_check * dec!(0.99) {
+                                            // Full fill or cumulative partials reached 100% — same close logic as single fill.
                                             tp_detected_by_ws = true;
                                             let close_size = filled.clone();
 
@@ -3217,6 +3217,37 @@ pub async fn run() -> Result<()> {
                                             state.last_logged_balance_up = None;
                                             state.last_logged_balance_down = None;
                                             state.total_shares_this_interval = Decimal::ZERO;
+                                        } else if filled > state.tp_last_order_filled {
+                                            // Partial fill — update state and log each partial (same as when price drops below entry).
+                                            let delta = filled.clone() - state.tp_last_order_filled.clone();
+                                            state.tp_cumulative_filled += delta.clone();
+                                            state.tp_last_order_filled = filled.clone();
+                                            if delta >= MIN_SELL_SIZE {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let pnl = (target.clone() - buy.price.clone()) * delta.clone();
+                                                    let roi_pct = ((target.clone() / buy.price) - Decimal::ONE) * dec!(100);
+                                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                    info!(
+                                                        "[IntervalSniper] TP partial fill via WS ({}): +{} @ {} (total TP filled {}/{}), pnl={:+.4} ({:+.2}%) held={}s",
+                                                        fill_event_type, fmt_decimal_2(&delta), fmt_price(Some(&target)),
+                                                        fmt_decimal_2(&state.tp_cumulative_filled), fmt_decimal_2(&tp_size_for_check), pnl, roi_pct, held_sec
+                                                    );
+                                                    if let Some(ref mut log) = state.session_log {
+                                                        let _ = log.log_position_close(
+                                                            &market.slug, market.interval_start_unix, market.close_time_unix,
+                                                            buy.side, buy.price.clone(), target.clone(), buy.timestamp_ms, now_ms_u,
+                                                            ExitType::TakeProfit, delta.clone(), Some(delta),
+                                                            buy.order_id.as_deref(), Some(oid.as_str()),
+                                                            state.interval_min_bid_up, state.interval_max_bid_up,
+                                                            state.interval_min_bid_down, state.interval_max_bid_down,
+                                                            None,
+                                                            None,
+                                                            None,
+                                                            false,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     _ => {}
