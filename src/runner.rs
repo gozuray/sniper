@@ -60,6 +60,8 @@ const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
 const PENDING_GTC_REST_CHECK_MS: u64 = 400;
 /// When no WS user channel, check REST every tick from buy (0 = no delay).
 const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 0;
+/// After BUY place_limit_order timeout: wait this many seconds for WS fill before retrying.
+const BUY_TIMEOUT_WAIT_SECS: u64 = 3;
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -4303,8 +4305,30 @@ pub async fn run() -> Result<()> {
                             state.config.min_buy_price,
                             state.config.max_buy_price
                         );
+                        let ws_confirmed_before = if let Some(ref ws) = state.ws_user {
+                            ws.get_confirmed_buy_for_token(token_id).await.unwrap_or(Decimal::ZERO)
+                        } else {
+                            Decimal::ZERO
+                        };
                         let t_order_start = Instant::now();
-                        let result = clob.place_limit_order(params, order_type).await?;
+                        let result = match clob.place_limit_order(params, order_type).await {
+                            Ok(r) => r,
+                            Err(_e) => {
+                                warn!(
+                                    "[IntervalSniper] BUY timeout — waiting {}s for WS fill before retrying",
+                                    BUY_TIMEOUT_WAIT_SECS
+                                );
+                                tokio::time::sleep(Duration::from_secs(BUY_TIMEOUT_WAIT_SECS)).await;
+                                if let Some(ref ws) = state.ws_user {
+                                    if let Some(confirmed_after) = ws.get_confirmed_buy_for_token(token_id).await {
+                                        if confirmed_after > ws_confirmed_before {
+                                            continue;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        };
                         if let Some(ref mut log) = state.session_log {
                             let order_type_str = match order_type {
                                 OrderType::Gtc => "GTC",

@@ -412,6 +412,12 @@ impl ClobWsUser {
         Ok(())
     }
 
+    /// Cumulative BUY fills (MATCHED) per asset_id. Used after timeout to detect if our order filled via WS.
+    pub async fn get_confirmed_buy_for_token(&self, token_id: &str) -> Option<Decimal> {
+        let m = self.confirmed_buy.read().await;
+        m.get(token_id).copied().filter(|d| *d > Decimal::ZERO)
+    }
+
     /// Return the current filled size (size_matched) for an order, if known.
     #[allow(dead_code)]
     pub async fn get_order_filled_size(&self, order_id: &str) -> Option<Decimal> {
