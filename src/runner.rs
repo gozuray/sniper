@@ -60,8 +60,6 @@ const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
 const PENDING_GTC_REST_CHECK_MS: u64 = 400;
 /// When no WS user channel, check REST every tick from buy (0 = no delay).
 const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 0;
-/// After BUY place_limit_order timeout: wait this many seconds for WS fill before retrying.
-const BUY_TIMEOUT_WAIT_SECS: u64 = 3;
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -124,6 +122,16 @@ fn update_interval_bids(
 /// Maximum number of trades (buy + sell) allowed per interval; second trade only when the first was closed by SL.
 #[allow(dead_code)]
 const MAX_TRADES_PER_INTERVAL: u32 = 2;
+
+/// After BUY place_limit_order returns Err (network), we wait for WS MATCHED; this stores context to apply the fill when detected.
+struct PendingTimeoutBuy {
+    token_id: String,
+    side: EntrySide,
+    price: Decimal,
+    size: Decimal,
+    at_ms: u64,
+    confirmed_before: Decimal,
+}
 
 struct RunnerState {
     config: Config,
@@ -201,6 +209,8 @@ struct RunnerState {
     telegram: Option<TelegramLog>,
     /// Keep the Telegram sender task alive.
     telegram_handle: Option<tokio::task::JoinHandle<()>>,
+    /// BUY place_limit_order returned Err (network); waiting for WS MATCHED to confirm fill before allowing new buys.
+    pending_timeout_buy: Option<PendingTimeoutBuy>,
 }
 
 /// Parse balance from balance-allowance raw JSON; balance is in 6-decimal raw units (6620 = 0.00662 shares).
@@ -965,6 +975,7 @@ pub async fn run() -> Result<()> {
         allowance_cache: None,
         telegram: None,
         telegram_handle: None,
+        pending_timeout_buy: None,
     };
 
     // Telegram: background task sends logs; main loop only enqueues (try_send), so no delay.
@@ -1024,6 +1035,108 @@ pub async fn run() -> Result<()> {
         // Fill state comes from WS user channel (TRADE + order UPDATE events). If "GTC partial fill" never appears
         // but the order filled on Polymarket, the WS may have missed the event (reconnect, event_type casing, or no TRADE/UPDATE received).
         if let Some(market) = state.market.as_ref().cloned() {
+            // pending_timeout_buy: BUY place_limit_order returned Err (network); wait for WS MATCHED or 10s timeout.
+            if let Some(ref ptb) = state.pending_timeout_buy {
+                if now_ms_u.saturating_sub(ptb.at_ms) > 10_000 {
+                    warn!(
+                        "[IntervalSniper] BUY timeout expired — no WS fill detected, assuming order was not executed"
+                    );
+                    state.pending_timeout_buy = None;
+                }
+            }
+            if let (Some(ref ptb), Some(ws_user)) = (
+                state.pending_timeout_buy.as_ref(),
+                state.ws_user.as_ref().map(|a| a.as_ref()),
+            ) {
+                if let Some(confirmed_after) = ws_user.get_confirmed_buy_for_token(&ptb.token_id).await {
+                    if confirmed_after > ptb.confirmed_before {
+                        let filled = (confirmed_after.clone() - ptb.confirmed_before.clone())
+                            .min(ptb.size.clone());
+                        if filled >= MIN_SELL_SIZE {
+                            let ptb = state.pending_timeout_buy.take().unwrap();
+                            let token_id = ptb.token_id.clone();
+                            let entry_side = ptb.side;
+                            let entry_price = ptb.price.clone();
+                            state.trades_this_interval += 1;
+                            state.total_shares_this_interval += filled.clone();
+                            state.ordered_this_interval = true;
+                            state.last_buy_order = Some(LastBuyOrder {
+                                order_id: None,
+                                token_id: token_id.clone(),
+                                side: entry_side,
+                                size: filled.clone(),
+                                price: entry_price.clone(),
+                                timestamp_ms: ptb.at_ms,
+                            });
+                            let target_price = if state.config.auto_sell_at_max_price {
+                                dec!(0.99)
+                            } else {
+                                round_to_tick(state.config.take_profit_price)
+                            };
+                            let base_sell_size = floor_to_decimals(
+                                filled.clone().min(state.config.size_shares),
+                                SELL_SIZE_DECIMALS,
+                            )
+                            .max(MIN_SELL_SIZE);
+                            let pct_tp =
+                                Decimal::from(state.config.auto_sell_quantity_percent) / dec!(100);
+                            let pct_sl =
+                                Decimal::from(state.config.stop_loss_quantity_percent) / dec!(100);
+                            let tp_size = floor_to_decimals(base_sell_size * pct_tp, SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(base_sell_size);
+                            let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
+                                .max(MIN_SELL_SIZE)
+                                .min(base_sell_size);
+                            state.pending_auto_sell = Some(PendingAutoSell {
+                                token_id: token_id.clone(),
+                                target_price,
+                                size: tp_size,
+                                placed_at_ms: now_ms_u,
+                            });
+                            state.pending_stop_loss = Some(PendingStopLoss {
+                                token_id,
+                                entry_price: entry_price.clone(),
+                                size: sl_size,
+                                trigger_price: round_to_tick(state.config.stop_loss_price),
+                                placed_at_ms: now_ms_u,
+                            });
+                            state.allowance_cache = None;
+                            state.auto_sell_placed = false;
+                            state.stop_loss_placed = false;
+                            state.sl_cumulative_filled = Decimal::ZERO;
+                            state.sl_last_order_filled = Decimal::ZERO;
+                            state.tp_cumulative_filled = Decimal::ZERO;
+                            state.tp_last_order_filled = Decimal::ZERO;
+                            state.tp_limit_order_id = None;
+                            state.tp_placed_size = None;
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
+                            info!(
+                                "[IntervalSniper] BUY (fill via WS after network error) {} @ {}   size={}   TP size={}   SL size={}",
+                                match entry_side {
+                                    EntrySide::Up => "Up  ",
+                                    EntrySide::Down => "Down",
+                                },
+                                fmt_decimal_2(&entry_price),
+                                fmt_decimal_2(&filled),
+                                fmt_decimal_2(&tp_size),
+                                fmt_decimal_2(&sl_size)
+                            );
+                            let w = state.ws_user.clone();
+                            log_balance_after_buy(
+                                clob.as_ref().as_ref(),
+                                &market,
+                                w.as_ref().map(|a| a.as_ref()),
+                                Some(ptb.at_ms),
+                                Some(entry_side),
+                                Some((entry_side, filled)),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
             if let (Some(ref order_id), Some(ws_user)) = (
                 state.pending_gtc_order_id.as_ref(),
                 state.ws_user.as_ref().map(|a| a.as_ref()),
@@ -4085,9 +4198,13 @@ pub async fn run() -> Result<()> {
         let no_open_position = state.pending_auto_sell.is_none() && state.pending_stop_loss.is_none();
         let can_buy = no_open_position
             && state.pending_gtc_order_id.is_none()
+            && state.pending_timeout_buy.is_none()
             && (state.trades_this_interval == 0 && !state.ordered_this_interval
                 || (state.trades_this_interval == 1 && state.re_entry_allowed_after_sl));
         if can_buy {
+            if state.pending_timeout_buy.is_some() {
+                continue;
+            }
             let in_window = state.config.no_window_all_intervals
                 || secs_to_close <= state.config.seconds_before_close as u64;
             let in_blocked_zone = state.config.block_buy_last_seconds > 0
@@ -4315,17 +4432,16 @@ pub async fn run() -> Result<()> {
                             Ok(r) => r,
                             Err(e) => {
                                 warn!(
-                                    "[IntervalSniper] BUY network error ({e}) — waiting {}s for WS fill",
-                                    BUY_TIMEOUT_WAIT_SECS
+                                    "[IntervalSniper] BUY network error ({e}) — order may have filled, waiting for WS MATCHED"
                                 );
-                                tokio::time::sleep(Duration::from_secs(BUY_TIMEOUT_WAIT_SECS)).await;
-                                if let Some(ref ws) = state.ws_user {
-                                    if let Some(confirmed_after) = ws.get_confirmed_buy_for_token(token_id).await {
-                                        if confirmed_after > ws_confirmed_before {
-                                            continue;
-                                        }
-                                    }
-                                }
+                                state.pending_timeout_buy = Some(PendingTimeoutBuy {
+                                    token_id: token_id.to_string(),
+                                    side,
+                                    price: effective_price.clone(),
+                                    size: size.clone(),
+                                    at_ms: now_ms_u,
+                                    confirmed_before: ws_confirmed_before,
+                                });
                                 continue;
                             }
                         };
