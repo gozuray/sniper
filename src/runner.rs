@@ -172,6 +172,9 @@ struct RunnerState {
     sl_limit_last_rest_check_ms: Option<u64>,
     /// Consecutive SL FOK no-fill count; used for exponential backoff delay.
     sl_fok_fail_count: u32,
+    /// True after the first SL FOK entry did cancel-TP + balance-wait for this position.
+    /// Prevents re-running the blocking balance-wait loop on every FOK retry.
+    sl_fok_cancel_done: bool,
     /// Persistent receiver for SELL MATCHED events; ensures we never miss a fill when REST returns before WS.
     sl_sell_fills_rx: Option<tokio::sync::broadcast::Receiver<(String, Decimal)>>,
     interval_switch_wall_time_ms: Option<u64>,
@@ -963,6 +966,7 @@ pub async fn run() -> Result<()> {
         sl_last_order_filled: Decimal::ZERO,
         sl_limit_last_rest_check_ms: None,
         sl_fok_fail_count: 0,
+        sl_fok_cancel_done: false,
         sl_sell_fills_rx: None,
         interval_switch_wall_time_ms: None,
         session_log: None,
@@ -2282,6 +2286,8 @@ pub async fn run() -> Result<()> {
                     state.sl_cumulative_filled = Decimal::ZERO;
                     state.sl_last_order_filled = Decimal::ZERO;
                     state.sl_limit_last_rest_check_ms = None;
+                    state.sl_fok_fail_count = 0;
+                    state.sl_fok_cancel_done = false;
                     state.allowance_cache = None;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
                     state.interval_min_bid_up = None;
@@ -2585,6 +2591,7 @@ pub async fn run() -> Result<()> {
                                 }
                                 info!("[IntervalSniper] ✓ SL FOK fill detected via WS — position closed (re-entry allowed), stopping FOK retries");
                                 state.sl_fok_fail_count = 0;
+                                state.sl_fok_cancel_done = false;
                                 state.stop_loss_placed = true;
                                 state.auto_sell_placed = true;
                                 state.re_entry_allowed_after_sl = true;
@@ -2614,7 +2621,7 @@ pub async fn run() -> Result<()> {
                                 }
                             } else {
                             // FOK path: place FOK at best_bid, race REST response vs WS fill; first wins closes position.
-                            if state.sl_cumulative_filled.is_zero() {
+                            if state.sl_cumulative_filled.is_zero() && !state.sl_fok_cancel_done {
                                 let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
                                 match cancel_result {
                                     Err(e) => warn!("[IntervalSniper] cancel orders before SL FOK failed: {} (continuing)", e),
@@ -2640,6 +2647,7 @@ pub async fn run() -> Result<()> {
                                 }
                                 state.allowance_cache = None;
                                 state.sl_fok_fail_count = 0;
+                                state.sl_fok_cancel_done = true;
                                 info!(
                                     "[IntervalSniper] SL FOK TRIGGERED: bid {} in SL zone (trigger {}) — placing FOK at best_bid (retry next tick if no fill)",
                                     fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
@@ -2790,6 +2798,7 @@ pub async fn run() -> Result<()> {
                                                 }
                                                 info!("[IntervalSniper] ✓ SL FOK filled @ {} — position closed (re-entry allowed)", fmt_price(Some(&exit_price_fok)));
                                                 state.sl_fok_fail_count = 0;
+                                                state.sl_fok_cancel_done = false;
                                                 state.stop_loss_placed = true;
                                                 state.auto_sell_placed = true;
                                                 state.re_entry_allowed_after_sl = true;
