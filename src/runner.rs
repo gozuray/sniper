@@ -349,6 +349,15 @@ fn is_position_closed_error(msg: Option<&str>) -> bool {
     })
 }
 
+/// True if the API error is "no orders found to match with FAK order" (or FOK).
+/// In that case we do not set ordered_this_interval so the next tick can retry the buy.
+fn is_fak_no_match_error(msg: Option<&str>) -> bool {
+    msg.map_or(false, |m| {
+        let lower = m.to_lowercase();
+        lower.contains("no orders found to match") && (lower.contains("fak") || lower.contains("fok"))
+    })
+}
+
 /// True if the API error is "invalid amounts, maker and taker amount must be higher than 0",
 /// or "size lower than the minimum". Balance is slow to update; treat as position closed to stop retry spam.
 fn is_invalid_amounts_error(msg: Option<&str>) -> bool {
@@ -4487,7 +4496,13 @@ pub async fn run() -> Result<()> {
                         }
                         // Mark that we attempted a buy this interval (prevents second buy if first
                         // returned success=false but filled on exchange; re-entry only after SL).
-                        state.ordered_this_interval = true;
+                        // Do NOT set on FAK/FOK "no orders found to match" so we retry next tick when book moves.
+                        let is_fak_no_match = !result.success
+                            && (order_type == OrderType::Fak || order_type == OrderType::Fok)
+                            && is_fak_no_match_error(result.error_msg.as_deref());
+                        if !is_fak_no_match {
+                            state.ordered_this_interval = true;
+                        }
                         if result.success {
                             let is_gtc_resting = order_type == OrderType::Gtc
                                 && result.filled_size.as_ref().map_or(true, |s| *s < size.clone() * dec!(0.01))
@@ -4632,6 +4647,11 @@ pub async fn run() -> Result<()> {
                             }
                         } else if let Some(msg) = result.error_msg {
                             warn!("[IntervalSniper]  FAIL  BUY   {}", msg);
+                            if is_fak_no_match {
+                                info!(
+                                    "[IntervalSniper] FAK/FOK no match — will retry buy next tick when price still in range"
+                                );
+                            }
                         }
                     }
                 }
