@@ -367,18 +367,19 @@ impl ClobWsUser {
 
                 // Only update size_matched on MATCHED — the same fill is reported again as MINED and CONFIRMED;
                 // counting all three would triple-count and break TP/SL placement (size would exceed actual position).
-                let order_id = value.get("taker_order_id")
-                    .or_else(|| value.get("maker_order_id"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                // BUG FIX: Update BOTH maker and taker order. When we place a SELL (SL/TP), we are the maker;
+                // the trade event preferred taker_order_id only, so we were only updating the buyer's order and never
+                // our SELL order → sl_cumulative_filled stayed 0 → bot kept trying to sell full size → "not enough balance".
+                let maker_oid = value.get("maker_order_id").and_then(|v| v.as_str()).map(String::from);
+                let taker_oid = value.get("taker_order_id").and_then(|v| v.as_str()).map(String::from);
+                // Infer maker side: trade "side" is taker's side, so maker is the opposite (BUY trade → maker SELL).
+                let maker_side = if side == "BUY" { "SELL" } else { "BUY" };
 
                 if status == "MATCHED" {
-                    if let Some(oid) = order_id {
+                    let mut map = state.write().await;
+                    let apply_fill = |map: &mut HashMap<String, UserOrderState>, oid: String, order_side: &str| {
                         let key = normalize_order_id(&oid);
-                        let mut map = state.write().await;
                         if let Some(existing) = map.get_mut(&key) {
-                            // Accumulate: each MATCHED event is one partial fill (e.g. 10 then 2 → total 12).
-                            // Cap by original_size when known so we never exceed order size.
                             let new_matched = existing.size_matched + trade_size;
                             existing.size_matched = if existing.original_size > Decimal::ZERO {
                                 new_matched.min(existing.original_size)
@@ -392,21 +393,36 @@ impl ClobWsUser {
                                 existing.size_matched
                             );
                         } else {
-                            // New order known only from this trade; don't set original_size so we don't cap future partials until we get an ORDER event.
                             tracing::trace!(
-                                "[ClobWsUser] trade applied (new entry): order_id={} size={}",
+                                "[ClobWsUser] trade applied (new entry): order_id={} size={} side={}",
                                 key,
-                                trade_size
+                                trade_size,
+                                order_side
                             );
                             map.insert(key.clone(), UserOrderState {
                                 order_id: key,
-                                asset_id,
-                                side,
+                                asset_id: asset_id.clone(),
+                                side: order_side.to_string(),
                                 original_size: Decimal::ZERO,
                                 size_matched: trade_size,
                                 order_type: "TRADE".to_string(),
                             });
                         }
+                    };
+                    match (maker_oid, taker_oid) {
+                        (Some(m), Some(t)) => {
+                            let mk = normalize_order_id(&m);
+                            let tk = normalize_order_id(&t);
+                            if mk == tk {
+                                apply_fill(&mut map, m, &maker_side);
+                            } else {
+                                apply_fill(&mut map, m, &maker_side);
+                                apply_fill(&mut map, t, &side);
+                            }
+                        }
+                        (Some(m), None) => apply_fill(&mut map, m, &maker_side),
+                        (None, Some(t)) => apply_fill(&mut map, t, &side),
+                        (None, None) => {}
                     }
                 }
             }
