@@ -2527,6 +2527,83 @@ pub async fn run() -> Result<()> {
                     } else if best_bid > Decimal::ZERO && best_bid <= sl.trigger_price + SL_TRIGGER_MARGIN {
                         // In SL zone (bid <= trigger + margin).
                         if state.config.stop_loss_time_in_force == SellOrderTimeInForce::Fok {
+                            // Drain WS sell fills that may have arrived after a previous FOK attempt (e.g. REST returned error but order filled on exchange).
+                            // This stops us from retrying FOK when the SL already matched.
+                            let effective_sl_size_drain = state.pending_stop_loss.as_ref().map(|p| p.size.clone()).unwrap_or_else(|| sl.size.clone());
+                            if let Some(ws_user) = ws_user_ref {
+                                let mut rx = ws_user.subscribe_sell_fills();
+                                loop {
+                                    match rx.try_recv() {
+                                        Ok((asset_id, size)) if asset_id == sl.token_id => {
+                                            state.sl_cumulative_filled += size;
+                                            if state.sl_cumulative_filled > effective_sl_size_drain {
+                                                state.sl_cumulative_filled = effective_sl_size_drain.clone();
+                                            }
+                                        }
+                                        Ok(_) => {} // SELL fill for another token; ignore
+                                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                                    }
+                                }
+                            }
+                            if state.sl_cumulative_filled >= effective_sl_size_drain.clone() * dec!(0.99) {
+                                // Position closed by a previous FOK fill (detected via WS); stop retrying FOK.
+                                let total_filled = state.sl_cumulative_filled.clone();
+                                let exit_price_fok = sl.trigger_price.clone();
+                                if let Some(ref buy) = state.last_buy_order {
+                                    let pnl = (exit_price_fok.clone() - buy.price) * total_filled.clone();
+                                    let roi_pct = ((exit_price_fok / buy.price) - Decimal::ONE) * dec!(100);
+                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                    info!(
+                                        "[CLOSED] SL FOK  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (fill detected via WS, stop retrying)",
+                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&exit_price_fok),
+                                        fmt_decimal_2(&total_filled), pnl, roi_pct, held_sec
+                                    );
+                                }
+                                if let Some(ref mut log) = state.session_log {
+                                    if let Some(ref buy) = state.last_buy_order {
+                                        let _ = log.log_position_close(
+                                            &market.slug, market.interval_start_unix, market.close_time_unix,
+                                            buy.side, buy.price, exit_price_fok.clone(), buy.timestamp_ms, now_ms_u,
+                                            ExitType::StopLoss, total_filled.clone(), None,
+                                            buy.order_id.as_deref(), None,
+                                            state.interval_min_bid_up, state.interval_max_bid_up,
+                                            state.interval_min_bid_down, state.interval_max_bid_down,
+                                            None, None, None, false,
+                                        );
+                                    }
+                                }
+                                info!("[IntervalSniper] ✓ SL FOK fill detected via WS — position closed (re-entry allowed), stopping FOK retries");
+                                state.sl_fok_fail_count = 0;
+                                state.stop_loss_placed = true;
+                                state.auto_sell_placed = true;
+                                state.re_entry_allowed_after_sl = true;
+                                state.tp_limit_order_id = None;
+                                state.tp_placed_size = None;
+                                state.tp_cumulative_filled = Decimal::ZERO;
+                                state.tp_last_order_filled = Decimal::ZERO;
+                                state.tp_limit_balance_retries = 0;
+                                state.sl_limit_order_id = None;
+                                state.sl_limit_order_price = None;
+                                state.sl_cumulative_filled = Decimal::ZERO;
+                                state.sl_last_order_filled = Decimal::ZERO;
+                                state.sl_limit_last_rest_check_ms = None;
+                                state.pending_auto_sell = None;
+                                state.pending_stop_loss = None;
+                                state.allowance_cache = None;
+                                state.last_buy_order = None;
+                                clear_pending_gtc(&mut state);
+                                state.balance_reflected_at_ms = None;
+                                state.balance_delay_clob_logged = false;
+                                state.last_logged_balance_up = None;
+                                state.last_logged_balance_down = None;
+                                state.total_shares_this_interval = Decimal::ZERO;
+                                if let Some(ws) = ws_user_ref {
+                                    ws.clear_token_state(&sl.token_id).await;
+                                }
+                            } else {
                             // FOK path: place FOK at best_bid, race REST response vs WS fill; first wins closes position.
                             if state.sl_cumulative_filled.is_zero() {
                                 let cancel_result = clob.cancel_orders_for_token(&sl.token_id).await;
@@ -2755,6 +2832,7 @@ pub async fn run() -> Result<()> {
                                         }
                                     }
                                 }
+                            }
                             }
                         } else {
                         // GTC path: try to place SL limit every tick while we have position and no resting SL order.
