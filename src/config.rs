@@ -111,6 +111,15 @@ pub fn load_config() -> Result<Config> {
         _ => SellOrderTimeInForce::Gtc,
     };
 
+    let stop_loss_tif = match env("MM_STOP_LOSS_TIME_IN_FORCE", "FOK")
+        .to_uppercase()
+        .as_str()
+    {
+        "FOK" => SellOrderTimeInForce::Fok,
+        "FAK" => SellOrderTimeInForce::Fak,
+        _ => SellOrderTimeInForce::Gtc,
+    };
+
     let loop_ms = env_u64("MM_LOOP_MS", 100).clamp(1, 500);
     let cooldown_ms = env_u64("MM_COOLDOWN_MS", 2000).min(60000);
     // Take profit / stop loss: fixed prices (0..=1). Sell when best_bid >= take_profit_price (TP) or best_bid <= stop_loss_price (SL).
@@ -146,6 +155,7 @@ pub fn load_config() -> Result<Config> {
         stop_loss_price,
         stop_loss_quantity_percent: env_u32("MM_STOP_LOSS_QUANTITY_PERCENT", 100).clamp(1, 100)
             as u8,
+        stop_loss_time_in_force: stop_loss_tif,
         loop_ms,
         cooldown_between_orders_ms: cooldown_ms,
         no_window_all_intervals: env_bool("MM_NO_WINDOW_ALL_INTERVALS", true),

@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -65,6 +66,8 @@ pub struct ClobWsUser {
     confirmed_buy: Arc<RwLock<HashMap<String, Decimal>>>,
     /// Token IDs for the current market; [Blockchain] trade log is emitted only when asset_id is in this set (empty = log all).
     active_token_ids: Arc<RwLock<HashSet<String>>>,
+    /// Broadcast (asset_id, size) on every MATCHED trade so runner can race REST vs WS for FOK SL.
+    sell_fill_tx: broadcast::Sender<(String, Decimal)>,
     _join: tokio::task::JoinHandle<()>,
 }
 
@@ -92,6 +95,8 @@ impl ClobWsUser {
         let confirmed_buy: Arc<RwLock<HashMap<String, Decimal>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let active_token_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let (sell_fill_tx, _) = broadcast::channel(32);
+        let sell_fill_tx_recv = sell_fill_tx.clone();
         let state_recv = Arc::clone(&state);
         let confirmed_buy_recv = Arc::clone(&confirmed_buy);
         let active_token_ids_recv = Arc::clone(&active_token_ids);
@@ -177,7 +182,7 @@ impl ClobWsUser {
                                     last_msg_at = std::time::Instant::now();
                                     match msg {
                                         Message::Text(text) => {
-                                            if let Err(e) = Self::apply_message(&state_recv, &confirmed_buy_recv, &active_token_ids_recv, &text).await {
+                                            if let Err(e) = Self::apply_message(&state_recv, &confirmed_buy_recv, &active_token_ids_recv, Some(&sell_fill_tx_recv), &text).await {
                                                 let event_type = serde_json::from_str::<serde_json::Value>(&text)
                                                     .ok()
                                                     .and_then(|v| v.get("event_type").and_then(|e| e.as_str()).map(String::from))
@@ -224,7 +229,7 @@ impl ClobWsUser {
             }
         });
 
-        Ok(Self { state, confirmed_buy, active_token_ids, _join: join })
+        Ok(Self { state, confirmed_buy, active_token_ids, sell_fill_tx, _join: join })
     }
 
     /// Build WebSocket user URL from REST host (same pattern as market WS).
@@ -246,6 +251,7 @@ impl ClobWsUser {
         state: &RwLock<HashMap<String, UserOrderState>>,
         confirmed_buy: &RwLock<HashMap<String, Decimal>>,
         active_token_ids: &RwLock<HashSet<String>>,
+        sell_fill_tx: Option<&broadcast::Sender<(String, Decimal)>>,
         text: &str,
     ) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(text).context("parse JSON")?;
@@ -424,11 +430,20 @@ impl ClobWsUser {
                         (None, Some(t)) => apply_fill(&mut map, t, &side),
                         (None, None) => {}
                     }
+                    // Broadcast (asset_id, size) for FOK SL: runner races REST vs this to close position.
+                    if let Some(tx) = sell_fill_tx {
+                        let _ = tx.send((asset_id.clone(), trade_size));
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Subscribe to MATCHED trade (asset_id, size) events. Used to race WS vs REST when placing SL FOK.
+    pub fn subscribe_sell_fills(&self) -> broadcast::Receiver<(String, Decimal)> {
+        self.sell_fill_tx.subscribe()
     }
 
     /// Cumulative BUY fills (MATCHED) per asset_id. Used after timeout to detect if our order filled via WS.
