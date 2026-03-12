@@ -2597,7 +2597,15 @@ pub async fn run() -> Result<()> {
                                         let side_recheck = if is_up { &top_recheck.token_id_up } else { &top_recheck.token_id_down };
                                         let recheck_bid = side_recheck.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                                         if recheck_bid >= TICK_SIZE {
-                                            let price = round_to_tick(recheck_bid);
+                                            // When best_bid is at SL target, place FOK 1 tick below to cross spread (more aggressive).
+                                            let price = if recheck_bid >= sl.trigger_price - TICK_SIZE
+                                                && recheck_bid <= sl.trigger_price + TICK_SIZE
+                                                && recheck_bid > TICK_SIZE
+                                            {
+                                                round_to_tick((recheck_bid - TICK_SIZE).max(TICK_SIZE))
+                                            } else {
+                                                round_to_tick(recheck_bid)
+                                            };
                                             let clob_ref = clob.clone();
                                             let token_id = sl.token_id.clone();
                                             let mut rest_handle = tokio::spawn(async move {
