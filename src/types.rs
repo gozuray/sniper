@@ -104,6 +104,9 @@ pub struct Config {
     pub telegram_chat_id: Option<String>,
     /// Telegram message format: 1–20 = same message body, title "Sniper N" (default 1).
     pub telegram_msg_format: u8,
+    /// When true, after cancel returns "already matched" for TP, verify with REST balance before declaring position closed.
+    /// If balance for the token is still above threshold, treat as false positive and re-place TP next tick (adds ~50–150ms latency).
+    pub verify_tp_fill_via_balance: bool,
 }
 
 /// Resolved market from Gamma API.

@@ -186,5 +186,6 @@ pub fn load_config() -> Result<Config> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         telegram_msg_format: env_u32("TELEGRAM_MSG_FORMAT", 1).max(1).min(20) as u8,
+        verify_tp_fill_via_balance: env_bool("MM_VERIFY_TP_FILL_VIA_BALANCE", false),
     })
 }

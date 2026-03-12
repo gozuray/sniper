@@ -3706,72 +3706,91 @@ pub async fn run() -> Result<()> {
                                     if let Some(reason) = res.not_canceled.get(oid.as_str()) {
                                         let r = reason.to_lowercase();
                                         if r.contains("matched") || r.contains("already canceled") {
-                                            tp_filled_this_iteration = true;
-                                            if let Some(ref buy) = state.last_buy_order {
-                                                let pnl = (target - buy.price) * tp.size.clone();
-                                                let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
-                                                let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
-                                                info!(
-                                                    "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (fill detected via cancel)",
-                                                    match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
-                                                    fmt_decimal_2(&buy.price), fmt_decimal_2(&target),
-                                                    fmt_decimal_2(&tp.size), pnl, roi_pct, held_sec
-                                                );
-                                            }
-                                            info!(
-                                                "[IntervalSniper] ✓ TP limit filled @ {} — position closed (cancel returned already matched)",
-                                                fmt_price(Some(&target))
-                                            );
-                                            if let Some(ref mut log) = state.session_log {
+                                            // Optional: verify with REST balance before declaring closed (avoids false positive if order was just canceled, not filled).
+                                            // Off by default (MM_VERIFY_TP_FILL_VIA_BALANCE=false) to keep HFT path latency minimal.
+                                            let confirm_fill = if state.config.verify_tp_fill_via_balance {
+                                                state.allowance_cache = None;
+                                                let bal = clob.get_available_balance(&tp.token_id).await.ok().flatten().unwrap_or(Decimal::ZERO);
+                                                if bal > dec!(0.01) {
+                                                    warn!(
+                                                        "[IntervalSniper] TP fill verification: balance still {} for token (expected 0 after fill) — not closing, will re-place TP next tick",
+                                                        fmt_decimal_2(&bal)
+                                                    );
+                                                    false
+                                                } else {
+                                                    true
+                                                }
+                                            } else {
+                                                true
+                                            };
+                                            if confirm_fill {
+                                                tp_filled_this_iteration = true;
                                                 if let Some(ref buy) = state.last_buy_order {
-                                                    let _ = log.log_position_close(
-                                                        &market.slug,
-                                                        market.interval_start_unix,
-                                                        market.close_time_unix,
-                                                        buy.side,
-                                                        buy.price,
-                                                        target,
-                                                        buy.timestamp_ms,
-                                                        now_ms_u,
-                                                        ExitType::TakeProfit,
-                                                        tp.size.clone(),
-                                                        Some(tp.size.clone()),
-                                                        buy.order_id.as_deref(),
-                                                        Some(oid.as_str()),
-                                                        state.interval_min_bid_up,
-                                                        state.interval_max_bid_up,
-                                                        state.interval_min_bid_down,
-                                                        state.interval_max_bid_down,
-                                                        None,
-                                                        None,
-                                                        None,
-                                                        false,
+                                                    let pnl = (target - buy.price) * tp.size.clone();
+                                                    let roi_pct = ((target / buy.price) - Decimal::ONE) * dec!(100);
+                                                    let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                    info!(
+                                                        "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (fill detected via cancel)",
+                                                        match buy.side { EntrySide::Up => "Up", EntrySide::Down => "Down" },
+                                                        fmt_decimal_2(&buy.price), fmt_decimal_2(&target),
+                                                        fmt_decimal_2(&tp.size), pnl, roi_pct, held_sec
                                                     );
                                                 }
+                                                info!(
+                                                    "[IntervalSniper] ✓ TP limit filled @ {} — position closed (cancel returned already matched)",
+                                                    fmt_price(Some(&target))
+                                                );
+                                                if let Some(ref mut log) = state.session_log {
+                                                    if let Some(ref buy) = state.last_buy_order {
+                                                        let _ = log.log_position_close(
+                                                            &market.slug,
+                                                            market.interval_start_unix,
+                                                            market.close_time_unix,
+                                                            buy.side,
+                                                            buy.price,
+                                                            target,
+                                                            buy.timestamp_ms,
+                                                            now_ms_u,
+                                                            ExitType::TakeProfit,
+                                                            tp.size.clone(),
+                                                            Some(tp.size.clone()),
+                                                            buy.order_id.as_deref(),
+                                                            Some(oid.as_str()),
+                                                            state.interval_min_bid_up,
+                                                            state.interval_max_bid_up,
+                                                            state.interval_min_bid_down,
+                                                            state.interval_max_bid_down,
+                                                            None,
+                                                            None,
+                                                            None,
+                                                            false,
+                                                        );
+                                                    }
+                                                }
+                                                state.auto_sell_placed = true;
+                                                state.stop_loss_placed = true;
+                                                state.re_entry_allowed_after_sl = false;
+                                                state.tp_limit_order_id = None;
+                                                state.tp_placed_size = None;
+                                                state.tp_cumulative_filled = Decimal::ZERO;
+                                                state.tp_last_order_filled = Decimal::ZERO;
+                                                state.tp_limit_balance_retries = 0;
+                                                state.sl_limit_order_id = None;
+                                                state.sl_limit_order_price = None;
+                                                state.sl_cumulative_filled = Decimal::ZERO;
+                                                state.sl_last_order_filled = Decimal::ZERO;
+                                                state.sl_limit_last_rest_check_ms = None;
+                                                state.pending_auto_sell = None;
+                                                state.pending_stop_loss = None;
+                                                state.allowance_cache = None;
+                                                state.last_buy_order = None;
+                                                clear_pending_gtc(&mut state);
+                                                state.balance_reflected_at_ms = None;
+                                                state.balance_delay_clob_logged = false;
+                                                state.last_logged_balance_up = None;
+                                                state.last_logged_balance_down = None;
+                                                state.total_shares_this_interval = Decimal::ZERO;
                                             }
-                                            state.auto_sell_placed = true;
-                                            state.stop_loss_placed = true;
-                                            state.re_entry_allowed_after_sl = false;
-                                            state.tp_limit_order_id = None;
-                                            state.tp_placed_size = None;
-                                            state.tp_cumulative_filled = Decimal::ZERO;
-                                            state.tp_last_order_filled = Decimal::ZERO;
-                                            state.tp_limit_balance_retries = 0;
-                                            state.sl_limit_order_id = None;
-                                            state.sl_limit_order_price = None;
-                                            state.sl_cumulative_filled = Decimal::ZERO;
-                                            state.sl_last_order_filled = Decimal::ZERO;
-                                            state.sl_limit_last_rest_check_ms = None;
-                                            state.pending_auto_sell = None;
-                                            state.pending_stop_loss = None;
-                                            state.allowance_cache = None;
-                                            state.last_buy_order = None;
-                                            clear_pending_gtc(&mut state);
-                                            state.balance_reflected_at_ms = None;
-                                            state.balance_delay_clob_logged = false;
-                                            state.last_logged_balance_up = None;
-                                            state.last_logged_balance_down = None;
-                                            state.total_shares_this_interval = Decimal::ZERO;
                                         }
                                     }
                                 }
