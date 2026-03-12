@@ -11,7 +11,7 @@ logs/
 
 # IDE
 .vscode/
-
+TP_HFT_analysis.md
 # OS
 .DS_Store
 Thumbs.db
