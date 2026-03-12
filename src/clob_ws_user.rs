@@ -365,45 +365,48 @@ impl ClobWsUser {
                     );
                 }
 
-                // Try taker_order_id first (our FAK/FOK orders), then maker_order_id (our GTC orders).
+                // Only update size_matched on MATCHED — the same fill is reported again as MINED and CONFIRMED;
+                // counting all three would triple-count and break TP/SL placement (size would exceed actual position).
                 let order_id = value.get("taker_order_id")
                     .or_else(|| value.get("maker_order_id"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
-                if let Some(oid) = order_id {
-                    let key = normalize_order_id(&oid);
-                    let mut map = state.write().await;
-                    if let Some(existing) = map.get_mut(&key) {
-                        // Accumulate: each trade event is one partial fill; Polymarket sends one event per fill (e.g. 10 then 2 → total 12).
-                        // Cap by original_size when known so we never exceed order size and duplicate events don't double-count.
-                        let new_matched = existing.size_matched + trade_size;
-                        existing.size_matched = if existing.original_size > Decimal::ZERO {
-                            new_matched.min(existing.original_size)
+                if status == "MATCHED" {
+                    if let Some(oid) = order_id {
+                        let key = normalize_order_id(&oid);
+                        let mut map = state.write().await;
+                        if let Some(existing) = map.get_mut(&key) {
+                            // Accumulate: each MATCHED event is one partial fill (e.g. 10 then 2 → total 12).
+                            // Cap by original_size when known so we never exceed order size.
+                            let new_matched = existing.size_matched + trade_size;
+                            existing.size_matched = if existing.original_size > Decimal::ZERO {
+                                new_matched.min(existing.original_size)
+                            } else {
+                                new_matched
+                            };
+                            tracing::trace!(
+                                "[ClobWsUser] trade applied: order_id={} +{} → size_matched={}",
+                                key,
+                                trade_size,
+                                existing.size_matched
+                            );
                         } else {
-                            new_matched
-                        };
-                        tracing::trace!(
-                            "[ClobWsUser] trade applied: order_id={} +{} → size_matched={}",
-                            key,
-                            trade_size,
-                            existing.size_matched
-                        );
-                    } else {
-                        // New order known only from this trade; don't set original_size so we don't cap future partials until we get an ORDER event.
-                        tracing::trace!(
-                            "[ClobWsUser] trade applied (new entry): order_id={} size={}",
-                            key,
-                            trade_size
-                        );
-                        map.insert(key.clone(), UserOrderState {
-                            order_id: key,
-                            asset_id,
-                            side,
-                            original_size: Decimal::ZERO,
-                            size_matched: trade_size,
-                            order_type: "TRADE".to_string(),
-                        });
+                            // New order known only from this trade; don't set original_size so we don't cap future partials until we get an ORDER event.
+                            tracing::trace!(
+                                "[ClobWsUser] trade applied (new entry): order_id={} size={}",
+                                key,
+                                trade_size
+                            );
+                            map.insert(key.clone(), UserOrderState {
+                                order_id: key,
+                                asset_id,
+                                side,
+                                original_size: Decimal::ZERO,
+                                size_matched: trade_size,
+                                order_type: "TRADE".to_string(),
+                            });
+                        }
                     }
                 }
             }
