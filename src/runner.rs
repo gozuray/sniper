@@ -3781,6 +3781,21 @@ pub async fn run() -> Result<()> {
                                         );
                                     }
                                 }
+                            } else if !tp_filled_this_iteration && best_bid >= target + TICK_SIZE {
+                                // Polymarket bug: resting TP ask was not matched even though best_bid
+                                // already crossed target by 1+ tick. Cancel the stuck order and let the
+                                // placement block below re-place it at the same target price this tick.
+                                warn!(
+                                    "[IntervalSniper] TP stale (Polymarket bug): bid {} >= TP+1tick ({}) — cancel & re-place @ {}",
+                                    fmt_price(Some(&best_bid)),
+                                    fmt_decimal_2(&(target + TICK_SIZE)),
+                                    fmt_price(Some(&target))
+                                );
+                                let _ = clob.cancel_orders_for_token(&tp.token_id).await;
+                                state.tp_limit_order_id = None;
+                                state.tp_placed_size = None;
+                                state.tp_last_order_filled = Decimal::ZERO;
+                                state.tp_limit_balance_retries = 0;
                             }
                         }
 
