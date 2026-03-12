@@ -2790,8 +2790,9 @@ pub async fn run() -> Result<()> {
                                 state.sl_fok_fail_count = 0;
                                 state.sl_fok_cancel_done = true;
                                 info!(
-                                    "[IntervalSniper] SL FOK TRIGGERED: bid {} in SL zone (trigger {}) — placing FOK at best_bid (retry next tick if no fill)",
-                                    fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
+                                    "[IntervalSniper] SL FOK TRIGGERED: bid {} in SL zone (trigger {}) — placing FOK at best_bid (retry every {}ms if no fill)",
+                                    fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price)),
+                                    state.config.sl_fok_retry_delay_ms
                                 );
                             }
                             state.allowance_cache = None;
@@ -2821,6 +2822,11 @@ pub async fn run() -> Result<()> {
                                         .map(|b| floor_to_decimals(expected_size.clone().min(b), SELL_SIZE_DECIMALS))
                                         .unwrap_or_else(|| expected_size.clone());
                                     if size_to_place >= MIN_SELL_SIZE && size_to_place >= DUST_THRESHOLD {
+                                        // Retry loop: on FOK failure, sleep MM_SL_FOK_RETRY_DELAY_MS then place again (same tick). If delay=0 we break and retry next tick.
+                                        loop {
+                                            if now_unix() >= market.close_time_unix {
+                                                break;
+                                            }
                                         let top_recheck = if let Some(ref ws) = state.ws_book {
                                             ws.get_top_of_book().await
                                         } else {
@@ -2831,7 +2837,9 @@ pub async fn run() -> Result<()> {
                                         };
                                         let side_recheck = if is_up { &top_recheck.token_id_up } else { &top_recheck.token_id_down };
                                         let recheck_bid = side_recheck.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
-                                        if recheck_bid >= TICK_SIZE {
+                                        if recheck_bid < TICK_SIZE {
+                                            break;
+                                        }
                                             // When best_bid is at/near SL target, place FOK with configured offset below to cross spread.
                                             // MM_SL_ORDER_PRICE_OFFSET controls the aggressiveness (default 0.01, max 0.10).
                                             let sl_offset = state.config.sl_order_price_offset;
@@ -2969,6 +2977,7 @@ pub async fn run() -> Result<()> {
                                                 if let Some(ws) = ws_user_ref {
                                                     ws.clear_token_state(&sl.token_id).await;
                                                 }
+                                                break; // exit retry loop
                                             } else {
                                                 state.sl_fok_fail_count = state.sl_fok_fail_count.saturating_add(1);
                                                 let delay_ms = if state.config.sl_fok_retry_delay_ms == 0 {
@@ -2980,18 +2989,20 @@ pub async fn run() -> Result<()> {
                                                 } else {
                                                     state.config.sl_fok_retry_delay_ms
                                                 };
-                                                if delay_ms > 0 && now_unix() < market.close_time_unix {
-                                                    trace!(
-                                                        "[IntervalSniper] SL FOK no fill this tick (retry #{}) — waiting {}ms before next attempt",
-                                                        state.sl_fok_fail_count,
-                                                        delay_ms
-                                                    );
-                                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                                } else {
+                                                if delay_ms == 0 || now_unix() >= market.close_time_unix {
                                                     trace!("[IntervalSniper] SL FOK no fill this tick — will retry at best_bid next tick");
+                                                    break;
                                                 }
+                                                trace!(
+                                                    "[IntervalSniper] SL FOK no fill (retry #{}) — waiting {}ms then re-placing FOK",
+                                                    state.sl_fok_fail_count,
+                                                    delay_ms
+                                                );
+                                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                                // continue loop: re-fetch book and place FOK again
                                             }
                                         }
+                                        } // end retry loop
                                     }
                                 }
                             }
