@@ -28,9 +28,6 @@ const TICK_SIZE: Decimal = dec!(0.01);
 const CLOB_DEFAULT_MIN_ORDER_SIZE: Decimal = dec!(5);
 /// Log order book and TP/SL status every this many loop ticks (e.g. 10 → ~1s if loop_ms=100).
 const LOG_BOOK_EVERY_TICKS: u64 = 10;
-/// Delay between SL FAK retries on no-match or transient errors (ms).
-#[allow(dead_code)]
-const SL_FOK_RETRY_DELAY_MS: u64 = 20;
 /// When SL limit is placed, recheck bid this often (ms) and cancel+replace if bid dropped — fast follow-down.
 const SL_FOLLOW_DOWN_MS: u64 = 50;
 /// Max follow-down retries so we don't block the main loop (e.g. 20 × 50ms = 1s of tight follow).
@@ -173,6 +170,8 @@ struct RunnerState {
     sl_last_order_filled: Decimal,
     /// Last wall time (ms) we did REST fallback check for SL order status; throttle to every 5s.
     sl_limit_last_rest_check_ms: Option<u64>,
+    /// Consecutive SL FOK no-fill count; used for exponential backoff delay.
+    sl_fok_fail_count: u32,
     interval_switch_wall_time_ms: Option<u64>,
     /// Session log (JSONL) when MM_SESSION_LOG=true.
     session_log: Option<SessionLog>,
@@ -961,6 +960,7 @@ pub async fn run() -> Result<()> {
         sl_cumulative_filled: Decimal::ZERO,
         sl_last_order_filled: Decimal::ZERO,
         sl_limit_last_rest_check_ms: None,
+        sl_fok_fail_count: 0,
         interval_switch_wall_time_ms: None,
         session_log: None,
         interval_min_bid_up: None,
@@ -2553,6 +2553,7 @@ pub async fn run() -> Result<()> {
                                     tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
                                 }
                                 state.allowance_cache = None;
+                                state.sl_fok_fail_count = 0;
                                 info!(
                                     "[IntervalSniper] SL FOK TRIGGERED: bid {} in SL zone (trigger {}) — placing FOK at best_bid (retry next tick if no fill)",
                                     fmt_price(Some(&best_bid)), fmt_price(Some(&sl.trigger_price))
@@ -2689,6 +2690,7 @@ pub async fn run() -> Result<()> {
                                                     }
                                                 }
                                                 info!("[IntervalSniper] ✓ SL FOK filled @ {} — position closed (re-entry allowed)", fmt_price(Some(&exit_price_fok)));
+                                                state.sl_fok_fail_count = 0;
                                                 state.stop_loss_placed = true;
                                                 state.auto_sell_placed = true;
                                                 state.re_entry_allowed_after_sl = true;
@@ -2716,7 +2718,26 @@ pub async fn run() -> Result<()> {
                                                     ws.clear_token_state(&sl.token_id).await;
                                                 }
                                             } else {
-                                                trace!("[IntervalSniper] SL FOK no fill this tick — will retry at best_bid next tick");
+                                                state.sl_fok_fail_count = state.sl_fok_fail_count.saturating_add(1);
+                                                let delay_ms = if state.config.sl_fok_retry_delay_ms == 0 {
+                                                    0u64
+                                                } else if state.config.sl_fok_retry_backoff {
+                                                    let exp = state.config.sl_fok_retry_delay_ms
+                                                        * 2u64.saturating_pow(state.sl_fok_fail_count.min(4) as u32);
+                                                    exp.min(5000)
+                                                } else {
+                                                    state.config.sl_fok_retry_delay_ms
+                                                };
+                                                if delay_ms > 0 && now_unix() < market.close_time_unix {
+                                                    trace!(
+                                                        "[IntervalSniper] SL FOK no fill this tick (retry #{}) — waiting {}ms before next attempt",
+                                                        state.sl_fok_fail_count,
+                                                        delay_ms
+                                                    );
+                                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                                } else {
+                                                    trace!("[IntervalSniper] SL FOK no fill this tick — will retry at best_bid next tick");
+                                                }
                                             }
                                         }
                                     }

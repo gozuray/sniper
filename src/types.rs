@@ -72,6 +72,10 @@ pub struct Config {
     pub stop_loss_quantity_percent: u8,
     /// Time-in-force for SL sell: FOK (fill-or-kill, retry at best_bid each tick) or GTC limit.
     pub stop_loss_time_in_force: SellOrderTimeInForce,
+    /// Delay (ms) after SL FOK no-fill before next retry. 0 = use only loop_ms. With backoff, delay = this * 2^min(fail_count, 4).
+    pub sl_fok_retry_delay_ms: u64,
+    /// If true, each consecutive SL FOK no-fill increases the delay (exponential backoff).
+    pub sl_fok_retry_backoff: bool,
     pub loop_ms: u64,
     #[allow(dead_code)]
     pub cooldown_between_orders_ms: u64,
