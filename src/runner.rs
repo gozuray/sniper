@@ -2531,7 +2531,19 @@ pub async fn run() -> Result<()> {
                             );
                         }
 
-                        let remaining = sl.size - state.sl_cumulative_filled.clone();
+                        // Sync SL size with actual balance so we sell full position (e.g. 6.07 not 6.00 when fill was larger than requested).
+                        state.allowance_cache = None;
+                        if let (Some(bal), Some(pending)) = (
+                            clob.get_available_balance(&sl.token_id).await.ok().flatten(),
+                            state.pending_stop_loss.as_mut(),
+                        ) {
+                            if bal > pending.size && bal >= state.sl_cumulative_filled {
+                                pending.size = bal;
+                            }
+                        }
+
+                        let effective_sl_size = state.pending_stop_loss.as_ref().map(|p| p.size.clone()).unwrap_or_else(|| sl.size.clone());
+                        let remaining = effective_sl_size - state.sl_cumulative_filled.clone();
 
                         // 1) If we have an SL limit order: check WS fill, or cancel+replace if bid dropped.
                         if let Some(ref oid) = state.sl_limit_order_id {
@@ -2546,7 +2558,7 @@ pub async fn run() -> Result<()> {
                                         state.sl_last_order_filled = filled_this_order;
                                         info!(
                                             "[IntervalSniper] SL fill via WS ({}): +{} (total {}/{}), order_id={}",
-                                            fill_event_type, fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
+                                            fill_event_type, fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&effective_sl_size), oid
                                         );
                                     }
                                 }
@@ -2572,7 +2584,7 @@ pub async fn run() -> Result<()> {
                                         state.sl_last_order_filled = size_matched;
                                         debug!(
                                             "[IntervalSniper] SL limit fill +{} (REST, total {}/{}), order_id={}",
-                                            fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&sl.size), oid
+                                            fmt_decimal_2(&delta), fmt_decimal_2(&state.sl_cumulative_filled), fmt_decimal_2(&effective_sl_size), oid
                                         );
                                     }
                                 }
@@ -2589,8 +2601,8 @@ pub async fn run() -> Result<()> {
                                 true,
                             ).await;
                             if sl_available.map_or(false, |a| a <= SL_BALANCE_DUST_CLOSE) {
-                                let implied_filled = sl.size - sl_available.unwrap_or(Decimal::ZERO);
-                                if implied_filled >= sl.size * dec!(0.99) {
+                                let implied_filled = effective_sl_size.clone() - sl_available.unwrap_or(Decimal::ZERO);
+                                if implied_filled >= effective_sl_size.clone() * dec!(0.99) {
                                     // Verify via REST that the order is actually MATCHED, not just locking allowance.
                                     let order_confirmed_filled = match clob.get_order(oid).await {
                                         Ok(info) => {
@@ -2600,7 +2612,7 @@ pub async fn run() -> Result<()> {
                                         Err(_) => false,
                                     };
                                     if order_confirmed_filled {
-                                        state.sl_cumulative_filled = sl.size;
+                                        state.sl_cumulative_filled = effective_sl_size.clone();
                                         info!(
                                             "[IntervalSniper] SL position closed (balance dust {}, REST confirmed MATCHED), allowing re-entry",
                                             fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
@@ -2621,7 +2633,7 @@ pub async fn run() -> Result<()> {
                                         Err(_) => false,
                                     };
                                     if order_confirmed_filled {
-                                        state.sl_cumulative_filled = sl.size;
+                                        state.sl_cumulative_filled = effective_sl_size.clone();
                                         info!(
                                             "[IntervalSniper] SL position closed (balance dust {}, had partial TP, REST confirmed), allowing re-entry",
                                             fmt_decimal_2(&sl_available.unwrap_or(Decimal::ZERO))
@@ -2631,10 +2643,10 @@ pub async fn run() -> Result<()> {
                             }
 
                             // Position closed when cumulative >= 99% of size.
-                            if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                            if state.sl_cumulative_filled >= effective_sl_size.clone() * dec!(0.99) {
                                 let exit_price = order_price;
                                 let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
-                                    sl.size.clone() - state.tp_cumulative_filled.clone()
+                                    effective_sl_size.clone() - state.tp_cumulative_filled.clone()
                                 } else {
                                     state.sl_cumulative_filled.clone()
                                 };
@@ -2716,14 +2728,15 @@ pub async fn run() -> Result<()> {
                                     })
                                     .unwrap_or(false);
                                 if sl_filled_via_cancel {
-                                    state.sl_cumulative_filled = sl.size.clone();
+                                    let filled_size = state.pending_stop_loss.as_ref().map(|p| p.size.clone()).unwrap_or_else(|| sl.size.clone());
+                                    state.sl_cumulative_filled = filled_size.clone();
                                     info!(
                                         "[IntervalSniper] SL position closed (order already matched on cancel), allowing re-entry"
                                     );
                                     // Run full cleanup immediately: next tick price may be above trigger so we'd never enter this block again.
                                     let exit_price = order_price;
                                     let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
-                                        sl.size.clone() - state.tp_cumulative_filled.clone()
+                                        filled_size - state.tp_cumulative_filled.clone()
                                     } else {
                                         state.sl_cumulative_filled.clone()
                                     };
@@ -2797,11 +2810,11 @@ pub async fn run() -> Result<()> {
                         // 2) Place GTC limit at best_bid when we have no resting SL order and remaining to sell.
                         // Require last_buy_order.is_some() so we skip placing after "already matched" cleanup in same tick.
                         if state.sl_limit_order_id.is_none() && state.last_buy_order.is_some() && remaining >= DUST_THRESHOLD {
-                            if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                            if state.sl_cumulative_filled >= effective_sl_size.clone() * dec!(0.99) {
                                 // Already closed above (WS detected 100%)
                             } else {
                                 // SL: retry every 200ms until place_sell_order succeeds or interval ends or price exits SL zone.
-                                    let expected_size = floor_to_decimals(remaining.clone().min(sl.size.clone()), SELL_SIZE_DECIMALS);
+                                    let expected_size = floor_to_decimals(remaining.clone().min(effective_sl_size.clone()), SELL_SIZE_DECIMALS);
                                     let params = BalanceAllowanceParams {
                                         asset_type: AssetType::Conditional,
                                         token_id: Some(sl.token_id.clone()),
@@ -2894,7 +2907,7 @@ pub async fn run() -> Result<()> {
                                                 Some(id) => id.clone(),
                                                 None => break,
                                             };
-                                            if state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                                            if state.sl_cumulative_filled >= effective_sl_size.clone() * dec!(0.99) {
                                                 break;
                                             }
                                             let order_price = state.sl_limit_order_price.unwrap_or(Decimal::ZERO);
@@ -2927,7 +2940,7 @@ pub async fn run() -> Result<()> {
                                                 .map(|r| r.to_lowercase().contains("matched"))
                                                 .unwrap_or(false);
                                             if sl_filled_via_cancel {
-                                                state.sl_cumulative_filled = sl.size.clone();
+                                                state.sl_cumulative_filled = effective_sl_size.clone();
                                                 state.sl_limit_order_id = None;
                                                 break;
                                             }
@@ -2935,7 +2948,7 @@ pub async fn run() -> Result<()> {
                                             state.sl_limit_order_price = None;
                                             state.sl_last_order_filled = Decimal::ZERO;
                                             state.allowance_cache = None;
-                                            let remaining_fd = sl.size.clone() - state.sl_cumulative_filled.clone();
+                                            let remaining_fd = effective_sl_size.clone() - state.sl_cumulative_filled.clone();
                                             if remaining_fd < DUST_THRESHOLD {
                                                 break;
                                             }
@@ -3001,10 +3014,10 @@ pub async fn run() -> Result<()> {
                         }
 
                         // When SL closed without a resting order (e.g. WS filled + dust, or place failed with "not enough balance"), run full cleanup.
-                        if state.sl_limit_order_id.is_none() && state.sl_cumulative_filled >= sl.size * dec!(0.99) {
+                        if state.sl_limit_order_id.is_none() && state.sl_cumulative_filled >= effective_sl_size.clone() * dec!(0.99) {
                             let exit_price = state.sl_limit_order_price.unwrap_or(best_bid);
                             let total_filled = if state.tp_cumulative_filled > Decimal::ZERO {
-                                sl.size.clone() - state.tp_cumulative_filled.clone()
+                                effective_sl_size.clone() - state.tp_cumulative_filled.clone()
                             } else {
                                 state.sl_cumulative_filled.clone()
                             };
@@ -3098,8 +3111,8 @@ pub async fn run() -> Result<()> {
                         let target = round_to_tick(tp.target_price);
                         let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
-                        // Reconcile FAK fill from WS: when MATCHED trade events arrive, pending_auto_sell/size may be larger than actual filled;
-                        // downsize so TP/SL placement does not fail with "not enough balance".
+                        // Reconcile FAK fill from WS: use actual filled size so TP/SL sell the full position.
+                        // Downsize when actual fill < planned; upsize when actual fill > planned (e.g. API said 6.00 but fill was 6.07).
                         if state.pending_auto_sell.is_some() && state.pending_stop_loss.is_some() {
                             if let (Some(buy), Some(ws_user)) = (
                                 state.last_buy_order.as_ref(),
@@ -3107,12 +3120,13 @@ pub async fn run() -> Result<()> {
                             ) {
                                 if let Some(ref oid) = buy.order_id {
                                     if let Some((filled, _)) = ws_user.get_order_filled_size_with_type(oid).await {
-                                        let cap = filled.min(buy.size.clone());
+                                        // Use actual filled as source of truth so we sell the full position (e.g. 6.07 not 6.00).
+                                        let cap = filled;
                                         let tp_size = state.pending_auto_sell.as_ref().unwrap().size.clone();
                                         let sl_size = state.pending_stop_loss.as_ref().unwrap().size.clone();
-                                        if cap < tp_size || cap < sl_size {
-                                            let new_tp = tp_size.min(cap);
-                                            let new_sl = sl_size.min(cap);
+                                        if cap != tp_size || cap != sl_size {
+                                            let new_tp = cap.clone();
+                                            let new_sl = cap.clone();
                                             state.pending_auto_sell.as_mut().unwrap().size = new_tp.clone();
                                             state.pending_stop_loss.as_mut().unwrap().size = new_sl.clone();
                                             info!(
