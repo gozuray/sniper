@@ -1287,19 +1287,29 @@ pub async fn run() -> Result<()> {
                         let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
                             .max(MIN_SELL_SIZE)
                             .min(base_sell_size);
+                        // On additional fill: keep original placed_at_ms so min_seconds_after_buy_before_auto_sell
+                        // is not reset — we already waited from the first buy; otherwise TP would never be placed
+                        // if the 2nd fill happens late in the interval (e.g. 4:30 + 30s = 5:00 = interval end).
+                        let (tp_placed_at_ms, sl_placed_at_ms) = if is_additional_fill {
+                            let tp_prev = state.pending_auto_sell.as_ref().map(|p| p.placed_at_ms).unwrap_or(now_ms_u);
+                            let sl_prev = state.pending_stop_loss.as_ref().map(|p| p.placed_at_ms).unwrap_or(now_ms_u);
+                            (tp_prev, sl_prev)
+                        } else {
+                            (now_ms_u, now_ms_u)
+                        };
                         if !tp_already_filled_ws {
                         state.pending_auto_sell = Some(PendingAutoSell {
                             token_id: token_id.clone(),
                             target_price,
                             size: tp_size,
-                            placed_at_ms: now_ms_u,
+                            placed_at_ms: tp_placed_at_ms,
                         });
                         state.pending_stop_loss = Some(PendingStopLoss {
                             token_id,
                             entry_price: entry_price.clone(),
                             size: sl_size,
                             trigger_price: round_to_tick(state.config.stop_loss_price),
-                            placed_at_ms: now_ms_u,
+                            placed_at_ms: sl_placed_at_ms,
                         });
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
@@ -1396,6 +1406,7 @@ pub async fn run() -> Result<()> {
                             }
                             let entry_side = state.pending_gtc_side.unwrap();
                             let entry_price = state.pending_gtc_price.as_ref().unwrap().clone();
+                            let prev_size_rest = state.last_buy_order.as_ref().map(|b| b.size.clone()).unwrap_or(Decimal::ZERO);
                             state.trades_this_interval += 1;
                             state.total_shares_this_interval += filled.clone();
                             state.last_buy_order = Some(LastBuyOrder {
@@ -1437,18 +1448,26 @@ pub async fn run() -> Result<()> {
                             let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE)
                                 .min(base_sell_size);
+                            let is_additional_fill_rest = prev_size_rest >= MIN_SELL_SIZE && filled > prev_size_rest;
+                            let (tp_placed_at_ms, sl_placed_at_ms) = if is_additional_fill_rest {
+                                let tp_prev = state.pending_auto_sell.as_ref().map(|p| p.placed_at_ms).unwrap_or(now_ms_u);
+                                let sl_prev = state.pending_stop_loss.as_ref().map(|p| p.placed_at_ms).unwrap_or(now_ms_u);
+                                (tp_prev, sl_prev)
+                            } else {
+                                (now_ms_u, now_ms_u)
+                            };
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.clone(),
                                 target_price,
                                 size: tp_size,
-                                placed_at_ms: now_ms_u,
+                                placed_at_ms: tp_placed_at_ms,
                             });
                             state.pending_stop_loss = Some(PendingStopLoss {
                                 token_id,
                                 entry_price: entry_price.clone(),
                                 size: sl_size,
                                 trigger_price: round_to_tick(state.config.stop_loss_price),
-                                placed_at_ms: now_ms_u,
+                                placed_at_ms: sl_placed_at_ms,
                             });
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
