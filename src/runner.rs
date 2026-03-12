@@ -2626,12 +2626,15 @@ pub async fn run() -> Result<()> {
                                                         result = &mut rest_handle => {
                                                             match result {
                                                                 Ok(Ok(r)) => {
+                                                                    // FOK: success=true (and no errorMsg) means order filled; API may omit makingAmount/takingAmount
                                                                     let filled_ok = r.success
-                                                                        && r.error_msg.as_ref().map(|s| s.is_empty()).unwrap_or(true)
-                                                                        && r.filled_size.map(|f| f >= remaining_99).unwrap_or(false);
-                                                                    if filled_ok {
+                                                                        && r.error_msg.as_ref().map(|s| s.is_empty()).unwrap_or(true);
+                                                                    let size_ok = r.filled_size
+                                                                        .map(|f| f >= remaining_99)
+                                                                        .unwrap_or(true);
+                                                                    if filled_ok && size_ok {
                                                                         sl_closed = true;
-                                                                        break r.filled_size;
+                                                                        break Some(r.filled_size.unwrap_or_else(|| expected_size.clone()));
                                                                     }
                                                                     break None;
                                                                 }
@@ -2661,9 +2664,11 @@ pub async fn run() -> Result<()> {
                                                 match rest_handle.await {
                                                     Ok(Ok(r)) => {
                                                         let filled_ok = r.success
-                                                            && r.error_msg.as_ref().map(|s| s.is_empty()).unwrap_or(true)
-                                                            && r.filled_size.map(|f| f >= remaining_99).unwrap_or(false);
-                                                        if filled_ok {
+                                                            && r.error_msg.as_ref().map(|s| s.is_empty()).unwrap_or(true);
+                                                        let size_ok = r.filled_size
+                                                            .map(|f| f >= remaining_99)
+                                                            .unwrap_or(true);
+                                                        if filled_ok && size_ok {
                                                             sl_closed = true;
                                                         }
                                                     }
