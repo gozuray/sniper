@@ -118,7 +118,7 @@ impl SessionLog {
             market_close_count: 0,
             total_pnl: Decimal::ZERO,
             telegram,
-            telegram_msg_format: telegram_msg_format.min(1).max(20),
+            telegram_msg_format: telegram_msg_format.max(1).min(20),
         }))
     }
 
