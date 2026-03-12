@@ -172,6 +172,8 @@ struct RunnerState {
     sl_limit_last_rest_check_ms: Option<u64>,
     /// Consecutive SL FOK no-fill count; used for exponential backoff delay.
     sl_fok_fail_count: u32,
+    /// Persistent receiver for SELL MATCHED events; ensures we never miss a fill when REST returns before WS.
+    sl_sell_fills_rx: Option<tokio::sync::broadcast::Receiver<(String, Decimal)>>,
     interval_switch_wall_time_ms: Option<u64>,
     /// Session log (JSONL) when MM_SESSION_LOG=true.
     session_log: Option<SessionLog>,
@@ -961,6 +963,7 @@ pub async fn run() -> Result<()> {
         sl_last_order_filled: Decimal::ZERO,
         sl_limit_last_rest_check_ms: None,
         sl_fok_fail_count: 0,
+        sl_sell_fills_rx: None,
         interval_switch_wall_time_ms: None,
         session_log: None,
         interval_min_bid_up: None,
@@ -2265,6 +2268,7 @@ pub async fn run() -> Result<()> {
                     state.pending_gtc_fill_deltas.clear();
                     state.pending_auto_sell = None;
                     state.pending_stop_loss = None;
+                    state.sl_sell_fills_rx = None;
                     state.auto_sell_placed = false;
                     state.stop_loss_placed = false;
                     state.tp_limit_order_id = None;
@@ -2528,10 +2532,14 @@ pub async fn run() -> Result<()> {
                         // In SL zone (bid <= trigger + margin).
                         if state.config.stop_loss_time_in_force == SellOrderTimeInForce::Fok {
                             // Drain WS sell fills that may have arrived after a previous FOK attempt (e.g. REST returned error but order filled on exchange).
-                            // This stops us from retrying FOK when the SL already matched.
+                            // Use a persistent receiver so MATCHED is never lost when REST returns before WS — stop retrying as soon as we see MATCHED.
                             let effective_sl_size_drain = state.pending_stop_loss.as_ref().map(|p| p.size.clone()).unwrap_or_else(|| sl.size.clone());
-                            if let Some(ws_user) = ws_user_ref {
-                                let mut rx = ws_user.subscribe_sell_fills();
+                            if state.sl_sell_fills_rx.is_none() {
+                                if let Some(ws) = ws_user_ref {
+                                    state.sl_sell_fills_rx = Some(ws.subscribe_sell_fills());
+                                }
+                            }
+                            if let Some(rx) = state.sl_sell_fills_rx.as_mut() {
                                 loop {
                                     match rx.try_recv() {
                                         Ok((asset_id, size)) if asset_id == sl.token_id => {
@@ -2592,6 +2600,7 @@ pub async fn run() -> Result<()> {
                                 state.sl_limit_last_rest_check_ms = None;
                                 state.pending_auto_sell = None;
                                 state.pending_stop_loss = None;
+                                state.sl_sell_fills_rx = None;
                                 state.allowance_cache = None;
                                 state.last_buy_order = None;
                                 clear_pending_gtc(&mut state);
@@ -2796,6 +2805,7 @@ pub async fn run() -> Result<()> {
                                                 state.sl_limit_last_rest_check_ms = None;
                                                 state.pending_auto_sell = None;
                                                 state.pending_stop_loss = None;
+                                                state.sl_sell_fills_rx = None;
                                                 state.allowance_cache = None;
                                                 state.last_buy_order = None;
                                                 clear_pending_gtc(&mut state);
