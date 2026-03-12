@@ -3111,8 +3111,9 @@ pub async fn run() -> Result<()> {
                         let target = round_to_tick(tp.target_price);
                         let tp_activation_price = target - TICK_SIZE; // Only activate TP when price touches TP - 0.01
 
-                        // Reconcile FAK fill from WS: use actual filled size so TP/SL sell the full position.
-                        // Downsize when actual fill < planned; upsize when actual fill > planned (e.g. API said 6.00 but fill was 6.07).
+                        // Reconcile FAK fill from WS: only UPSIZE when WS reports 100% and we haven't placed TP/SL yet.
+                        // Never downsize here — TP/SL must place normally with available balance; placement uses min(planned, balance).
+                        // So we only update planned size when actual fill > planned (e.g. 6.07) so we sell full position if still not placed.
                         if state.pending_auto_sell.is_some() && state.pending_stop_loss.is_some() {
                             if let (Some(buy), Some(ws_user)) = (
                                 state.last_buy_order.as_ref(),
@@ -3120,17 +3121,19 @@ pub async fn run() -> Result<()> {
                             ) {
                                 if let Some(ref oid) = buy.order_id {
                                     if let Some((filled, _)) = ws_user.get_order_filled_size_with_type(oid).await {
-                                        // Use actual filled as source of truth so we sell the full position (e.g. 6.07 not 6.00).
                                         let cap = filled;
                                         let tp_size = state.pending_auto_sell.as_ref().unwrap().size.clone();
                                         let sl_size = state.pending_stop_loss.as_ref().unwrap().size.clone();
-                                        if cap != tp_size || cap != sl_size {
+                                        let valid_cap = cap >= CLOB_DEFAULT_MIN_ORDER_SIZE;
+                                        // Only upsize: cap > current. Never shrink (partial fill must not block TP/SL placement).
+                                        let need_up = valid_cap && (cap > tp_size || cap > sl_size);
+                                        if need_up {
                                             let new_tp = cap.clone();
                                             let new_sl = cap.clone();
                                             state.pending_auto_sell.as_mut().unwrap().size = new_tp.clone();
                                             state.pending_stop_loss.as_mut().unwrap().size = new_sl.clone();
                                             info!(
-                                                "[IntervalSniper] FAK fill reconciled from WS: order_id={} actual_filled={} → TP size {}→{}  SL size {}→{}",
+                                                "[IntervalSniper] FAK fill reconciled from WS (upsize only): order_id={} actual_filled={} → TP {}→{}  SL {}→{}",
                                                 oid.chars().take(20).collect::<String>(),
                                                 fmt_decimal_2(&cap),
                                                 fmt_decimal_2(&tp_size),
