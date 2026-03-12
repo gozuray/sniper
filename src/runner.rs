@@ -2827,6 +2827,39 @@ pub async fn run() -> Result<()> {
                                             if now_unix() >= market.close_time_unix {
                                                 break;
                                             }
+                                            // Drain persistent WS sell-fills so we see MATCHED even when REST returned first (e.g. HTTP 400).
+                                            if let Some(rx) = state.sl_sell_fills_rx.as_mut() {
+                                                loop {
+                                                    match rx.try_recv() {
+                                                        Ok((asset_id, size)) if asset_id == sl.token_id => {
+                                                            state.sl_cumulative_filled += size;
+                                                            if state.sl_cumulative_filled > effective_sl_size {
+                                                                state.sl_cumulative_filled = effective_sl_size.clone();
+                                                            }
+                                                        }
+                                                        Ok(_) => {}
+                                                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                                                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                                                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                                                    }
+                                                }
+                                            }
+                                            if state.sl_cumulative_filled >= effective_sl_size.clone() * dec!(0.99) {
+                                                trace!("[IntervalSniper] SL FOK fill detected via WS drain in retry loop — exiting, cleanup next tick");
+                                                break;
+                                            }
+                                            // Re-check balance: if already 0/dust, position was sold (e.g. by previous FOK); stop retrying.
+                                            state.allowance_cache = None;
+                                            let bal_recheck = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                            if bal_recheck.map_or(true, |b| b <= DUST_THRESHOLD) {
+                                                state.sl_cumulative_filled = effective_sl_size.clone();
+                                                trace!("[IntervalSniper] SL FOK: balance 0/dust in retry loop — assuming filled, exiting");
+                                                break;
+                                            }
+                                            let remaining_recheck = effective_sl_size.clone() - state.sl_cumulative_filled.clone();
+                                            if remaining_recheck < DUST_THRESHOLD {
+                                                break;
+                                            }
                                         let top_recheck = if let Some(ref ws) = state.ws_book {
                                             ws.get_top_of_book().await
                                         } else {
@@ -2860,9 +2893,8 @@ pub async fn run() -> Result<()> {
                                             });
                                             let remaining_99 = remaining.clone() * dec!(0.99);
                                             let sl_token = sl.token_id.clone();
-                                            let mut sl_closed = false;
                                             let exit_price_fok = price;
-                                            let filled_from_ws: Option<Decimal> = if let Some(ws_user) = ws_user_ref {
+                                            let (filled_from_ws, rest_error_msg): (Option<Decimal>, Option<String>) = if let Some(ws_user) = ws_user_ref {
                                                 let mut rx = ws_user.subscribe_sell_fills();
                                                 let timeout = tokio::time::sleep(Duration::from_secs(10));
                                                 tokio::pin!(timeout);
@@ -2871,19 +2903,17 @@ pub async fn run() -> Result<()> {
                                                         result = &mut rest_handle => {
                                                             match result {
                                                                 Ok(Ok(r)) => {
-                                                                    // FOK: success=true (and no errorMsg) means order filled; API may omit makingAmount/takingAmount
                                                                     let filled_ok = r.success
                                                                         && r.error_msg.as_ref().map(|s| s.is_empty()).unwrap_or(true);
                                                                     let size_ok = r.filled_size
                                                                         .map(|f| f >= remaining_99)
                                                                         .unwrap_or(true);
                                                                     if filled_ok && size_ok {
-                                                                        sl_closed = true;
-                                                                        break Some(r.filled_size.unwrap_or_else(|| expected_size.clone()));
+                                                                        break (Some(r.filled_size.unwrap_or_else(|| expected_size.clone())), None);
                                                                     }
-                                                                    break None;
+                                                                    break (None, r.error_msg.clone());
                                                                 }
-                                                                _ => break None,
+                                                                _ => break (None, None),
                                                             }
                                                         }
                                                         msg = rx.recv() => {
@@ -2891,17 +2921,16 @@ pub async fn run() -> Result<()> {
                                                                 Ok((asset_id, size)) => {
                                                                     if asset_id == sl_token && size >= remaining_99 {
                                                                         rest_handle.abort();
-                                                                        sl_closed = true;
-                                                                        break Some(size);
+                                                                        break (Some(size), None);
                                                                     }
                                                                 }
                                                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+                                                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break (None, None),
                                                             }
                                                         }
                                                         _ = &mut timeout => {
                                                             rest_handle.abort();
-                                                            break None;
+                                                            break (None, None);
                                                         }
                                                     }
                                                 }
@@ -2914,13 +2943,15 @@ pub async fn run() -> Result<()> {
                                                             .map(|f| f >= remaining_99)
                                                             .unwrap_or(true);
                                                         if filled_ok && size_ok {
-                                                            sl_closed = true;
+                                                            (Some(r.filled_size.unwrap_or_else(|| expected_size.clone())), None)
+                                                        } else {
+                                                            (None, r.error_msg.clone())
                                                         }
                                                     }
-                                                    _ => {}
+                                                    _ => (None, None),
                                                 }
-                                                None
                                             };
+                                            let sl_closed = filled_from_ws.is_some();
                                             if sl_closed {
                                                 let total_filled = filled_from_ws.unwrap_or_else(|| expected_size.clone());
                                                 if let Some(ref buy) = state.last_buy_order {
@@ -2979,6 +3010,36 @@ pub async fn run() -> Result<()> {
                                                 }
                                                 break; // exit retry loop
                                             } else {
+                                                // HTTP 400 "not enough balance" often means order filled on exchange but REST lagged — drain WS and re-check.
+                                                if is_position_closed_error(rest_error_msg.as_deref()) {
+                                                    if let Some(rx) = state.sl_sell_fills_rx.as_mut() {
+                                                        loop {
+                                                            match rx.try_recv() {
+                                                                Ok((asset_id, size)) if asset_id == sl.token_id => {
+                                                                    state.sl_cumulative_filled += size;
+                                                                    if state.sl_cumulative_filled > effective_sl_size {
+                                                                        state.sl_cumulative_filled = effective_sl_size.clone();
+                                                                    }
+                                                                }
+                                                                Ok(_) => {}
+                                                                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                                                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                                                                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                                                            }
+                                                        }
+                                                    }
+                                                    if state.sl_cumulative_filled >= effective_sl_size.clone() * dec!(0.99) {
+                                                        trace!("[IntervalSniper] SL FOK fill detected after balance error (WS drain) — exiting, cleanup next tick");
+                                                        break;
+                                                    }
+                                                    state.allowance_cache = None;
+                                                    let bal_after_err = clob.get_available_balance(&sl.token_id).await.ok().flatten();
+                                                    if bal_after_err.map_or(true, |b| b <= DUST_THRESHOLD) {
+                                                        state.sl_cumulative_filled = effective_sl_size.clone();
+                                                        trace!("[IntervalSniper] SL FOK: balance 0/dust after balance error — assuming filled, exiting");
+                                                        break;
+                                                    }
+                                                }
                                                 state.sl_fok_fail_count = state.sl_fok_fail_count.saturating_add(1);
                                                 let delay_ms = if state.config.sl_fok_retry_delay_ms == 0 {
                                                     0u64
