@@ -1206,12 +1206,17 @@ pub async fn run() -> Result<()> {
                                                 break;
                                             }
                                             if bid_now == Decimal::ZERO { break; }
-                                            let price = round_to_tick(bid_now);
+                                            let tif = state.config.stop_loss_time_in_force;
+                                            let price = if tif == crate::types::SellOrderTimeInForce::Fok {
+                                                let sl_offset = state.config.sl_order_price_offset;
+                                                round_to_tick((bid_now - sl_offset).max(TICK_SIZE))
+                                            } else {
+                                                round_to_tick(bid_now)
+                                            };
                                             let size_to_place = bal
                                                 .map(|b| floor_to_decimals(sl_size.min(b), SELL_SIZE_DECIMALS))
                                                 .unwrap_or(sl_size);
                                             if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
-                                                let tif = state.config.stop_loss_time_in_force;
                                                 match clob.place_sell_order(&sl_token, price, size_to_place, tif).await {
                                                     Ok(result) if result.success => {
                                                         if tif == crate::types::SellOrderTimeInForce::Gtc {
@@ -2827,12 +2832,14 @@ pub async fn run() -> Result<()> {
                                         let side_recheck = if is_up { &top_recheck.token_id_up } else { &top_recheck.token_id_down };
                                         let recheck_bid = side_recheck.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                                         if recheck_bid >= TICK_SIZE {
-                                            // When best_bid is at SL target, place FOK 1 tick below to cross spread (more aggressive).
-                                            let price = if recheck_bid >= sl.trigger_price - TICK_SIZE
-                                                && recheck_bid <= sl.trigger_price + TICK_SIZE
-                                                && recheck_bid > TICK_SIZE
+                                            // When best_bid is at/near SL target, place FOK with configured offset below to cross spread.
+                                            // MM_SL_ORDER_PRICE_OFFSET controls the aggressiveness (default 0.01, max 0.10).
+                                            let sl_offset = state.config.sl_order_price_offset;
+                                            let price = if recheck_bid >= sl.trigger_price - sl_offset
+                                                && recheck_bid <= sl.trigger_price + sl_offset
+                                                && recheck_bid > sl_offset
                                             {
-                                                round_to_tick((recheck_bid - TICK_SIZE).max(TICK_SIZE))
+                                                round_to_tick((recheck_bid - sl_offset).max(TICK_SIZE))
                                             } else {
                                                 round_to_tick(recheck_bid)
                                             };

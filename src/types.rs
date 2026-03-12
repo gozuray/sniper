@@ -76,6 +76,10 @@ pub struct Config {
     pub sl_fok_retry_delay_ms: u64,
     /// If true, each consecutive SL FOK no-fill increases the delay (exponential backoff).
     pub sl_fok_retry_backoff: bool,
+    /// Price offset below best_bid when placing SL FOK orders (default 0.01 = 1 tick).
+    /// Higher value = more aggressive, more likely to fill, but potentially worse exit price.
+    /// Example: 0.05 = place FOK 5 cents below best_bid when in SL zone near trigger.
+    pub sl_order_price_offset: Decimal,
     pub loop_ms: u64,
     #[allow(dead_code)]
     pub cooldown_between_orders_ms: u64,
