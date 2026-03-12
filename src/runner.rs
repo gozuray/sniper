@@ -1104,6 +1104,8 @@ pub async fn run() -> Result<()> {
                             let sl_size = floor_to_decimals(base_sell_size * pct_sl, SELL_SIZE_DECIMALS)
                                 .max(MIN_SELL_SIZE)
                                 .min(base_sell_size);
+                            // Precompute before token_id is moved into PendingStopLoss.
+                            let recovery_is_up = token_id == market.token_id_up;
                             state.pending_auto_sell = Some(PendingAutoSell {
                                 token_id: token_id.clone(),
                                 target_price,
@@ -1146,9 +1148,143 @@ pub async fn run() -> Result<()> {
                                 w.as_ref().map(|a| a.as_ref()),
                                 Some(ptb.at_ms),
                                 Some(entry_side),
-                                Some((entry_side, filled)),
+                                Some((entry_side, filled.clone())),
                             )
                             .await;
+                            // Network-error recovery: position arrived late via WS, so no TP/SL order is on the book yet.
+                            // Normal flow waits for price to touch target before placing TP, and only places SL when in SL zone.
+                            // After a network error the fill can arrive well into the interval with price anywhere —
+                            // act immediately based on the live order book, exactly like the normal tick would if it had
+                            // been the first tick after the fill.
+                            if !state.config.dry_run {
+                                // Read current book (WS if available, else REST).
+                                let recovery_book = if let Some(ref ws) = state.ws_book {
+                                    ws.get_top_of_book().await
+                                } else {
+                                    match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
+                                        Ok(t) => t,
+                                        Err(_) => TopOfBook { token_id_up: None, token_id_down: None },
+                                    }
+                                };
+                                let recovery_side_book = if recovery_is_up { &recovery_book.token_id_up } else { &recovery_book.token_id_down };
+                                let recovery_best_bid = recovery_side_book.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                let sl_trigger = round_to_tick(state.config.stop_loss_price);
+                                let in_sl_zone = recovery_best_bid > Decimal::ZERO && recovery_best_bid <= sl_trigger + SL_TRIGGER_MARGIN;
+                                info!(
+                                    "[IntervalSniper] network-error recovery: best_bid={} sl_trigger={} in_sl_zone={}",
+                                    fmt_price(Some(&recovery_best_bid)), fmt_price(Some(&sl_trigger)), in_sl_zone
+                                );
+                                if in_sl_zone && state.config.enable_stop_loss {
+                                    // Price already in SL zone — place SL immediately (same logic as normal tick, FOK or GTC).
+                                    state.allowance_cache = None;
+                                    let sl_token = state.pending_stop_loss.as_ref().unwrap().token_id.clone();
+                                    let params = BalanceAllowanceParams {
+                                        asset_type: AssetType::Conditional,
+                                        token_id: Some(sl_token.clone()),
+                                    };
+                                    let mut sl_placed_ok = false;
+                                    for _retry in 0..15u32 {
+                                        if now_unix() >= market.close_time_unix { break; }
+                                        state.allowance_cache = None;
+                                        let _ = clob.as_ref().update_balance_allowance(&params).await;
+                                        let bal = clob.get_available_balance(&sl_token).await.ok().flatten();
+                                        if bal.as_ref().map(|b| *b >= sl_size * dec!(0.90)).unwrap_or(false) {
+                                            // Refresh best_bid before placing (price may have moved during balance wait).
+                                            let book_now = if let Some(ref ws) = state.ws_book {
+                                                ws.get_top_of_book().await
+                                            } else {
+                                                match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
+                                                    Ok(t) => t,
+                                                    Err(_) => recovery_book.clone(),
+                                                }
+                                            };
+                                            let side_now = if recovery_is_up { &book_now.token_id_up } else { &book_now.token_id_down };
+                                            let bid_now = side_now.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                            if bid_now > sl_trigger + SL_TRIGGER_MARGIN {
+                                                // Price recovered; let normal TP flow handle it next tick.
+                                                info!("[IntervalSniper] SL immediate: price recovered (bid {} > trigger {}), deferring to TP flow", fmt_price(Some(&bid_now)), fmt_price(Some(&sl_trigger)));
+                                                break;
+                                            }
+                                            if bid_now == Decimal::ZERO { break; }
+                                            let price = round_to_tick(bid_now);
+                                            let size_to_place = bal
+                                                .map(|b| floor_to_decimals(sl_size.min(b), SELL_SIZE_DECIMALS))
+                                                .unwrap_or(sl_size);
+                                            if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                let tif = state.config.stop_loss_time_in_force;
+                                                match clob.place_sell_order(&sl_token, price, size_to_place, tif).await {
+                                                    Ok(result) if result.success => {
+                                                        if tif == crate::types::SellOrderTimeInForce::Gtc {
+                                                            state.sl_limit_order_id = result.order_id.clone();
+                                                            state.sl_limit_order_price = Some(price);
+                                                        }
+                                                        info!(
+                                                            "[IntervalSniper] SL {:?} placed immediately after network-error fill @ {} size={} order_id={:?}",
+                                                            tif, fmt_price(Some(&price)), fmt_decimal_2(&size_to_place), result.order_id
+                                                        );
+                                                        sl_placed_ok = true;
+                                                        break;
+                                                    }
+                                                    Ok(result) => {
+                                                        warn!("[IntervalSniper] SL immediate place failed: {:?}, retrying...", result.error_msg);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[IntervalSniper] SL immediate place error: {e}, retrying...");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                    }
+                                    if !sl_placed_ok {
+                                        info!("[IntervalSniper] SL immediate placement deferred — main loop will handle SL normally");
+                                    }
+                                } else if state.config.enable_auto_sell || state.config.auto_sell_at_max_price {
+                                    // Price above SL zone — place TP limit at target so it rests on the book.
+                                    let tp_token = state.pending_auto_sell.as_ref().unwrap().token_id.clone();
+                                    let tp_target = round_to_tick(state.pending_auto_sell.as_ref().unwrap().target_price);
+                                    let params = BalanceAllowanceParams {
+                                        asset_type: AssetType::Conditional,
+                                        token_id: Some(tp_token.clone()),
+                                    };
+                                    let mut tp_placed_ok = false;
+                                    for _retry in 0..15u32 {
+                                        if now_unix() >= market.close_time_unix { break; }
+                                        state.allowance_cache = None;
+                                        let _ = clob.as_ref().update_balance_allowance(&params).await;
+                                        let bal = clob.get_available_balance(&tp_token).await.ok().flatten();
+                                        if bal.as_ref().map(|b| *b >= tp_size * dec!(0.99)).unwrap_or(false) {
+                                            let size_to_place = bal
+                                                .map(|b| floor_to_decimals(tp_size.min(b), SELL_SIZE_DECIMALS))
+                                                .unwrap_or(tp_size);
+                                            if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                match clob.place_sell_order(&tp_token, tp_target, size_to_place, crate::types::SellOrderTimeInForce::Gtc).await {
+                                                    Ok(result) if result.success => {
+                                                        state.tp_limit_order_id = result.order_id.clone();
+                                                        state.tp_placed_size = Some(size_to_place);
+                                                        info!(
+                                                            "[IntervalSniper] TP limit placed immediately after network-error fill @ {} size={} order_id={:?}",
+                                                            fmt_price(Some(&tp_target)), fmt_decimal_2(&size_to_place), result.order_id
+                                                        );
+                                                        tp_placed_ok = true;
+                                                        break;
+                                                    }
+                                                    Ok(result) => {
+                                                        warn!("[IntervalSniper] TP immediate place failed: {:?}, retrying...", result.error_msg);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[IntervalSniper] TP immediate place error: {e}, retrying...");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                    }
+                                    if !tp_placed_ok {
+                                        info!("[IntervalSniper] TP immediate placement deferred — main loop will handle TP/SL normally");
+                                    }
+                                }
+                            }
                         }
                     }
                 }
