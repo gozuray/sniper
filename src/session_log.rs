@@ -78,7 +78,7 @@ pub struct SessionLog {
     market_close_count: u32,
     total_pnl: Decimal,
     telegram: Option<TelegramLog>,
-    /// 1=compact, 2=card, 3=minimal
+    /// 1–20: same message body, title "Sniper N"
     telegram_msg_format: u8,
 }
 
@@ -86,7 +86,7 @@ impl SessionLog {
     /// Create a new session log in `dir` with filename `session_YYYY-MM-DDTHH-MM-SS.jsonl`.
     /// Creates `dir` if it does not exist. Returns None if disabled or creation fails.
     /// If `telegram` is Some, short summaries are enqueued to Telegram (non-blocking).
-    /// `telegram_msg_format`: 1=compact, 2=card, 3=minimal.
+    /// `telegram_msg_format`: 1–20 = same message, title "Sniper N".
     pub fn new(
         session_start_ms: u64,
         dir: &str,
@@ -118,7 +118,7 @@ impl SessionLog {
             market_close_count: 0,
             total_pnl: Decimal::ZERO,
             telegram,
-            telegram_msg_format: telegram_msg_format.min(1).max(3),
+            telegram_msg_format: telegram_msg_format.min(1).max(20),
         }))
     }
 
@@ -273,36 +273,16 @@ impl SessionLog {
                 let interval_label = format!("{} · {}", asset_from_slug(slug), interval_lisbon_time(interval_start_unix));
                 // Real USDC values (as in Polymarket history): cost = size*entry_price, proceeds = size*exit_price.
                 let exit_display = exit_type_telegram_display(exit_type);
-                let msg = match self.telegram_msg_format {
-                1 => format!(
-                    "📌 Close\n{} · {} {}\n├ Entrada: ${}  →  Venta: ${}\n└ PnL: ${}",
-                    interval_label,
-                    side_str(side),
-                    exit_display,
-                    fmt_decimal_2(&entry_value_usd),
-                    fmt_decimal_2(&exit_value_usd),
-                    fmt_decimal_2(&pnl)
-                ),
-                2 => format!(
-                    "━━━━━━━━━━━━━━━━\n📊 Position closed\n━━━━━━━━━━━━━━━━\n├ Interval: {} 5m · {}\n├ Side: {} · {}\n├ Entrada (coste): ${}\n├ Venta (recibido): ${}\n└ PnL: ${}\n━━━━━━━━━━━━━━━━",
-                    asset_from_slug(slug),
-                    interval_lisbon_time(interval_start_unix),
-                    side_str(side),
-                    exit_display,
-                    fmt_decimal_2(&entry_value_usd),
-                    fmt_decimal_2(&exit_value_usd),
-                    fmt_decimal_2(&pnl)
-                ),
-                _ => format!(
-                    "{} {}  Entrada ${} → Venta ${}  PnL ${}  ({})",
+                let body = format!(
+                    "{} {}  Entrada ${} → Venta ${}\nPnL ${}  ({})",
                     side_str(side),
                     exit_display,
                     fmt_decimal_2(&entry_value_usd),
                     fmt_decimal_2(&exit_value_usd),
                     fmt_decimal_2(&pnl),
                     interval_label
-                ),
-            };
+                );
+                let msg = format!("Sniper {}\n{}", self.telegram_msg_format, body);
                 t.send(msg);
             }
         }
@@ -383,30 +363,15 @@ impl SessionLog {
             } else {
                 format!("{:.0}%", win_rate * 100.0)
             };
-            let msg = match self.telegram_msg_format {
-                1 => format!(
-                    "📈 Session summary\nTP={}  SL={}  MC={}  ·  Win {}  ·  PnL ${}",
-                    self.tp_count,
-                    self.sl_count,
-                    self.market_close_count,
-                    win_pct,
-                    self.total_pnl
-                ),
-                2 => format!(
-                    "══════════════════\n📈 Session summary\n══════════════════\n├ TP: {}  SL: {}  MC: {}\n├ Win rate: {}\n└ Total PnL: ${}\n══════════════════",
-                    self.tp_count,
-                    self.sl_count,
-                    self.market_close_count,
-                    win_pct,
-                    self.total_pnl
-                ),
-                _ => format!(
-                    "Session · {} trades · {} win · ${}",
-                    closed_count,
-                    win_pct,
-                    self.total_pnl
-                ),
-            };
+            let body = format!(
+                "TP={}  SL={}  MC={}  ·  Win {}  ·  PnL ${}",
+                self.tp_count,
+                self.sl_count,
+                self.market_close_count,
+                win_pct,
+                self.total_pnl
+            );
+            let msg = format!("Sniper {}\n{}", self.telegram_msg_format, body);
             t.send(msg);
         }
         Ok(())
