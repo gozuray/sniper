@@ -51,6 +51,8 @@ const TINY_FILL_THRESHOLD: Decimal = dec!(0.01);
 const BALANCE_BUFFER_SHARES: Decimal = dec!(0.000001);
 /// Retry interval (ms) when placing TP/SL after WS fill until REST balance reflects the fill or interval ends.
 const TP_SL_BALANCE_RETRY_MS: u64 = 200;
+/// When price is at target, retry placing TP every this many ms until placed or price leaves target (then normal flow e.g. SL).
+const TP_AT_TARGET_RETRY_MS: u64 = 500;
 /// Interval (ms) for logging CLOB balance and buy→balance-reflected delay.
 const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
 /// When WS is present: wait this long before using REST get_order/balance fallback. WS can take 1–3 ticks to deliver the fill; this gives it priority so we log "fill first: user WS" when possible.
@@ -3675,6 +3677,73 @@ pub async fn run() -> Result<()> {
                                                 fmt_decimal_2(&sl_size),
                                                 fmt_decimal_2(&new_sl),
                                             );
+                                            // Immediately try to place TP if price is at target (we have size from WS, no need to wait for REST balance).
+                                            if state.tp_limit_order_id.is_none() {
+                                                let sl_zone_upper = state
+                                                    .pending_stop_loss
+                                                    .as_ref()
+                                                    .map(|s| s.trigger_price + SL_TRIGGER_MARGIN)
+                                                    .unwrap_or(entry_price);
+                                                if best_bid >= tp_activation_price && best_bid >= sl_zone_upper {
+                                                    let size_to_place =
+                                                        floor_to_decimals(new_tp.clone().min(state.config.size_shares), SELL_SIZE_DECIMALS);
+                                                    if size_to_place >= CLOB_DEFAULT_MIN_ORDER_SIZE {
+                                                        state.allowance_cache = None;
+                                                        let params = BalanceAllowanceParams {
+                                                            asset_type: AssetType::Conditional,
+                                                            token_id: Some(tp.token_id.clone()),
+                                                        };
+                                                        let _ = clob.as_ref().update_balance_allowance(&params).await;
+                                                        let price = target;
+                                                        match clob
+                                                            .place_sell_order(
+                                                                &tp.token_id,
+                                                                price.clone(),
+                                                                size_to_place.clone(),
+                                                                crate::types::SellOrderTimeInForce::Gtc,
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(result) => {
+                                                                if let Some(ref mut log) = state.session_log {
+                                                                    let _ = log.log_order_submitted(
+                                                                        &market.slug,
+                                                                        market.interval_start_unix,
+                                                                        market.close_time_unix,
+                                                                        now_ms(),
+                                                                        &tp.token_id,
+                                                                        "SELL",
+                                                                        "GTC",
+                                                                        price.clone(),
+                                                                        size_to_place.clone(),
+                                                                        result.order_id.as_deref(),
+                                                                        result.http_status,
+                                                                        result.success,
+                                                                        result.error_msg.as_deref(),
+                                                                    );
+                                                                }
+                                                                if result.success {
+                                                                    state.tp_limit_order_id = result.order_id.clone();
+                                                                    state.tp_placed_size = Some(size_to_place);
+                                                                    state.tp_limit_balance_retries = 0;
+                                                                    info!(
+                                                                        "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (immediate after WS fill, at target)",
+                                                                        fmt_price(Some(&price)),
+                                                                        fmt_decimal_2(&size_to_place),
+                                                                        result.order_id
+                                                                    );
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                trace!(
+                                                                    "[IntervalSniper] TP immediate place after WS fill failed: {} (will retry in loop)",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -4290,7 +4359,7 @@ pub async fn run() -> Result<()> {
                                             SELL_SIZE_DECIMALS,
                                         );
                                         if ws_user_ref.is_some() {
-                                            // TP: retry every 200ms until place_sell_order succeeds or interval ends or price exits TP zone (e.g. into SL zone).
+                                            // TP: while at target, retry every TP_AT_TARGET_RETRY_MS until placed or interval ends or price exits TP zone (then normal flow e.g. SL).
                                             let params = BalanceAllowanceParams {
                                                 asset_type: AssetType::Conditional,
                                                 token_id: Some(tp.token_id.clone()),
@@ -4378,7 +4447,7 @@ pub async fn run() -> Result<()> {
                                                                 if now_unix() >= market.close_time_unix {
                                                                     break;
                                                                 }
-                                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                                tokio::time::sleep(Duration::from_millis(TP_AT_TARGET_RETRY_MS)).await;
                                                                 continue;
                                                             }
                                                         };
@@ -4419,7 +4488,7 @@ pub async fn run() -> Result<()> {
                                                         }
                                                     }
                                                 }
-                                                tokio::time::sleep(Duration::from_millis(TP_SL_BALANCE_RETRY_MS)).await;
+                                                tokio::time::sleep(Duration::from_millis(TP_AT_TARGET_RETRY_MS)).await;
                                             }
                                         } else {
                                         // No WS: legacy polling loop until REST balance reflects fill or interval ends.
