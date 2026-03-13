@@ -4181,8 +4181,10 @@ pub async fn run() -> Result<()> {
                                     && state.tp_cumulative_filled.is_zero();
                                 let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
                                 // Detect TP already filled when we have no resting order: balance 0/dust → position closed, do not place.
+                                // Only when we had already placed a TP for this position (tp_placed_size.is_some()). Otherwise balance 0
+                                // is likely stale after entry fill (WS/REST not updated yet) → would be a false positive and we'd close without ever placing TP.
                                 let mut skip_placement_tp_already_filled = false;
-                                if size.is_zero() && stale_available && !dust_after_sl {
+                                if size.is_zero() && stale_available && !dust_after_sl && state.tp_placed_size.is_some() {
                                     state.allowance_cache = None;
                                     let rest_bal = clob.get_available_balance(&tp.token_id).await.ok().flatten();
                                     if rest_bal.map_or(true, |b| b < TP_SL_DUST_SIZE) {
