@@ -1209,7 +1209,7 @@ pub async fn run() -> Result<()> {
                                             let tif = state.config.stop_loss_time_in_force;
                                             let price = if tif == crate::types::SellOrderTimeInForce::Fok {
                                                 let sl_offset = state.config.sl_order_price_offset;
-                                                round_to_tick((bid_now - sl_offset).max(TICK_SIZE))
+                                                round_to_tick((sl_trigger - sl_offset).max(TICK_SIZE))
                                             } else {
                                                 round_to_tick(bid_now)
                                             };
@@ -2873,17 +2873,10 @@ pub async fn run() -> Result<()> {
                                         if recheck_bid < TICK_SIZE {
                                             break;
                                         }
-                                            // When best_bid is at/near SL target, place FOK with configured offset below to cross spread.
-                                            // MM_SL_ORDER_PRICE_OFFSET controls the aggressiveness (default 0.01, max 0.10).
+                                            // In SL zone: place FOK always below the trigger (trigger - offset) so the order is aggressive and fills.
+                                            // MM_SL_ORDER_PRICE_OFFSET = e.g. 0.05 → order at 0.80 when trigger is 0.85.
                                             let sl_offset = state.config.sl_order_price_offset;
-                                            let price = if recheck_bid >= sl.trigger_price - sl_offset
-                                                && recheck_bid <= sl.trigger_price + sl_offset
-                                                && recheck_bid > sl_offset
-                                            {
-                                                round_to_tick((recheck_bid - sl_offset).max(TICK_SIZE))
-                                            } else {
-                                                round_to_tick(recheck_bid)
-                                            };
+                                            let price = round_to_tick((sl.trigger_price - sl_offset).max(TICK_SIZE));
                                             let clob_ref = clob.clone();
                                             let token_id = sl.token_id.clone();
                                             let mut rest_handle = tokio::spawn(async move {
