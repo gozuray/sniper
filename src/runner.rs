@@ -554,7 +554,8 @@ async fn log_balance_after_buy(
 }
 
 /// Fetch CLOB balance for both tokens and log every BALANCE_LOG_INTERVAL_MS when holding a position.
-/// "WS balance after fill" / "Balance from fill (instant)" only when the position was bought this interval; otherwise "WS balance" or "CLOB balance (REST)".
+/// Purely diagnostic: not used for trading. Safe to remove; you only lose these log lines.
+/// "WS balance after fill" only when the position was bought this interval; otherwise "WS balance" or "CLOB balance (REST)".
 async fn log_clob_balance_if_due(
     clob: &dyn ClobClient,
     market: &ResolvedMarket,
@@ -713,31 +714,45 @@ async fn log_clob_balance_if_due(
         .as_ref()
         .map(fmt_decimal_2)
         .unwrap_or_else(|| "-".to_string());
-    let balance_changed = up != state.last_logged_balance_up || down != state.last_logged_balance_down;
+    // For the token we don't hold, WS often alternates Some(0) / None → avoid logging every tick.
+    let both_zero_or_none = |a: &Option<Decimal>, b: &Option<Decimal>| {
+        let az = a.as_ref().map(|x| *x == Decimal::ZERO).unwrap_or(true);
+        let bz = b.as_ref().map(|x| *x == Decimal::ZERO).unwrap_or(true);
+        az && bz
+    };
+    let up_changed = up != state.last_logged_balance_up
+        && (position_token_id == Some(market.token_id_up.as_str()) || !both_zero_or_none(&up, &state.last_logged_balance_up));
+    let down_changed = down != state.last_logged_balance_down
+        && (position_token_id == Some(market.token_id_down.as_str()) || !both_zero_or_none(&down, &state.last_logged_balance_down));
+    let balance_changed = up_changed || down_changed;
     if balance_changed {
-        if balance_from_ws && fill_in_this_interval {
+        // "WS balance after fill" solo una vez por posición, cuando se detecta el balance tras el fill.
+        let first_time_after_fill = balance_from_ws && fill_in_this_interval && !state.balance_delay_clob_logged;
+        let first_time_fill_instant = balance_from_fill_instant && fill_in_this_interval && !state.balance_delay_clob_logged;
+        if first_time_after_fill {
             info!(
                 "[IntervalSniper] WS balance after fill:  Up={}  Down={}  (0ms)",
                 up_str, down_str
             );
             state.balance_delay_clob_logged = true;
-        } else if balance_from_fill_instant && fill_in_this_interval {
+        } else if first_time_fill_instant {
             info!(
                 "[IntervalSniper] Balance from fill (instant)  Up={}  Down={}  (0ms)",
                 up_str, down_str
             );
             state.balance_delay_clob_logged = true;
-        } else if balance_from_ws || balance_from_fill_instant {
+        } else if (balance_from_ws || balance_from_fill_instant) && !(fill_in_this_interval && state.balance_delay_clob_logged) {
             info!(
                 "[IntervalSniper] WS balance:  Up={}  Down={}",
                 up_str, down_str
             );
-        } else {
+        } else if !(fill_in_this_interval && state.balance_delay_clob_logged) {
             info!(
                 "[IntervalSniper] CLOB balance (REST)  Up={}  Down={}",
                 up_str, down_str
             );
         }
+        // Siempre actualizar para no considerar "cambio" en el próximo tick.
         state.last_logged_balance_up = up;
         state.last_logged_balance_down = down;
     }
