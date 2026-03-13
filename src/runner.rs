@@ -57,6 +57,10 @@ const BALANCE_LOG_INTERVAL_MS: u64 = 1000;
 const PENDING_GTC_REST_CHECK_MS: u64 = 400;
 /// When no WS user channel, check REST every tick from buy (0 = no delay).
 const PENDING_GTC_NO_WS_FALLBACK_MS: u64 = 0;
+/// When in SL FOK retry: sleep this long (ms) so we re-fetch book and retry at new best_bid every tick instead of waiting full loop_ms.
+const SL_FOK_RETRY_LOOP_MS: u64 = 100;
+/// Max wait (s) for REST/WS when placing SL FOK so we can retry at new price sooner if REST hangs.
+const SL_FOK_WAIT_TIMEOUT_SECS: u64 = 3;
 
 /// True if top has at least one side with book data (for WS fallback to REST).
 fn top_has_book_data(top: &TopOfBook) -> bool {
@@ -2863,16 +2867,25 @@ pub async fn run() -> Result<()> {
                                         .map(|b| floor_to_decimals(expected_size.clone().min(b), SELL_SIZE_DECIMALS))
                                         .unwrap_or_else(|| expected_size.clone());
                                     if size_to_place >= MIN_SELL_SIZE && size_to_place >= DUST_THRESHOLD {
-                                        let top_recheck = if let Some(ref ws) = state.ws_book {
-                                            ws.get_top_of_book().await
+                                        // Always use fresh book for FOK price so each retry uses current best_bid (not stale).
+                                        let (_top_recheck, recheck_bid) = if let Some(ref ws) = state.ws_book {
+                                            let t = ws.get_top_of_book().await;
+                                            let side = if is_up { &t.token_id_up } else { &t.token_id_down };
+                                            let bid = side.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                            (t, bid)
                                         } else {
                                             match fetch_top_of_book(&http, &clob_host, &market.token_id_up, &market.token_id_down).await {
-                                                Ok(t) => t,
-                                                Err(_) => top.clone(),
+                                                Ok(t) => {
+                                                    let side = if is_up { &t.token_id_up } else { &t.token_id_down };
+                                                    let bid = side.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
+                                                    (t, bid)
+                                                }
+                                                Err(_) => {
+                                                    // Avoid using stale top: skip placing FOK this tick so next tick we retry with fresh price.
+                                                    (top.clone(), Decimal::ZERO)
+                                                }
                                             }
                                         };
-                                        let side_recheck = if is_up { &top_recheck.token_id_up } else { &top_recheck.token_id_down };
-                                        let recheck_bid = side_recheck.as_ref().and_then(|s| s.best_bid).unwrap_or(Decimal::ZERO);
                                         if recheck_bid >= TICK_SIZE {
                                             // Aggressive SL price: trigger − offset, capped at best_bid so the order always crosses.
                                             let aggressive = (sl.trigger_price - state.config.sl_order_price_offset).max(TICK_SIZE);
@@ -2890,7 +2903,7 @@ pub async fn run() -> Result<()> {
                                             let exit_price_fok = price;
                                             let filled_from_ws: Option<Decimal> = if let Some(ws_user) = ws_user_ref {
                                                 let mut rx = ws_user.subscribe_sell_fills();
-                                                let timeout = tokio::time::sleep(Duration::from_secs(10));
+                                                let timeout = tokio::time::sleep(Duration::from_secs(SL_FOK_WAIT_TIMEOUT_SECS));
                                                 tokio::pin!(timeout);
                                                 loop {
                                                     tokio::select! {
@@ -4321,9 +4334,10 @@ pub async fn run() -> Result<()> {
                                                     .as_ref()
                                                     .map(|s| s.trigger_price + SL_TRIGGER_MARGIN)
                                                     .unwrap_or(entry_price);
-                                                if current_best_bid <= sl_zone_upper {
+                                                // Use strict < so that when bid == sl_zone_upper we still try to place TP (boundary is not "in" SL zone).
+                                                if current_best_bid < sl_zone_upper {
                                                     info!(
-                                                        "[IntervalSniper] TP limit retries cancelled: price in SL zone (bid {} <= {}), SL will take over — will retry TP when price returns to target (next tick)",
+                                                        "[IntervalSniper] TP limit retries cancelled: price in SL zone (bid {} < {}), SL will take over — will retry TP when price returns to target (next tick)",
                                                         fmt_price(Some(&current_best_bid)),
                                                         fmt_price(Some(&sl_zone_upper))
                                                     );
@@ -4512,9 +4526,10 @@ pub async fn run() -> Result<()> {
                                                 .as_ref()
                                                 .map(|sl| sl.trigger_price + SL_TRIGGER_MARGIN)
                                                 .unwrap_or(entry_price);
-                                            if current_best_bid <= sl_zone_upper {
+                                            // Use strict < so that when bid == sl_zone_upper we still try to place TP (boundary is not "in" SL zone).
+                                            if current_best_bid < sl_zone_upper {
                                                 info!(
-                                                    "[IntervalSniper] TP limit retries cancelled: price in SL zone (bid {} <= {}), SL will take over — will retry TP when price returns to target (next tick)",
+                                                    "[IntervalSniper] TP limit retries cancelled: price in SL zone (bid {} < {}), SL will take over — will retry TP when price returns to target (next tick)",
                                                     fmt_price(Some(&current_best_bid)),
                                                     fmt_price(Some(&sl_zone_upper))
                                                 );
@@ -5479,6 +5494,12 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+        // When SL FOK is retrying, sleep shorter so we re-fetch book and retry at new best_bid every tick.
+        let sleep_ms = if state.sl_triggered && state.config.stop_loss_time_in_force == SellOrderTimeInForce::Fok {
+            loop_ms.min(SL_FOK_RETRY_LOOP_MS)
+        } else {
+            loop_ms
+        };
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
     }
 }
