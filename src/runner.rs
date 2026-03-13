@@ -158,6 +158,10 @@ struct RunnerState {
     tp_last_order_filled: Decimal,
     /// Consecutive TP limit placement failures due to balance/allowance errors.
     tp_limit_balance_retries: u32,
+    /// Last time we logged "TP reactivation" (ms); throttle to every 2s to avoid log spam.
+    last_tp_reactivation_log_ms: Option<u64>,
+    /// Last time we attempted TP placement after a balance/allowance error (ms); retry at most every 500ms to give CLOB time to update.
+    tp_last_balance_retry_placement_ms: Option<u64>,
     /// Last wall time (ms) we did REST fallback check for TP order status; throttle to every 5s.
     tp_limit_last_rest_check_ms: Option<u64>,
     /// Order ID of the GTC SL limit order (cancel and replace at new best_bid when bid drops).
@@ -976,6 +980,8 @@ pub async fn run() -> Result<()> {
         tp_cumulative_filled: Decimal::ZERO,
         tp_last_order_filled: Decimal::ZERO,
         tp_limit_balance_retries: 0,
+        last_tp_reactivation_log_ms: None,
+        tp_last_balance_retry_placement_ms: None,
         tp_limit_last_rest_check_ms: None,
         sl_limit_order_id: None,
         sl_limit_order_price: None,
@@ -3804,19 +3810,115 @@ pub async fn run() -> Result<()> {
                                 }
                             } else if !tp_filled_this_iteration && best_bid >= target + TICK_SIZE {
                                 // Polymarket bug: resting TP ask was not matched even though best_bid
-                                // already crossed target by 1+ tick. Cancel the stuck order and let the
-                                // placement block below re-place it at the same target price this tick.
+                                // already crossed target by 1+ tick. Cancel the stuck order; then check
+                                // if it was already filled (before/during cancel) so we don't re-place.
                                 warn!(
                                     "[IntervalSniper] TP stale (Polymarket bug): bid {} >= TP+1tick ({}) — cancel & re-place @ {}",
                                     fmt_price(Some(&best_bid)),
                                     fmt_decimal_2(&(target + TICK_SIZE)),
                                     fmt_price(Some(&target))
                                 );
+                                let oid_to_check = state.tp_limit_order_id.clone();
                                 let _ = clob.cancel_orders_for_token(&tp.token_id).await;
-                                state.tp_limit_order_id = None;
-                                state.tp_placed_size = None;
-                                state.tp_last_order_filled = Decimal::ZERO;
-                                state.tp_limit_balance_retries = 0;
+                                // Detect TP already filled: check order status after cancel (filled before or by cancel).
+                                if let Some(ref oid) = oid_to_check {
+                                    if let Ok(order_info) = clob.get_order(oid).await {
+                                        let status = order_info
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        if status.contains("MATCHED") || status.eq_ignore_ascii_case("FILLED") {
+                                            let rest_filled = order_info
+                                                .get("size_matched")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| Decimal::from_str(s).ok())
+                                                .unwrap_or_else(|| tp.size.clone());
+                                            info!(
+                                                "[IntervalSniper] ✓ TP already filled (detected after cancel via get_order MATCHED) — position closed"
+                                            );
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let exit_price = target;
+                                                let pnl = (exit_price - buy.price.clone()) * rest_filled.clone();
+                                                let roi_pct = ((exit_price / buy.price) - Decimal::ONE) * dec!(100);
+                                                let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                info!(
+                                                    "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s",
+                                                    match buy.side {
+                                                        EntrySide::Up => "Up",
+                                                        EntrySide::Down => "Down",
+                                                    },
+                                                    fmt_decimal_2(&buy.price),
+                                                    fmt_decimal_2(&exit_price),
+                                                    fmt_decimal_2(&rest_filled),
+                                                    pnl,
+                                                    roi_pct,
+                                                    held_sec
+                                                );
+                                            }
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        buy.side,
+                                                        buy.price.clone(),
+                                                        target,
+                                                        buy.timestamp_ms,
+                                                        now_ms_u,
+                                                        ExitType::TakeProfit,
+                                                        rest_filled.clone(),
+                                                        state.tp_placed_size.clone(),
+                                                        buy.order_id.as_deref(),
+                                                        Some(oid.as_str()),
+                                                        state.interval_min_bid_up,
+                                                        state.interval_max_bid_up,
+                                                        state.interval_min_bid_down,
+                                                        state.interval_max_bid_down,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        false,
+                                                    );
+                                                }
+                                            }
+                                            tp_filled_this_iteration = true;
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false;
+                                            state.tp_limit_order_id = None;
+                                            state.tp_placed_size = None;
+                                            state.tp_cumulative_filled = Decimal::ZERO;
+                                            state.tp_last_order_filled = Decimal::ZERO;
+                                            state.tp_limit_balance_retries = 0;
+                                            state.last_tp_reactivation_log_ms = None;
+                                            state.tp_last_balance_retry_placement_ms = None;
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_cumulative_filled = Decimal::ZERO;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.sl_limit_last_rest_check_ms = None;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.allowance_cache = None;
+                                            state.last_buy_order = None;
+                                            clear_pending_gtc(&mut state);
+                                            state.balance_reflected_at_ms = None;
+                                            state.balance_delay_clob_logged = false;
+                                            state.last_logged_balance_up = None;
+                                            state.last_logged_balance_down = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                        }
+                                    }
+                                }
+                                if !tp_filled_this_iteration {
+                                    state.tp_limit_order_id = None;
+                                    state.tp_placed_size = None;
+                                    state.tp_last_order_filled = Decimal::ZERO;
+                                    state.tp_limit_balance_retries = 0;
+                                    state.last_tp_reactivation_log_ms = None;
+                                    state.tp_last_balance_retry_placement_ms = None;
+                                }
                             }
                         }
 
@@ -4039,13 +4141,20 @@ pub async fn run() -> Result<()> {
                         if !tp_filled_this_iteration && state.tp_limit_order_id.is_none() && state.sl_limit_order_id.is_none() {
                             let target_reached = best_bid >= tp_activation_price;
                             if target_reached {
-                                // Log reactivation when we're retrying after balance/retry was cancelled (e.g. price dropped to entry then came back)
+                                // Log reactivation when we're retrying after balance/retry; throttle to every 2s to avoid log spam.
                                 if state.tp_limit_balance_retries > 0 {
-                                    info!(
-                                        "[IntervalSniper] TP reactivation: price back at target (bid {} >= {}), retrying placement",
-                                        fmt_price(Some(&best_bid)),
-                                        fmt_price(Some(&tp_activation_price))
-                                    );
+                                    let now_ms_log = now_ms();
+                                    let should_log = state.last_tp_reactivation_log_ms
+                                        .map(|t| now_ms_log.saturating_sub(t) >= 2000)
+                                        .unwrap_or(true);
+                                    if should_log {
+                                        info!(
+                                            "[IntervalSniper] TP reactivation: price back at target (bid {} >= {}), retrying placement (balance/allowance retry, next attempt in ~500ms)",
+                                            fmt_price(Some(&best_bid)),
+                                            fmt_price(Some(&tp_activation_price))
+                                        );
+                                        state.last_tp_reactivation_log_ms = Some(now_ms_log);
+                                    }
                                 }
                                 let position_remaining = tp.size.clone() - state.tp_cumulative_filled.clone();
                                 let position_size_real = position_remaining;
@@ -4071,7 +4180,94 @@ pub async fn run() -> Result<()> {
                                     && state.sl_cumulative_filled > Decimal::ZERO
                                     && state.tp_cumulative_filled.is_zero();
                                 let stale_available = position_size_real >= CLOB_DEFAULT_MIN_ORDER_SIZE;
-                                if (size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE) || (size.is_zero() && stale_available && !dust_after_sl) {
+                                // Detect TP already filled when we have no resting order: balance 0/dust → position closed, do not place.
+                                let mut skip_placement_tp_already_filled = false;
+                                if size.is_zero() && stale_available && !dust_after_sl {
+                                    state.allowance_cache = None;
+                                    let rest_bal = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                                    if rest_bal.map_or(true, |b| b < TP_SL_DUST_SIZE) {
+                                        info!(
+                                            "[IntervalSniper] ✓ TP already filled (balance 0/dust, no resting order) — position closed, no placement"
+                                        );
+                                        if let Some(ref buy) = state.last_buy_order {
+                                            let exit_price = target.clone();
+                                            let close_size = tp.size.clone();
+                                            let pnl = (exit_price.clone() - buy.price.clone()) * close_size.clone();
+                                            let roi_pct = ((exit_price / buy.price.clone()) - Decimal::ONE) * dec!(100);
+                                            let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                            info!(
+                                                "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (detected via balance)",
+                                                match buy.side {
+                                                    EntrySide::Up => "Up",
+                                                    EntrySide::Down => "Down",
+                                                },
+                                                fmt_decimal_2(&buy.price),
+                                                fmt_decimal_2(&exit_price),
+                                                fmt_decimal_2(&close_size),
+                                                pnl,
+                                                roi_pct,
+                                                held_sec
+                                            );
+                                        }
+                                        if let Some(ref mut log) = state.session_log {
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let _ = log.log_position_close(
+                                                    &market.slug,
+                                                    market.interval_start_unix,
+                                                    market.close_time_unix,
+                                                    buy.side,
+                                                    buy.price.clone(),
+                                                    target.clone(),
+                                                    buy.timestamp_ms,
+                                                    now_ms_u,
+                                                    ExitType::TakeProfit,
+                                                    tp.size.clone(),
+                                                    state.tp_placed_size.clone(),
+                                                    buy.order_id.as_deref(),
+                                                    state.tp_limit_order_id.as_deref(),
+                                                    state.interval_min_bid_up,
+                                                    state.interval_max_bid_up,
+                                                    state.interval_min_bid_down,
+                                                    state.interval_max_bid_down,
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                        skip_placement_tp_already_filled = true;
+                                        state.auto_sell_placed = true;
+                                        state.stop_loss_placed = true;
+                                        state.re_entry_allowed_after_sl = false;
+                                        state.tp_limit_order_id = None;
+                                        state.tp_placed_size = None;
+                                        state.tp_cumulative_filled = Decimal::ZERO;
+                                        state.tp_last_order_filled = Decimal::ZERO;
+                                        state.tp_limit_balance_retries = 0;
+                                        state.last_tp_reactivation_log_ms = None;
+                                        state.tp_last_balance_retry_placement_ms = None;
+                                        state.sl_limit_order_id = None;
+                                        state.sl_limit_order_price = None;
+                                        state.sl_cumulative_filled = Decimal::ZERO;
+                                        state.sl_last_order_filled = Decimal::ZERO;
+                                        state.sl_limit_last_rest_check_ms = None;
+                                        state.pending_auto_sell = None;
+                                        state.pending_stop_loss = None;
+                                        state.allowance_cache = None;
+                                        state.last_buy_order = None;
+                                        clear_pending_gtc(&mut state);
+                                        state.balance_reflected_at_ms = None;
+                                        state.balance_delay_clob_logged = false;
+                                        state.last_logged_balance_up = None;
+                                        state.last_logged_balance_down = None;
+                                        state.total_shares_this_interval = Decimal::ZERO;
+                                    }
+                                }
+                                if !skip_placement_tp_already_filled
+                                    && ((size > Decimal::ZERO && size < CLOB_DEFAULT_MIN_ORDER_SIZE)
+                                        || (size.is_zero() && stale_available && !dust_after_sl))
+                                {
                                     if stale_available && !dust_after_sl {
                                         // With MATCHED (ws_user): invalidate server cache, backoff get balance, place once — no polling loop.
                                         let expected_size = floor_to_decimals(
@@ -4408,7 +4604,7 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                         } // end legacy polling loop (no WS)
-                                    } else if dust_after_sl {
+                                    } else if !skip_placement_tp_already_filled && dust_after_sl {
                                         // Dust left after SL filled (e.g. SL size was 5.99, left 0.01). Do not report as TP.
                                         let exit_price = state.sl_limit_order_price.unwrap_or(target);
                                         let total_filled = tp.size.clone() - available.unwrap_or(Decimal::ZERO);
@@ -4445,7 +4641,7 @@ pub async fn run() -> Result<()> {
                                             }
                                         }
                                         state.re_entry_allowed_after_sl = true;
-                                    } else {
+                                    } else if !skip_placement_tp_already_filled {
                                         // Real dust after partial TP fill: report as TP with filled amount.
                                         info!(
                                             "[IntervalSniper] TP remaining {} below API minimum {} — dust after partial fill, closing position",
@@ -4488,7 +4684,26 @@ pub async fn run() -> Result<()> {
                                     state.last_logged_balance_up = None;
                                     state.last_logged_balance_down = None;
                                     state.total_shares_this_interval = Decimal::ZERO;
-                                } else if size >= MIN_SELL_SIZE && size >= DUST_THRESHOLD {
+                                } else if !skip_placement_tp_already_filled
+                                    && size >= MIN_SELL_SIZE
+                                    && size >= DUST_THRESHOLD
+                                {
+                                    // When retrying after balance/allowance error, only attempt placement every 500ms to give CLOB time to update and avoid API/log spam.
+                                    let allow_placement = if state.tp_limit_balance_retries > 0 {
+                                        let now_placement = now_ms();
+                                        let ok = state.tp_last_balance_retry_placement_ms
+                                            .map(|t| now_placement.saturating_sub(t) >= 500)
+                                            .unwrap_or(true);
+                                        if ok {
+                                            state.tp_last_balance_retry_placement_ms = Some(now_placement);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        true
+                                    };
+                                    if allow_placement {
                                     let price = target;
                                         let result = match clob
                                             .place_sell_order(
@@ -4529,6 +4744,8 @@ pub async fn run() -> Result<()> {
                                         state.tp_limit_order_id = result.order_id.clone();
                                         state.tp_placed_size = Some(size.clone());
                                         state.tp_limit_balance_retries = 0;
+                                        state.last_tp_reactivation_log_ms = None;
+                                        state.tp_last_balance_retry_placement_ms = None;
                                         info!(
                                             "[IntervalSniper] TP limit placed @ {} size={} order_id={:?} (cancel if price drops to entry {})",
                                             fmt_price(Some(&price)),
@@ -4537,29 +4754,109 @@ pub async fn run() -> Result<()> {
                                             fmt_price(Some(&entry_price))
                                         );
                                     } else if is_position_closed_error(result.error_msg.as_deref()) {
-                                        state.tp_limit_balance_retries += 1;
-                                        if state.tp_limit_balance_retries == 1 {
-                                            warn!(
-                                                "[IntervalSniper] TP limit balance/allowance error (retry {}), will retry with actual balance next tick (do not cancel — would cancel resting GTC entry)",
-                                                state.tp_limit_balance_retries
+                                        state.allowance_cache = None;
+                                        let bal = clob.get_available_balance(&tp.token_id).await.ok().flatten();
+                                        if bal.map_or(true, |b| b < TP_SL_DUST_SIZE) {
+                                            // Balance 0/dust → TP already filled, position closed; stop placement.
+                                            info!(
+                                                "[IntervalSniper] ✓ TP already filled (balance 0/dust after place error) — position closed, no more placement"
                                             );
-                                            state.allowance_cache = None;
-                                            // Log raw balance-allowance JSON so we know if it's balance=0 or allowance=0.
-                                            match clob.get_balance_allowance(&tp.token_id).await {
-                                                Ok(raw) => {
-                                                    let hint = format_balance_allowance_hint(&raw);
-                                                    warn!(
-                                                        "[IntervalSniper] balance-allowance for TP token: {}{}",
-                                                        raw.chars().take(300).collect::<String>(),
-                                                        hint
+                                            if let Some(ref buy) = state.last_buy_order {
+                                                let exit_price = target.clone();
+                                                let close_size = tp.size.clone();
+                                                let pnl = (exit_price.clone() - buy.price.clone()) * close_size.clone();
+                                                let roi_pct = ((exit_price / buy.price.clone()) - Decimal::ONE) * dec!(100);
+                                                let held_sec = now_ms_u.saturating_sub(buy.timestamp_ms) / 1000;
+                                                info!(
+                                                    "[CLOSED] TP  {} entry={} exit={} size={} pnl={:+.4} ({:+.2}%) held={}s (detected via balance after error)",
+                                                    match buy.side {
+                                                        EntrySide::Up => "Up",
+                                                        EntrySide::Down => "Down",
+                                                    },
+                                                    fmt_decimal_2(&buy.price),
+                                                    fmt_decimal_2(&exit_price),
+                                                    fmt_decimal_2(&close_size),
+                                                    pnl,
+                                                    roi_pct,
+                                                    held_sec
+                                                );
+                                            }
+                                            if let Some(ref mut log) = state.session_log {
+                                                if let Some(ref buy) = state.last_buy_order {
+                                                    let _ = log.log_position_close(
+                                                        &market.slug,
+                                                        market.interval_start_unix,
+                                                        market.close_time_unix,
+                                                        buy.side,
+                                                        buy.price.clone(),
+                                                        target.clone(),
+                                                        buy.timestamp_ms,
+                                                        now_ms_u,
+                                                        ExitType::TakeProfit,
+                                                        tp.size.clone(),
+                                                        state.tp_placed_size.clone(),
+                                                        buy.order_id.as_deref(),
+                                                        state.tp_limit_order_id.as_deref(),
+                                                        state.interval_min_bid_up,
+                                                        state.interval_max_bid_up,
+                                                        state.interval_min_bid_down,
+                                                        state.interval_max_bid_down,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        false,
                                                     );
                                                 }
-                                                Err(e) => warn!(
-                                                    "[IntervalSniper] could not fetch balance-allowance: {}",
-                                                    e
-                                                ),
                                             }
-                                        } else if state.tp_limit_balance_retries >= 10 {
+                                            state.auto_sell_placed = true;
+                                            state.stop_loss_placed = true;
+                                            state.re_entry_allowed_after_sl = false;
+                                            state.tp_limit_order_id = None;
+                                            state.tp_placed_size = None;
+                                            state.tp_cumulative_filled = Decimal::ZERO;
+                                            state.tp_last_order_filled = Decimal::ZERO;
+                                            state.tp_limit_balance_retries = 0;
+                                            state.last_tp_reactivation_log_ms = None;
+                                            state.tp_last_balance_retry_placement_ms = None;
+                                            state.sl_limit_order_id = None;
+                                            state.sl_limit_order_price = None;
+                                            state.sl_cumulative_filled = Decimal::ZERO;
+                                            state.sl_last_order_filled = Decimal::ZERO;
+                                            state.sl_limit_last_rest_check_ms = None;
+                                            state.pending_auto_sell = None;
+                                            state.pending_stop_loss = None;
+                                            state.allowance_cache = None;
+                                            state.last_buy_order = None;
+                                            clear_pending_gtc(&mut state);
+                                            state.balance_reflected_at_ms = None;
+                                            state.balance_delay_clob_logged = false;
+                                            state.last_logged_balance_up = None;
+                                            state.last_logged_balance_down = None;
+                                            state.total_shares_this_interval = Decimal::ZERO;
+                                        } else {
+                                            state.tp_limit_balance_retries += 1;
+                                            if state.tp_limit_balance_retries == 1 {
+                                                warn!(
+                                                    "[IntervalSniper] TP limit balance/allowance error (retry {}), will retry with actual balance next tick (do not cancel — would cancel resting GTC entry)",
+                                                    state.tp_limit_balance_retries
+                                                );
+                                                match clob.get_balance_allowance(&tp.token_id).await {
+                                                    Ok(raw) => {
+                                                        let hint = format_balance_allowance_hint(&raw);
+                                                        warn!(
+                                                            "[IntervalSniper] balance-allowance for TP token: {}{}",
+                                                            raw.chars().take(300).collect::<String>(),
+                                                            hint
+                                                        );
+                                                    }
+                                                    Err(e) => warn!(
+                                                        "[IntervalSniper] could not fetch balance-allowance: {}",
+                                                        e
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                        if state.tp_limit_balance_retries >= 10 {
                                             warn!(
                                                 "[IntervalSniper] TP limit failed {} times with balance/allowance error — attempting FOK market sell",
                                                 state.tp_limit_balance_retries
@@ -4730,6 +5027,7 @@ pub async fn run() -> Result<()> {
                                         warn!("[IntervalSniper] TP limit place failed: {}", msg);
                                     }
                                     }
+                                    } // end if allow_placement (throttle retries to every 500ms)
                                 }
                             }
                         }
