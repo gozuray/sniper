@@ -156,8 +156,11 @@ pub fn load_config() -> Result<Config> {
         stop_loss_quantity_percent: env_u32("MM_STOP_LOSS_QUANTITY_PERCENT", 100).clamp(1, 100)
             as u8,
         stop_loss_time_in_force: stop_loss_tif,
-        sl_fok_retry_delay_ms: env_u64("MM_SL_FOK_RETRY_DELAY_MS", 0).min(5000),
-        sl_fok_retry_backoff: env_bool("MM_SL_FOK_RETRY_BACKOFF", true),
+        sl_order_price_offset: {
+            let v = env_decimal("MM_SL_ORDER_PRICE_OFFSET", "0.05");
+            v.max(Decimal::from_str("0.01").unwrap_or(v))
+             .min(Decimal::from_str("0.10").unwrap_or(v))
+        },
         loop_ms,
         cooldown_between_orders_ms: cooldown_ms,
         no_window_all_intervals: env_bool("MM_NO_WINDOW_ALL_INTERVALS", true),
