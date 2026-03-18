@@ -2638,6 +2638,17 @@ pub async fn run() -> Result<()> {
                     state.allowance_cache = None;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
                     if let Some(ref btc) = state.btc_price {
+                        let (inicio, cierre) = {
+                            let s = btc.read().await;
+                            (s.candle_open_price, s.current_price)
+                        };
+                        if inicio > Decimal::ZERO && cierre > Decimal::ZERO {
+                            info!(
+                                "[IntervalSniper] BTC vela anterior: inicio {}  cierre {}",
+                                fmt_decimal_2(&inicio),
+                                fmt_decimal_2(&cierre)
+                            );
+                        }
                         crate::binance_ws::reset_candle_open(btc).await;
                     }
                     state.interval_min_bid_up = None;
@@ -2729,6 +2740,7 @@ pub async fn run() -> Result<()> {
         // market is already the clone from above; do not re-borrow state.market so clear_pending_gtc(&mut state) is allowed later
 
         // BTC dual exit: when pending_btc_dual_exit is set, sell via FAK when best_bid of position >= tp_price OR companion best_bid <= companion_tp_price (whichever first).
+        // Sell size = real-time balance from WS user (same as buy size) to avoid balance/size errors.
         if let Some(ref dual) = state.pending_btc_dual_exit {
             let up_bid = top
                 .token_id_up
@@ -2750,9 +2762,17 @@ pub async fn run() -> Result<()> {
                 } else {
                     round_to_tick(down_bid)
                 };
+                let available = get_available_for_sell(
+                    clob.as_ref().as_ref(),
+                    ws_user_ref,
+                    &dual.token_id,
+                    &mut state.allowance_cache,
+                    false,
+                )
+                .await;
                 let size_to_place = effective_sell_size(
                     dual.size.clone(),
-                    None,
+                    available,
                     CLOB_DEFAULT_MIN_ORDER_SIZE,
                 );
                 if size_to_place >= MIN_SELL_SIZE {
@@ -2767,13 +2787,13 @@ pub async fn run() -> Result<()> {
                     {
                         Ok(result) if result.success => {
                             info!(
-                                "[IntervalSniper] BTC dual exit FAK sell {} @ {} size={}",
+                                "[IntervalSniper] BTC dual exit FAK sell {} @ {} size={} (balance WS)",
                                 match dual.entry_side {
                                     EntrySide::Up => "Up",
                                     EntrySide::Down => "Down",
                                 },
                                 fmt_decimal_2(&sell_price),
-                                fmt_decimal_2(&dual.size)
+                                fmt_decimal_2(&size_to_place)
                             );
                             state.pending_btc_dual_exit = None;
                             state.pending_auto_sell = None;
@@ -5498,6 +5518,21 @@ pub async fn run() -> Result<()> {
                     );
                 }
                 if let Some((side, size_available, order_type, limit_price)) = entry {
+                    if state.config.btc_signal_enabled {
+                        if let Some(ref btc_guard) = state.btc_price {
+                            let btc = btc_guard.read().await;
+                            if btc.current_price > Decimal::ZERO {
+                                let ref_price = btc.current_price
+                                    / (Decimal::ONE + btc.pct_change / dec!(100));
+                                info!(
+                                    "[IntervalSniper] Momentum activado: BTC {}% (desde {} a {})",
+                                    fmt_decimal_2(&btc.pct_change),
+                                    fmt_decimal_2(&ref_price),
+                                    fmt_decimal_2(&btc.current_price)
+                                );
+                            }
+                        }
+                    }
                     let token_id = match side {
                         EntrySide::Up => &market.token_id_up,
                         EntrySide::Down => &market.token_id_down,

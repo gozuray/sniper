@@ -62,9 +62,12 @@ pub async fn start(
     state
 }
 
-/// Reset candle open price to current price (kept for compatibility; rolling window is the main source).
+/// Set candle_open_price to current price (for logging "inicio vela" at next interval switch).
 pub async fn reset_candle_open(state: &Arc<RwLock<BtcPriceState>>) {
-    let _ = state;
+    let mut s = state.write().await;
+    if s.current_price > Decimal::ZERO {
+        s.candle_open_price = s.current_price;
+    }
 }
 
 fn pct_to_direction(pct: Decimal, up_pct: Decimal, down_pct: Decimal) -> BtcDirection {
