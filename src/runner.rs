@@ -11,8 +11,8 @@ use crate::redeem;
 use crate::session_log::{ExitType, SessionLog};
 use crate::telegram_log::TelegramLog;
 use crate::types::{
-    Config, EntrySide, LastBuyOrder, PendingAutoSell, PendingStopLoss, ResolvedMarket, TopOfBook,
-    OrderStrategy, SellOrderTimeInForce,
+    BtcDirection, Config, EntrySide, LastBuyOrder, PendingAutoSell, PendingBtcDualExit,
+    PendingStopLoss, ResolvedMarket, TopOfBook, OrderStrategy, SellOrderTimeInForce,
 };
 use anyhow::Result;
 use ethers::signers::Signer;
@@ -227,6 +227,10 @@ struct RunnerState {
     telegram_handle: Option<tokio::task::JoinHandle<()>>,
     /// BUY place_limit_order returned Err (network); waiting for WS MATCHED to confirm fill before allowing new buys.
     pending_timeout_buy: Option<PendingTimeoutBuy>,
+    /// BTC price state from Binance AggTrade WS (when MM_BTC_SIGNAL_ENABLED).
+    btc_price: Option<Arc<tokio::sync::RwLock<crate::types::BtcPriceState>>>,
+    /// Dual exit for BTC momentum: sell when best_bid >= btc_tp_price or companion best_bid <= companion_tp_price (whichever first).
+    pending_btc_dual_exit: Option<PendingBtcDualExit>,
 }
 
 /// Parse balance from balance-allowance raw JSON; balance is in 6-decimal raw units (6620 = 0.00662 shares).
@@ -847,6 +851,30 @@ fn choose_side_by_bid(
     candidates.into_iter().next()
 }
 
+/// Momentum-only entry: no price-in-range check. Buy UP when direction is Up, DOWN when Down, if that side has liquidity.
+fn choose_side_momentum_only(
+    config: &Config,
+    book: &TopOfBook,
+    direction: BtcDirection,
+    min_order_size: Decimal,
+) -> Option<(EntrySide, Decimal, Decimal)> {
+    let up = book.token_id_up.as_ref()?;
+    let down = book.token_id_down.as_ref()?;
+    let up_ask = up.best_ask?;
+    let down_ask = down.best_ask?;
+    let up_size = up.best_ask_size.unwrap_or(Decimal::ZERO);
+    let down_size = down.best_ask_size.unwrap_or(Decimal::ZERO);
+    match direction {
+        BtcDirection::Up if config.allow_buy_up && up_size >= min_order_size => {
+            Some((EntrySide::Up, up_ask, up_size))
+        }
+        BtcDirection::Down if config.allow_buy_down && down_size >= min_order_size => {
+            Some((EntrySide::Down, down_ask, down_size))
+        }
+        _ => None,
+    }
+}
+
 /// Delay between redeem tx submissions to avoid RPC rate limit.
 const REDEEM_DELAY_BETWEEN_TXS_MS: u64 = 500;
 
@@ -1022,7 +1050,26 @@ pub async fn run() -> Result<()> {
         telegram: None,
         telegram_handle: None,
         pending_timeout_buy: None,
+        btc_price: None,
+        pending_btc_dual_exit: None,
     };
+
+    // BTC momentum signal: start Binance AggTrade WS when enabled (rolling window for % change).
+    if config.btc_signal_enabled {
+        state.btc_price = Some(
+            crate::binance_ws::start(
+                config.btc_momentum_window_sec,
+                config.btc_signal_ewma_alpha,
+                config.btc_up_signal_pct,
+                config.btc_down_signal_pct,
+            )
+            .await,
+        );
+        info!(
+            "[IntervalSniper] BTC momentum only — buy on signal, window={}s",
+            config.btc_momentum_window_sec
+        );
+    }
 
     // Telegram: background task sends logs; main loop only enqueues (try_send), so no delay.
     if config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some() {
@@ -1149,6 +1196,28 @@ pub async fn run() -> Result<()> {
                                 trigger_price: round_to_tick(state.config.stop_loss_price),
                                 placed_at_ms: now_ms_u,
                             });
+                            if state.config.btc_signal_enabled {
+                                let pas = state.pending_auto_sell.as_ref().unwrap();
+                                let buy = state.last_buy_order.as_ref().unwrap();
+                                let tp_price = round_to_tick(
+                                    (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                                );
+                                let companion_tp_price = round_to_tick(
+                                    (Decimal::ONE - tp_price).max(dec!(0.01)),
+                                );
+                                state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                    token_id: pas.token_id.clone(),
+                                    companion_token_id: if buy.side == EntrySide::Up {
+                                        market.token_id_down.clone()
+                                    } else {
+                                        market.token_id_up.clone()
+                                    },
+                                    entry_side: buy.side,
+                                    tp_price,
+                                    companion_tp_price,
+                                    size: pas.size.clone(),
+                                });
+                            }
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
@@ -1484,6 +1553,28 @@ pub async fn run() -> Result<()> {
                             trigger_price: round_to_tick(state.config.stop_loss_price),
                             placed_at_ms: sl_placed_at_ms,
                         });
+                        if state.config.btc_signal_enabled {
+                            let pas = state.pending_auto_sell.as_ref().unwrap();
+                            let buy = state.last_buy_order.as_ref().unwrap();
+                            let tp_price = round_to_tick(
+                                (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                            );
+                            let companion_tp_price = round_to_tick(
+                                (Decimal::ONE - tp_price).max(dec!(0.01)),
+                            );
+                            state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                token_id: pas.token_id.clone(),
+                                companion_token_id: if buy.side == EntrySide::Up {
+                                    market.token_id_down.clone()
+                                } else {
+                                    market.token_id_up.clone()
+                                },
+                                entry_side: buy.side,
+                                tp_price,
+                                companion_tp_price,
+                                size: pas.size.clone(),
+                            });
+                        }
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
@@ -1642,6 +1733,28 @@ pub async fn run() -> Result<()> {
                                 trigger_price: round_to_tick(state.config.stop_loss_price),
                                 placed_at_ms: sl_placed_at_ms,
                             });
+                            if state.config.btc_signal_enabled {
+                                let pas = state.pending_auto_sell.as_ref().unwrap();
+                                let buy = state.last_buy_order.as_ref().unwrap();
+                                let tp_price = round_to_tick(
+                                    (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                                );
+                                let companion_tp_price = round_to_tick(
+                                    (Decimal::ONE - tp_price).max(dec!(0.01)),
+                                );
+                                state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                    token_id: pas.token_id.clone(),
+                                    companion_token_id: if buy.side == EntrySide::Up {
+                                        market.token_id_down.clone()
+                                    } else {
+                                        market.token_id_up.clone()
+                                    },
+                                    entry_side: buy.side,
+                                    tp_price,
+                                    companion_tp_price,
+                                    size: pas.size.clone(),
+                                });
+                            }
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
@@ -1766,6 +1879,28 @@ pub async fn run() -> Result<()> {
                                     trigger_price: round_to_tick(state.config.stop_loss_price),
                                     placed_at_ms: now_ms_u,
                                 });
+                                if state.config.btc_signal_enabled {
+                                    let pas = state.pending_auto_sell.as_ref().unwrap();
+                                    let buy = state.last_buy_order.as_ref().unwrap();
+                                    let tp_price = round_to_tick(
+                                        (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                                    );
+                                    let companion_tp_price = round_to_tick(
+                                        (Decimal::ONE - tp_price).max(dec!(0.01)),
+                                    );
+                                    state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                        token_id: pas.token_id.clone(),
+                                        companion_token_id: if buy.side == EntrySide::Up {
+                                            market.token_id_down.clone()
+                                        } else {
+                                            market.token_id_up.clone()
+                                        },
+                                        entry_side: buy.side,
+                                        tp_price,
+                                        companion_tp_price,
+                                        size: pas.size.clone(),
+                                    });
+                                }
                                 state.allowance_cache = None;
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;
@@ -1914,6 +2049,28 @@ pub async fn run() -> Result<()> {
                             trigger_price: round_to_tick(state.config.stop_loss_price),
                             placed_at_ms: now_ms_u,
                         });
+                        if state.config.btc_signal_enabled {
+                            let pas = state.pending_auto_sell.as_ref().unwrap();
+                            let buy = state.last_buy_order.as_ref().unwrap();
+                            let tp_price = round_to_tick(
+                                (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                            );
+                            let companion_tp_price = round_to_tick(
+                                (Decimal::ONE - tp_price).max(dec!(0.01)),
+                            );
+                            state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                token_id: pas.token_id.clone(),
+                                companion_token_id: if buy.side == EntrySide::Up {
+                                    market.token_id_down.clone()
+                                } else {
+                                    market.token_id_up.clone()
+                                },
+                                entry_side: buy.side,
+                                tp_price,
+                                companion_tp_price,
+                                size: pas.size.clone(),
+                            });
+                        }
                         state.allowance_cache = None;
                         state.auto_sell_placed = false;
                         state.stop_loss_placed = false;
@@ -2029,6 +2186,28 @@ pub async fn run() -> Result<()> {
                                 trigger_price: round_to_tick(state.config.stop_loss_price),
                                 placed_at_ms: now_ms_u,
                             });
+                            if state.config.btc_signal_enabled {
+                                let pas = state.pending_auto_sell.as_ref().unwrap();
+                                let buy = state.last_buy_order.as_ref().unwrap();
+                                let tp_price = round_to_tick(
+                                    (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                                );
+                                let companion_tp_price = round_to_tick(
+                                    (Decimal::ONE - tp_price).max(dec!(0.01)),
+                                );
+                                state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                    token_id: pas.token_id.clone(),
+                                    companion_token_id: if buy.side == EntrySide::Up {
+                                        market.token_id_down.clone()
+                                    } else {
+                                        market.token_id_up.clone()
+                                    },
+                                    entry_side: buy.side,
+                                    tp_price,
+                                    companion_tp_price,
+                                    size: pas.size.clone(),
+                                });
+                            }
                             state.allowance_cache = None;
                             state.auto_sell_placed = false;
                             state.stop_loss_placed = false;
@@ -2455,8 +2634,12 @@ pub async fn run() -> Result<()> {
                     state.sl_fok_fail_count = 0;
                     state.sl_fok_cancel_done = false;
                     state.sl_triggered = false;
+                    state.pending_btc_dual_exit = None;
                     state.allowance_cache = None;
                     state.interval_switch_wall_time_ms = Some(now_ms_u);
+                    if let Some(ref btc) = state.btc_price {
+                        crate::binance_ws::reset_candle_open(btc).await;
+                    }
                     state.interval_min_bid_up = None;
                     state.interval_max_bid_up = None;
                     state.interval_min_bid_down = None;
@@ -2544,6 +2727,77 @@ pub async fn run() -> Result<()> {
         }
         update_interval_bids(&mut state, &token_id_up, &token_id_down, &top);
         // market is already the clone from above; do not re-borrow state.market so clear_pending_gtc(&mut state) is allowed later
+
+        // BTC dual exit: when pending_btc_dual_exit is set, sell via FAK when best_bid of position >= tp_price OR companion best_bid <= companion_tp_price (whichever first).
+        if let Some(ref dual) = state.pending_btc_dual_exit {
+            let up_bid = top
+                .token_id_up
+                .as_ref()
+                .and_then(|s| s.best_bid)
+                .unwrap_or(Decimal::ZERO);
+            let down_bid = top
+                .token_id_down
+                .as_ref()
+                .and_then(|s| s.best_bid)
+                .unwrap_or(Decimal::ZERO);
+            let trigger = match dual.entry_side {
+                EntrySide::Up => up_bid >= dual.tp_price || down_bid <= dual.companion_tp_price,
+                EntrySide::Down => down_bid >= dual.tp_price || up_bid <= dual.companion_tp_price,
+            };
+            if trigger {
+                let sell_price = if dual.entry_side == EntrySide::Up {
+                    round_to_tick(up_bid)
+                } else {
+                    round_to_tick(down_bid)
+                };
+                let size_to_place = effective_sell_size(
+                    dual.size.clone(),
+                    None,
+                    CLOB_DEFAULT_MIN_ORDER_SIZE,
+                );
+                if size_to_place >= MIN_SELL_SIZE {
+                    match clob
+                        .place_sell_order(
+                            &dual.token_id,
+                            sell_price,
+                            size_to_place,
+                            SellOrderTimeInForce::Fak,
+                        )
+                        .await
+                    {
+                        Ok(result) if result.success => {
+                            info!(
+                                "[IntervalSniper] BTC dual exit FAK sell {} @ {} size={}",
+                                match dual.entry_side {
+                                    EntrySide::Up => "Up",
+                                    EntrySide::Down => "Down",
+                                },
+                                fmt_decimal_2(&sell_price),
+                                fmt_decimal_2(&dual.size)
+                            );
+                            state.pending_btc_dual_exit = None;
+                            state.pending_auto_sell = None;
+                            state.pending_stop_loss = None;
+                            state.auto_sell_placed = true;
+                            state.stop_loss_placed = true;
+                            state.tp_limit_order_id = None;
+                            state.tp_placed_size = None;
+                            state.sl_limit_order_id = None;
+                            state.sl_limit_order_price = None;
+                            state.allowance_cache = None;
+                        }
+                        Ok(result) => {
+                            if let Some(ref msg) = result.error_msg {
+                                debug!("[IntervalSniper] BTC dual exit FAK sell failed: {}", msg);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("[IntervalSniper] BTC dual exit FAK sell error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
 
         // Periodic log: order book scan (real-time visibility) — debug only so terminal shows only buy/sell events
         if tick_count % LOG_BOOK_EVERY_TICKS == 0 {
@@ -5154,26 +5408,71 @@ pub async fn run() -> Result<()> {
 
             if in_window && can_buy_after_open && !in_blocked_zone {
                 let min_order_size = CLOB_DEFAULT_MIN_ORDER_SIZE;
-                // GtcResting: trigger when best_bid touches range; place GTC limit at max_buy_price + 1 tick.
-                // Gtc: trigger when best_ask in range; place GTC limit at min_buy_price.
-                // FokCrossSpread: trigger when best_ask in range; place FOK at exact price if min==max else best_ask + 1 tick (all-or-nothing).
-                // Otherwise (FakCrossSpread etc): trigger when best_ask in range; place FAK at best_ask + 1 tick (clamped to range).
-                let entry = match state.config.order_strategy {
-                    OrderStrategy::GtcResting => choose_side_by_bid(&state.config, &top, min_order_size)
-                        .map(|(side, _best_bid, size_available)| {
-                            let limit_price =
-                                round_to_tick(state.config.max_buy_price + TICK_SIZE);
-                            (side, size_available, OrderType::Gtc, limit_price)
-                        }),
-                    OrderStrategy::Gtc => choose_side(&state.config, &top, min_order_size)
-                        .map(|(side, _best_ask, size_available)| {
-                            let limit_price = round_to_tick(state.config.min_buy_price);
-                            (side, size_available, OrderType::Gtc, limit_price)
-                        }),
-                    OrderStrategy::FokCrossSpread => {
-                        let exact_price = state.config.min_buy_price == state.config.max_buy_price;
-                        choose_side(&state.config, &top, min_order_size).map(
+                let entry = if state.config.btc_signal_enabled {
+                    match &state.btc_price {
+                        Some(btc_guard) => {
+                            let btc = btc_guard.read().await;
+                            if now_ms_u.saturating_sub(btc.last_update_ms)
+                                > state.config.btc_signal_stale_ms
+                            {
+                                tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                                continue;
+                            }
+                            choose_side_momentum_only(
+                                &state.config,
+                                &top,
+                                btc.direction,
+                                min_order_size,
+                            )
+                            .map(|(side, best_ask, size_available)| {
+                                (
+                                    side,
+                                    size_available,
+                                    OrderType::Fak,
+                                    round_to_tick(best_ask + TICK_SIZE),
+                                )
+                            })
+                        }
+                        None => {
+                            tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    match state.config.order_strategy {
+                        OrderStrategy::GtcResting => choose_side_by_bid(&state.config, &top, min_order_size)
+                            .map(|(side, _best_bid, size_available)| {
+                                let limit_price =
+                                    round_to_tick(state.config.max_buy_price + TICK_SIZE);
+                                (side, size_available, OrderType::Gtc, limit_price)
+                            }),
+                        OrderStrategy::Gtc => choose_side(&state.config, &top, min_order_size)
+                            .map(|(side, _best_ask, size_available)| {
+                                let limit_price = round_to_tick(state.config.min_buy_price);
+                                (side, size_available, OrderType::Gtc, limit_price)
+                            }),
+                        OrderStrategy::FokCrossSpread => {
+                            let exact_price = state.config.min_buy_price == state.config.max_buy_price;
+                            choose_side(&state.config, &top, min_order_size).map(
+                                |(side, best_ask, size_available)| {
+                                    let limit_price = if exact_price {
+                                        round_to_tick(state.config.min_buy_price)
+                                    } else {
+                                        round_to_tick(
+                                            (best_ask + TICK_SIZE)
+                                                .max(state.config.min_buy_price)
+                                                .min(state.config.max_buy_price),
+                                        )
+                                        .max(best_ask)
+                                    };
+                                    (side, size_available, OrderType::Fok, limit_price)
+                                },
+                            )
+                        }
+                        _ => choose_side(&state.config, &top, min_order_size).map(
                             |(side, best_ask, size_available)| {
+                                let exact_price =
+                                    state.config.min_buy_price == state.config.max_buy_price;
                                 let limit_price = if exact_price {
                                     round_to_tick(state.config.min_buy_price)
                                 } else {
@@ -5184,27 +5483,10 @@ pub async fn run() -> Result<()> {
                                     )
                                     .max(best_ask)
                                 };
-                                (side, size_available, OrderType::Fok, limit_price)
+                                (side, size_available, OrderType::Fak, limit_price)
                             },
-                        )
+                        ),
                     }
-                    _ => choose_side(&state.config, &top, min_order_size).map(
-                        |(side, best_ask, size_available)| {
-                            let exact_price =
-                                state.config.min_buy_price == state.config.max_buy_price;
-                            let limit_price = if exact_price {
-                                round_to_tick(state.config.min_buy_price)
-                            } else {
-                                round_to_tick(
-                                    (best_ask + TICK_SIZE)
-                                        .max(state.config.min_buy_price)
-                                        .min(state.config.max_buy_price),
-                                )
-                                .max(best_ask)
-                            };
-                            (side, size_available, OrderType::Fak, limit_price)
-                        },
-                    ),
                 };
                 if entry.is_none()
                     && state.trades_this_interval == 1
@@ -5522,6 +5804,28 @@ pub async fn run() -> Result<()> {
                                     trigger_price,
                                     placed_at_ms: now_ms_u,
                                 });
+                                if state.config.btc_signal_enabled {
+                                    let pas = state.pending_auto_sell.as_ref().unwrap();
+                                    let buy = state.last_buy_order.as_ref().unwrap();
+                                    let tp_price = round_to_tick(
+                                        (buy.price + state.config.btc_tp_min_profit).min(dec!(0.99)),
+                                    );
+                                    let companion_tp_price = round_to_tick(
+                                        (Decimal::ONE - tp_price).max(dec!(0.01)),
+                                    );
+                                    state.pending_btc_dual_exit = Some(PendingBtcDualExit {
+                                        token_id: pas.token_id.clone(),
+                                        companion_token_id: if buy.side == EntrySide::Up {
+                                            market.token_id_down.clone()
+                                        } else {
+                                            market.token_id_up.clone()
+                                        },
+                                        entry_side: buy.side,
+                                        tp_price,
+                                        companion_tp_price,
+                                        size: pas.size.clone(),
+                                    });
+                                }
                                 state.allowance_cache = None;
                                 state.auto_sell_placed = false;
                                 state.stop_loss_placed = false;

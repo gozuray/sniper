@@ -1,6 +1,7 @@
 //! Interval Sniper (Rust): buy in range [min_buy_price, max_buy_price], sell on take profit and stop loss.
 //! Same logic as the TypeScript bot in src/bot/marketMaker/.
 
+mod binance_ws;
 mod clob;
 mod clob_ws_book;
 mod clob_ws_user;

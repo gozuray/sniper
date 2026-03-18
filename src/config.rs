@@ -186,5 +186,18 @@ pub fn load_config() -> Result<Config> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         telegram_msg_format: env_u32("TELEGRAM_MSG_FORMAT", 1).max(1).min(20) as u8,
+        btc_signal_enabled: env_bool("MM_BTC_SIGNAL_ENABLED", false),
+        btc_up_signal_pct: env_decimal("MM_BTC_UP_SIGNAL_PCT", "0.05"),
+        btc_down_signal_pct: env_decimal("MM_BTC_DOWN_SIGNAL_PCT", "0.05"),
+        btc_signal_stale_ms: env_u64("MM_BTC_SIGNAL_STALE_MS", 5000),
+        btc_signal_ewma_alpha: env("MM_BTC_SIGNAL_EWMA_ALPHA", "0.3")
+            .parse()
+            .unwrap_or(0.3f64)
+            .clamp(0.01, 1.0),
+        btc_signal_min_duration_ms: env_u64("MM_BTC_SIGNAL_MIN_DURATION_MS", 500),
+        btc_tp_price: normalize_price(env_decimal("MM_BTC_TP_PRICE", "0.94")),
+        btc_companion_tp_price: normalize_price(env_decimal("MM_BTC_COMPANION_TP_PRICE", "0.06")),
+        btc_momentum_window_sec: env_u64("MM_BTC_MOMENTUM_WINDOW_SEC", 60).max(5).min(300),
+        btc_tp_min_profit: normalize_price(env_decimal("MM_BTC_TP_MIN_PROFIT", "0.02")),
     })
 }

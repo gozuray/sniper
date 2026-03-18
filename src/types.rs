@@ -99,6 +99,22 @@ pub struct Config {
     pub telegram_chat_id: Option<String>,
     /// Telegram message format: 1–20 = same message body, title "Sniper N" (default 1).
     pub telegram_msg_format: u8,
+    // --- BTC momentum signal (Binance AggTrade)
+    pub btc_signal_enabled: bool,
+    pub btc_up_signal_pct: Decimal,
+    pub btc_down_signal_pct: Decimal,
+    pub btc_signal_stale_ms: u64,
+    pub btc_signal_ewma_alpha: f64,
+    #[allow(dead_code)]
+    pub btc_signal_min_duration_ms: u64,
+    #[allow(dead_code)]
+    pub btc_tp_price: Decimal,
+    #[allow(dead_code)]
+    pub btc_companion_tp_price: Decimal,
+    /// Rolling window in seconds for BTC % change (e.g. 60 = last 60 sec).
+    pub btc_momentum_window_sec: u64,
+    /// Minimum profit per share for dual exit (e.g. 0.02 → tp = entry + 0.02).
+    pub btc_tp_min_profit: Decimal,
 }
 
 /// Resolved market from Gamma API.
@@ -165,6 +181,38 @@ pub struct PendingStopLoss {
     pub size: Decimal,
     pub trigger_price: Decimal,
     pub placed_at_ms: u64,
+}
+
+/// BTC price direction from % change since candle open (for momentum signal gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtcDirection {
+    Up,
+    Down,
+    Neutral,
+}
+
+/// Live BTC price state from Binance AggTrade WS (EWMA price, % change, direction).
+#[derive(Debug, Clone)]
+pub struct BtcPriceState {
+    pub current_price: Decimal,
+    #[allow(dead_code)]
+    pub candle_open_price: Decimal,
+    pub pct_change: Decimal,
+    pub direction: BtcDirection,
+    pub last_update_ms: u64,
+}
+
+/// Dual exit for BTC momentum trades: sell when best_bid of bought token >= tp_price
+/// OR best_bid of companion token <= companion_tp_price (whichever first), via FAK.
+#[derive(Debug, Clone)]
+pub struct PendingBtcDualExit {
+    pub token_id: String,
+    #[allow(dead_code)]
+    pub companion_token_id: String,
+    pub entry_side: EntrySide,
+    pub tp_price: Decimal,
+    pub companion_tp_price: Decimal,
+    pub size: Decimal,
 }
 
 /// Order book from CLOB REST (raw).
