@@ -1273,7 +1273,7 @@ pub async fn run() -> Result<()> {
                                     "[IntervalSniper] network-error recovery: best_bid={} sl_trigger={} in_sl_zone={}",
                                     fmt_price(Some(&recovery_best_bid)), fmt_price(Some(&sl_trigger)), in_sl_zone
                                 );
-                                if in_sl_zone && state.config.enable_stop_loss {
+                                if in_sl_zone && state.config.enable_stop_loss && !state.config.btc_signal_enabled {
                                     // Price already in SL zone — place SL immediately (same logic as normal tick, FOK or GTC).
                                     state.allowance_cache = None;
                                     let sl_token = state.pending_stop_loss.as_ref().unwrap().token_id.clone();
@@ -2867,7 +2867,8 @@ pub async fn run() -> Result<()> {
         // Stop loss: limit-order style (like TP). When bid <= trigger + SL_TRIGGER_MARGIN, place GTC limit at best_bid
         // and keep trying every tick while in zone (no resting SL order). If bid drops before fill, cancel and replace.
         // Detect 100% fill via WS user. Use same `top` as main tick for consistent book and minimal latency (no extra WS/REST call).
-        if state.config.enable_stop_loss {
+        // When MM_BTC_SIGNAL_ENABLED (momentum mode), exit is handled only by pending_btc_dual_exit — do not use traditional SL.
+        if state.config.enable_stop_loss && !state.config.btc_signal_enabled {
             if let Some(ref sl) = state.pending_stop_loss.clone() {
                 if !state.stop_loss_placed {
                     let is_up = sl.token_id == market.token_id_up;
@@ -4027,11 +4028,16 @@ pub async fn run() -> Result<()> {
                         let mut tp_filled_this_iteration = false;
                         // 1) If we have a TP limit order resting: cancel when price drops below entry OR when in SL zone (best_bid <= SL trigger).
                         //    Same `top` as main tick is used for SL and TP so one consistent book view per tick (HFT).
-                        let in_sl_zone = state
-                            .pending_stop_loss
-                            .as_ref()
-                            .map(|sl| best_bid <= sl.trigger_price + SL_TRIGGER_MARGIN)
-                            .unwrap_or(false);
+                        //    When MM_BTC_SIGNAL_ENABLED (momentum), exit is only via pending_btc_dual_exit — do not cancel TP for "SL zone".
+                        let in_sl_zone = if state.config.btc_signal_enabled {
+                            false
+                        } else {
+                            state
+                                .pending_stop_loss
+                                .as_ref()
+                                .map(|sl| best_bid <= sl.trigger_price + SL_TRIGGER_MARGIN)
+                                .unwrap_or(false)
+                        };
                         let should_cancel_tp_below_level = best_bid < entry_price || in_sl_zone;
                         let tp_order_id = state.tp_limit_order_id.clone();
                         if let Some(ref oid) = tp_order_id {
@@ -5417,18 +5423,28 @@ pub async fn run() -> Result<()> {
             let sec_since_start = 300u64.saturating_sub(secs_to_close);
             let min_after_open = state.config.min_seconds_after_market_open.max(3);
             let can_buy_after_open = sec_since_start >= min_after_open as u64;
-            if let Some(switch_ms) = state.interval_switch_wall_time_ms {
-                let elapsed_ms = now_ms_u.saturating_sub(switch_ms);
-                if elapsed_ms < (min_after_open as u64) * 1000 {
-                    // Skip first N seconds after interval switch
-                    tokio::time::sleep(Duration::from_millis(loop_ms)).await;
-                    continue;
+            // When legacy mode: skip first N seconds after interval switch. When momentum: no delay — buy only on signal.
+            if !state.config.btc_signal_enabled {
+                if let Some(switch_ms) = state.interval_switch_wall_time_ms {
+                    let elapsed_ms = now_ms_u.saturating_sub(switch_ms);
+                    if elapsed_ms < (min_after_open as u64) * 1000 {
+                        tokio::time::sleep(Duration::from_millis(loop_ms)).await;
+                        continue;
+                    }
                 }
             }
 
-            if in_window && can_buy_after_open && !in_blocked_zone {
+            // When MM_BTC_SIGNAL_ENABLED (momentum): only allow buy when we have a valid BTC signal; do not use in_window/can_buy_after_open or order_strategy/min_buy_price/max_buy_price.
+            // When legacy: require in_window, can_buy_after_open, and use order_strategy + price-in-range.
+            let ok_to_try_buy = if state.config.btc_signal_enabled {
+                !in_blocked_zone
+            } else {
+                in_window && can_buy_after_open && !in_blocked_zone
+            };
+            if ok_to_try_buy {
                 let min_order_size = CLOB_DEFAULT_MIN_ORDER_SIZE;
                 let entry = if state.config.btc_signal_enabled {
+                    // Momentum-only: entry only from BTC signal. Never use order_strategy, min_buy_price, max_buy_price.
                     match &state.btc_price {
                         Some(btc_guard) => {
                             let btc = btc_guard.read().await;
@@ -5459,6 +5475,7 @@ pub async fn run() -> Result<()> {
                         }
                     }
                 } else {
+                    // Legacy: price-in-range [min_buy_price, max_buy_price] and order_strategy. Not used when btc_signal_enabled.
                     match state.config.order_strategy {
                         OrderStrategy::GtcResting => choose_side_by_bid(&state.config, &top, min_order_size)
                             .map(|(side, _best_bid, size_available)| {
@@ -5512,10 +5529,16 @@ pub async fn run() -> Result<()> {
                     && state.trades_this_interval == 1
                     && state.re_entry_allowed_after_sl
                 {
-                    debug!(
-                        "[IntervalSniper] Re-entry allowed after SL but price not in range (min_buy={} max_buy={}) — waiting for target",
-                        state.config.min_buy_price, state.config.max_buy_price
-                    );
+                    if state.config.btc_signal_enabled {
+                        debug!(
+                            "[IntervalSniper] Re-entry allowed after SL — waiting for momentum signal"
+                        );
+                    } else {
+                        debug!(
+                            "[IntervalSniper] Re-entry allowed after SL but price not in range (min_buy={} max_buy={}) — waiting for target",
+                            state.config.min_buy_price, state.config.max_buy_price
+                        );
+                    }
                 }
                 if let Some((side, size_available, order_type, limit_price)) = entry {
                     if state.config.btc_signal_enabled {
