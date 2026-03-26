@@ -1,37 +1,31 @@
 [package]
 name = "sniper"
-version = "0.1.0"
-edition = "2021"
-description = "Interval Sniper bot for Polymarket BTC/SOL 5m — buy in range, sell on TP/SL"
+version = "0.2.0"
+edition = "2024"
+description = "HFT momentum + RL bot for Polymarket BTC Up/Down 5m"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-dotenvy = "0.15"
-rust_decimal = { version = "1", features = ["serde"] }
-rust_decimal_macros = "1"
-chrono = "0.4"
-chrono-tz = "0.10"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "1"
-anyhow = "1"
-urlencoding = "2"
-async-trait = "0.1"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-futures-util = "0.3"
-
-# Live CLOB: EIP-712 order signing + HMAC L2 auth
-ethers = "2"
-base64 = "0.22"
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# ethers = { version = "2", features = ["abigen", "ws"] }  # optional for EIP-712 live orders
+anyhow = "1.0.102"
+futures-util = "0.3.32"
+polymarket-client-sdk = { version = "0.4.4", features = ["clob", "gamma", "ws"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# Process-wide TLS: rustls 0.23 requires a single CryptoProvider; `ring` matches typical reqwest builds.
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
+rust_decimal = { version = "1.40.0", features = ["serde"] }
+rust_decimal_macros = "1.40.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+rand = { version = "0.8", features = ["std_rng"] }
+thiserror = "1.0.69"
+toml = "0.8.23"
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7.18" }
+chrono = "0.4.44"
+chrono-tz = "0.10.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+urlencoding = "2.1.3"
 
 [[bin]]
 name = "sniper"

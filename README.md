@@ -1,15 +1,28 @@
-# Interval Sniper (Rust)
+# Momentum + RL Sniper (Polymarket BTC 5m)
 
-Same logic as the TypeScript Interval Sniper in `src/bot/marketMaker/`: **buy only when the best ask is in a configured range** `[min_buy_price, max_buy_price]`, **one buy per 5-minute interval**, and **sell on take profit and stop loss**.
+HFT momentum bot for Polymarket BTC Up/Down 5-minute markets, with optional
+reinforcement-learning (Q-learning) threshold tuning in paper mode.
 
-## Logic
+## How it works
 
-- **Market**: BTC or SOL 5-minute Up/Down (Polymarket). Slug: `btc-updown-5m-{interval_start_unix}` or `sol-updown-5m-{interval_start_unix}`.
-- **Entry**: Choose the side (Up or Down) with the **higher best ask** that is inside `[min_buy_price, max_buy_price]` and has enough liquidity. Place a single buy per interval (FAK cross-spread by default).
-- **Take profit**: After a fill, if `enable_auto_sell` is set, sell when `best_bid >= take_profit_price` (fixed price from config, or 0.99 if `auto_sell_at_max_price`).
-- **Stop loss**: If `enable_stop_loss` is set, sell when `best_bid <= stop_loss_price` (fixed price from config).
-
-No UI; run as a standalone binary.
+1. **CEX spot feeds** — Binance `aggTrade` and Coinbase `matches` WebSockets stream
+   real-time BTC prices into per-asset ring buffers.
+2. **Multi-venue anchor** — At each 5m interval open, REST calls to 7 exchanges
+   (Binance, Coinbase, Kraken, Bybit, OKX, Bitfinex, Bitstamp) produce a robust
+   reference price.
+3. **Momentum signal** — The percentage move from anchor to latest price is mapped
+   to a fair `P(Up)` via a logistic function, gated by volume and probability
+   thresholds.
+4. **Polymarket execution** — The bot resolves active BTC 5m slugs via the Gamma
+   API, reads best asks from the CLOB WebSocket orderbook, and enters when the
+   momentum-implied edge exceeds `edge_min`.
+5. **Optional arb** — When `YES + NO` ask sum is low enough, a delta-neutral
+   both-sides entry is placed.
+6. **Paper / Live** — `paper` mode simulates fills against the live orderbook;
+   `live` mode posts real orders via `polymarket-client-sdk` (EIP-712 auth).
+7. **RL tuning (paper only)** — When `[adaptive_paper.rl]` is enabled, a tabular
+   Q-learning agent adjusts momentum thresholds (`delta_up_pct`, `delta_down_pct`,
+   `edge_min`) each 5m interval, learning from PnL and TP/SL statistics.
 
 ## Build
 
@@ -19,56 +32,47 @@ cargo build --release
 
 ## Run
 
-Copy `.env.example` to `.env` and set at least:
-
-- **Gamma**: `POLYMARKET_REST_BASE` (e.g. `https://gamma-api.polymarket.com`)
-- **CLOB** (for order book; required for live orders): `POLYMARKET_CLOB_HOST` (e.g. `https://clob.polymarket.com`)
-- **Interval Sniper**: `MM_DRY_RUN=true` (recommended first), `MM_SIZE_SHARES`, `MM_MIN_BUY_PRICE`, `MM_MAX_BUY_PRICE`, `MM_ENABLE_AUTO_SELL`, `MM_TAKE_PROFIT_PRICE`, `MM_ENABLE_STOP_LOSS`, `MM_STOP_LOSS_PRICE`, etc.
-
-Then:
-
 ```bash
-cargo run
-# or
-./target/release/sniper
+cp config.example.toml config.toml   # edit with your settings
+cargo run --release -- config.toml
 ```
 
-## Environment variables
+If you omit the argument, the binary defaults to `config.toml` in the current
+working directory.
 
-Compatible with the TypeScript bot `MM_*` and `INTERVAL_SNIPER_*` names:
+## Configuration
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `INTERVAL_SNIPER_MARKET` | `btc_5m` or `sol_5m` | `btc_5m` |
-| `MM_MARKET_SLUG` | Override slug (empty = current 5m) | (dynamic) |
-| `MM_SIZE_SHARES` | Max shares to buy per interval | `5` |
-| `MM_MIN_BUY_PRICE` | Min ask price to buy (0–1) | `0.9` |
-| `MM_MAX_BUY_PRICE` | Max ask price to buy (0–1) | `0.95` |
-| `MM_ALLOW_BUY_UP` / `MM_ALLOW_BUY_DOWN` | Allow buying Up/Down | `true` |
-| `MM_SECONDS_BEFORE_CLOSE` | Only act when seconds to close ≤ this | `20` |
-| `MM_NO_WINDOW_ALL_INTERVALS` | If true, act all interval | `true` |
-| `MM_MIN_SECONDS_AFTER_MARKET_OPEN` | No buy in first N seconds | `0` |
-| `MM_DRY_RUN` | If true, no real orders | `true` |
-| `MM_ENABLE_AUTO_SELL` | Enable take profit | `true` |
-| `MM_TAKE_PROFIT_PRICE` | TP: sell when best_bid ≥ this (0–1) | `0.97` |
-| `MM_ENABLE_STOP_LOSS` | Enable stop loss | `true` |
-| `MM_STOP_LOSS_PRICE` | SL: sell when best_bid ≤ this (0–1) | `0.90` |
-| `MM_LOOP_MS` | Loop interval (ms) | `100` |
+All settings live in `config.toml`. See `config.example.toml` for the full
+reference with comments.
 
-CLOB/Gamma (same as main polybot): `POLYMARKET_CLOB_HOST` (or `POLYMARKET_CLOB_URL`), `POLYMARKET_REST_BASE`. For **live orders** set `MM_DRY_RUN=false` and:
+| Section | Purpose |
+|---------|---------|
+| `mode` | `paper` or `live` |
+| `[paper]` | Virtual USDC balance for paper trading |
+| `[momentum]` | Window, delta thresholds, volume gate, probability scale |
+| `[trading]` | Edge min, tick rate, TP/SL, TIF, spread/staleness guards |
+| `[risk]` | Per-trade sizing, daily drawdown, kill switch |
+| `[adaptive_paper]` | Interval reports, lag logging, heuristic threshold tuning |
+| `[adaptive_paper.rl]` | Q-learning agent hyperparameters |
 
-- `PRIVATE_KEY` or `POLYMARKET_PRIVATE_KEY` — wallet private key (hex, with or without `0x`)
-- `API_KEY`, `SECRET`, `PASSPHRASE` — CLOB API credentials (from Polymarket L1 derive)
-- `POLYMARKET_CHAIN_ID` — e.g. `137` (Polygon)
-- `FUNDER_ADDRESS` — address that holds funds (proxy/Safe); defaults to signer if unset
-- `SIGNATURE_TYPE` — `0` EOA, `1` POLY_PROXY, `2` GNOSIS_SAFE (default `2`)
-- `MM_NEG_RISK` — `true` for multi-outcome (neg-risk) markets; default `false` for BTC/SOL 5m
+### Environment variables (optional)
 
-## Live orders
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SNIPER_LOG` | `sniper.log` | Log file path |
+| `RUST_LOG` | unset → `warn,sniper=info` | Quiets non-bot crates; sniper stays at `info`. Momentum diagnostics: e.g. `RUST_LOG=sniper::strategy::momentum=trace,sniper=info` |
 
-**Live order placement is implemented** in this Rust binary: EIP-712 order signing and HMAC L2 auth for the Polymarket CLOB. Set `MM_DRY_RUN=false` and configure `PRIVATE_KEY` (or `POLYMARKET_PRIVATE_KEY`), `API_KEY`, `SECRET`, `PASSPHRASE`, and optionally `FUNDER_ADDRESS` and `SIGNATURE_TYPE`. Use **`MM_DRY_RUN=true`** to run in simulation without sending real orders.
+## Live trading
 
-## Reference
+Provide in `config.toml`:
 
-- TypeScript implementation: `../src/bot/marketMaker/`
-- Spec (HFT-style): `../docs/INTERVAL_SNIPER_RUST_HFT.md`
+- `private_key_polygon` — Polygon wallet private key hex
+- `signature_type` — `eoa`, `proxy`, or `gnosissafe`
+- `starting_balance_usdc` — Required in live mode
+
+## VPS / latency tips
+
+1. Run on a low-latency VPS near Polymarket / CEX routing.
+2. Start in `paper` mode; switch to `live` once fills behave as expected.
+3. Key tuning knobs: `momentum.window_sec`, `trading.tick_ms`,
+   `trading.edge_min`, `momentum.delta_up_pct` / `delta_down_pct`.

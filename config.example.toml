@@ -1,0 +1,133 @@
+mode = "paper"
+signature_type = "eoa"
+
+[paper]
+balance_usdc = 10000
+
+# Paper-only: métricas por franja 5m, lag libro vs CEX, tuning de umbrales momentum.
+# [adaptive_paper]
+# enabled = true
+# report_dir = "paper_reports"
+# analysis_jsonl = true
+# analysis_tick_ms = 1000
+# lag_signal_min_ms = 50
+# lag_signal_max_ms = 800
+# ~$3.5 en 1 s a BTC≈$70k; alinea el umbral con spikes cortos (~460ms) de aggTrade.
+# impulse_min_pct = "0.00005"
+# Ventana hacia atrás para medir impulso (era 3000ms; 1000ms captura el impulso real del burst).
+# impulse_window_ms = 1000
+# tune_every_n_intervals = 4
+# low_activity_trade_ceiling = 1
+# delta_tune_step = "0.0002"
+# delta_min_pct = "0.0005"
+# delta_max_pct = "0.01"
+# Q-learning **cada intervalo 5m** en paper (sustituye tuning heurístico por ventana). Requiere adaptive + mode paper.
+#
+# Esquema persistido: **Q-table v3** → 729 estados (3⁶) × 13 acciones. Buckets: actividad, TP rate, PnL intervalo,
+# spread medio, p_strong medio, racha SL (0 / 1 / 2+). Si `persist_path` tiene un JSON de tamaño distinto (v2 u otro),
+# **no se carga** y empieza con Q en cero; borra el fichero o usa otro `persist_path`.
+#
+# Límites que aplica el bandit (ver `src/rl/mod.rs::apply_action` + clamp en paper_lab):
+#   prob_scale         → [100.0, 500.0]  (acciones ±25.0)
+#   min_taker_imbalance → [0.0, 0.40] (acciones ±0.05)
+#   take_profit_ticks   → 0.01…0.08 USDC por tick de 1¢ (1…8 ticks si TP en saltos de 0.01)
+#   stop_loss_ticks     → 0.01…0.10 idem (1…10 ticks)
+#   sl_cooldown_ms      → [500, 30_000] tras aplicar RL; desde el 2.º SL consecutivo (sin TP/settle intermedio) +2000 ms/hasta techo.
+#
+# Para atribuir PnL a la última acción RL, activa `trades_jsonl_path`; cada línea incluye `entry_diag.rl_action_applied`.
+#
+# Log: rl_interval.jsonl (schema `sniper.rl_interval.v3`) + rl_interval.csv bajo report_dir.
+# [adaptive_paper.rl]
+# enabled = true
+# alpha = 0.18
+# gamma = 0.92
+# epsilon = 0.18
+# epsilon_min = 0.04
+# epsilon_decay = 0.998
+# persist_path = "rl_qtable.json"
+# interval_step_fraction = 0.42
+# pnl_reward_divisor = 12.0
+# log_interval_jsonl = true
+# interval_log_jsonl_path = "rl_interval.jsonl"
+# log_interval_csv = true
+# interval_log_csv_path = "rl_interval.csv"
+
+[momentum]
+# Rolling window in seconds (3–10). Price AND volume both measured over this window.
+window_sec = 5
+# Dollar-based delta thresholds (recommended). Overrides delta_*_pct when present.
+# Adapts automatically as BTC price changes. Raise to reduce noise, lower for more signals.
+# Examples at BTC≈$70k: $50→0.071%, $100→0.141%, $20→0.028%
+delta_up_usd = "20"
+delta_down_usd = "20"
+# Pct fallback (only used when delta_*_usd is commented/removed).
+delta_up_pct = "0.001"
+delta_down_pct = "0.001"
+min_quote_volume_window = "500"
+# prob_scale: logistic p = 1/(1+exp(-scale*|pct|)). RL ajusta en [100,500] ±25.
+# Scale=700, $20 on BTC≈$71k → |Δ|≈0.028% → p≈0.55 (logistic).
+prob_scale = 700.0
+strong_prob_threshold = 0.53
+# min_taker_imbalance ∈ [0,0.40] vía RL. 0.05 ≈ 52.5% neto a favor en una dirección (era 0.10).
+# BTC suele impulsar en ráfagas cortas, no con presión sostenida 60/40.
+min_taker_imbalance = 0.05
+
+[trading]
+edge_min = "0.03"
+yes_no_arb_enabled = false
+arb_yes_no_sum_max = "0.99"
+post_only = false
+entry_limit_slippage_bps = "1"
+cancel_if_unfilled_ms = 2000
+tick_ms = 1
+max_positions_per_market = 3
+entry_cooldown_ms = 10000
+# Tras un SL, espera extra antes de re-entrar en el mismo mercado (omitir = sin extra).
+# sl_cooldown_ms = 8000
+# Una línea JSON por trade al cerrar (TP/SL/settle); path relativo al cwd o absoluto.
+# Recomendado si usas RL: incluye `entry_diag.rl_action_applied` para acoplar reward ↔ acción.
+# trades_jsonl_path = "paper_reports/trades.jsonl"
+# Sell when best bid >= entry + this (0.02 = 2¢). Omit or null to disable.
+take_profit_ticks = "0.02"
+# Opcional: cierra si el bid cae esta cantidad bajo el precio de entrada (misma unidad que TP).
+# stop_loss_ticks = "0.03"
+# stop_loss_time_in_force = "fak"
+# Live: "fak" (default) momentum/latency; "fok" arb tamaño fijo; "gtc" + post_only = maker.
+entry_time_in_force = "fak"
+take_profit_time_in_force = "fak"
+# Max orderbook WS age (ms); skip signals/exits if stale. None = disabled.
+# max_book_staleness_ms = 3000
+# Max spread (ask − bid) outcome price units; skip entry if wider. None = disabled.
+max_spread_ticks = "0.05"
+# Min seconds left in interval to allow new entries (default 60).
+# min_time_remaining_sec = 60
+# Trailing SL: sell if bid <= high_water_mark − this. None = fixed SL only.
+# trailing_stop_loss_ticks = "0.02"
+# Cap entry size to ratio × best_ask_size (default 1.0).
+# max_size_to_ask_ratio = "1.0"
+# Timeout (ms) for un-filled TP/SL exit orders before clearing and retrying (default 15000).
+# exit_order_timeout_ms = 15000
+
+# Kraken / Bybit / OKX / Bitfinex / Bitstamp: solo precio ancla REST al inicio de franja.
+# Momentum en vivo: **Binance + Coinbase** (WebSocket). `consensus` exige que ambos pasen filtros con la misma dirección.
+# Usa `binance` solo mientras bootstrappeas datos; `consensus` cuando quieras ambos CEX.
+[cex]
+mode = "auto"
+max_feed_staleness_ms = 1500
+# primary | consensus
+momentum_policy = "binance"
+
+[risk]
+risk_per_trade_frac = "0.02"
+daily_drawdown_frac = "0.08"
+kill_switch_enabled = true
+
+# Optional discovery settings:
+only_active_markets = true
+subscription_horizon_intervals = 2
+
+# Solo BTC 5m en Polymarket; otros símbolos en la lista se ignoran.
+assets = ["BTC"]
+
+# Live mode only:
+# private_key_polygon = "0xYOUR_PRIVATE_KEY_HEX"

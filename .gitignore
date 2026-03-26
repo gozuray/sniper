@@ -4,15 +4,28 @@ target/
 # env
 .env
 
-# logs
+# config (secrets / local tuning)
+config.toml
+sniper.log
+
+# logs & reports
 logs/
+paper_reports/
 *.jsonl
 *.csv
 
+# Node (not used)
+node_modules/
+package.json
+package-lock.json
+
 # IDE
 .vscode/
-TP_HFT_analysis.md
+
 # OS
 .DS_Store
 Thumbs.db
+
+# misc
 .claude/
+TP_HFT_analysis.md
