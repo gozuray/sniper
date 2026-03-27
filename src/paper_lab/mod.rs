@@ -1,7 +1,12 @@
 //! Paper mode: métricas por intervalo, log de lag CEX vs libro, ajuste suave de umbrales de momentum.
 
+mod tp_timing;
+
 use crate::config::{AdaptivePaperConfig, MomentumConfig, Mode, TradingConfig};
+use crate::config_writeback::{self, TunedParams};
 use crate::rl::{DeltaQAgent, RlTuningState};
+use crate::types::{Position, Signal};
+use tp_timing::TpTimingStore;
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -28,6 +33,8 @@ struct IntervalAgg {
     /// Suma de `p_strong` al entrar (solo momentum paper).
     p_strong_sum: f64,
     p_strong_n: u32,
+    /// Trades que no alcanzaron TP dentro de la ventana adaptativa (`profit_window`).
+    profit_deadline_misses: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,15 +76,29 @@ pub struct PaperLab {
     last_analysis_ms: AtomicU64,
     /// Q-learning en paper (opcional); excluyente con la rama heurística en `maybe_tune`.
     rl: Option<Mutex<DeltaQAgent>>,
+    /// EMA tiempo→TP por bucket de `p_strong` (opcional).
+    tp_timing: Option<Mutex<TpTimingStore>>,
+    /// Ruta al `config.toml` para writeback RL (si `writeback_config = true`).
+    config_path: Option<PathBuf>,
 }
 
 impl PaperLab {
-    pub fn new(cfg: AdaptivePaperConfig) -> Result<Arc<Self>> {
+    pub fn new(cfg: AdaptivePaperConfig, config_path: Option<PathBuf>) -> Result<Arc<Self>> {
         let report_dir = PathBuf::from(cfg.report_dir.trim());
         fs::create_dir_all(&report_dir).with_context(|| format!("crear {}", report_dir.display()))?;
         let rl = match cfg.rl.as_ref() {
             Some(rlc) if rlc.enabled => Some(Mutex::new(DeltaQAgent::new(&cfg, rlc.clone())?)),
             _ => None,
+        };
+        let tp_timing = if cfg.profit_window.enabled {
+            let path = if Path::new(cfg.profit_window.persist_path.trim()).is_absolute() {
+                PathBuf::from(cfg.profit_window.persist_path.trim())
+            } else {
+                report_dir.join(cfg.profit_window.persist_path.trim())
+            };
+            Some(Mutex::new(TpTimingStore::load_or_new(path, cfg.profit_window.ema_alpha)?))
+        } else {
+            None
         };
         Ok(Arc::new(Self {
             report_dir,
@@ -100,7 +121,94 @@ impl PaperLab {
             }),
             last_analysis_ms: AtomicU64::new(0),
             rl,
+            tp_timing,
+            config_path,
         }))
+    }
+
+    #[inline]
+    pub fn profit_window_enabled(&self) -> bool {
+        self.cfg.profit_window.enabled
+    }
+
+    /// Fija `tp_profit_deadline_ms` en la posición momentum (tras el primer fill). `take_profit_ticks`: efectivo OrderManager.
+    pub fn apply_profit_deadline_to_position(
+        &self,
+        pos: &mut Position,
+        take_profit_ticks: Option<Decimal>,
+        strong_threshold: f64,
+    ) {
+        if !self.cfg.profit_window.enabled {
+            return;
+        }
+        if !matches!(pos.kind, Signal::Momentum { .. }) {
+            return;
+        }
+        let Some(tp) = take_profit_ticks else {
+            return;
+        };
+        if tp.is_zero() {
+            return;
+        }
+        let Some(fill_ms) = pos.entry_fill_ms else {
+            return;
+        };
+        if let Some(deadline) =
+            self.abs_profit_deadline_from_entry(pos.entry_diag.p_strong, fill_ms, strong_threshold)
+        {
+            pos.tp_profit_deadline_ms = Some(deadline);
+        }
+    }
+
+    /// `None` si `profit_window` desactivado o mutex roto.
+    pub fn abs_profit_deadline_from_entry(&self, p_strong: f64, entry_ms: u64, strong_threshold: f64) -> Option<u64> {
+        if !self.cfg.profit_window.enabled {
+            return None;
+        }
+        let pw = &self.cfg.profit_window;
+        let mtx = self.tp_timing.as_ref()?;
+        let wait = {
+            let s = mtx.lock().ok()?;
+            s.allowed_wait_ms(
+                p_strong,
+                strong_threshold,
+                pw.weak_time_factor,
+                pw.strong_time_factor,
+                pw.default_expect_ms,
+                pw.min_ms,
+                pw.max_ms,
+            )
+        };
+        Some(entry_ms.saturating_add(wait))
+    }
+
+    pub fn on_closed_take_profit_timing(&self, p_strong: f64, entry_fill_ms: Option<u64>, exit_ms: u64) {
+        if !self.cfg.profit_window.enabled {
+            return;
+        }
+        let Some(mtx) = self.tp_timing.as_ref() else {
+            return;
+        };
+        let Some(entry) = entry_fill_ms else {
+            return;
+        };
+        let dt = exit_ms.saturating_sub(entry);
+        if dt < 1 {
+            return;
+        }
+        if let Ok(mut store) = mtx.lock() {
+            if let Err(e) = store.record_success(p_strong, dt) {
+                tracing::warn!(target: "sniper", error = %e, "profit_window · persist EMA tiempo→TP falló");
+            }
+        }
+    }
+
+    pub fn record_profit_deadline_miss(&self, interval_start_unix: u64) {
+        let mut g = self.current.lock().expect("paper_lab current");
+        if g.interval_start_unix != interval_start_unix {
+            return;
+        }
+        g.profit_deadline_misses = g.profit_deadline_misses.saturating_add(1);
     }
 
     /// Llamar **antes** de cambiar `last_logged_btc_5m_start` al nuevo intervalo.
@@ -124,6 +232,7 @@ impl PaperLab {
             spread_samples: 0,
             p_strong_sum: 0.0,
             p_strong_n: 0,
+            profit_deadline_misses: 0,
         };
     }
 
@@ -149,6 +258,7 @@ impl PaperLab {
             pnl_realized_in_interval_usdc: String,
             momentum_delta_up_pct: String,
             momentum_delta_down_pct: String,
+            profit_deadline_misses: u32,
             note: &'a str,
         }
 
@@ -169,7 +279,8 @@ impl PaperLab {
             pnl_realized_in_interval_usdc: agg.pnl_usdc.to_string(),
             momentum_delta_up_pct: adap.delta_up_pct.to_string(),
             momentum_delta_down_pct: adap.delta_down_pct.to_string(),
-            note: "tp = TP ganador; stop_loss = salida por bid bajo umbral; settle = fin de intervalo sin TP/SL",
+            profit_deadline_misses: agg.profit_deadline_misses,
+            note: "tp = TP ganador; stop_loss = salida por bid bajo umbral; settle = fin de intervalo sin TP/SL; profit_deadline_misses = no alcanzó TP en ventana adaptativa estando ≥ entrada",
         };
 
         let path = self
@@ -185,6 +296,7 @@ impl PaperLab {
             tp_hits = agg.take_profit_hits,
             sl_hits = agg.stop_loss_hits,
             settle_no_tp = agg.settles_without_tp,
+            profit_deadline_misses = agg.profit_deadline_misses,
             tp_rate = format!("{tp_rate:.2}"),
             pnl = %agg.pnl_usdc,
             "paper_lab · reporte de intervalo"
@@ -256,6 +368,11 @@ impl PaperLab {
             avg_p_strong,
             streak,
         );
+        let miss_pen = if self.cfg.profit_window.enabled {
+            agg.profit_deadline_misses as f64 * self.cfg.profit_window.rl_penalty_per_miss
+        } else {
+            0.0
+        };
         let r = DeltaQAgent::reward_interval_profit_max(
             agg.pnl_usdc,
             agg.take_profit_hits,
@@ -263,6 +380,8 @@ impl PaperLab {
             agg.settles_without_tp,
             agg.trades_opened,
             rlc.pnl_reward_divisor,
+            agg.profit_deadline_misses,
+            self.cfg.profit_window.rl_penalty_per_miss,
         );
 
         let mut rl = rl_mtx.lock().expect("rl agent");
@@ -354,6 +473,8 @@ impl PaperLab {
                 "avg_p_strong_at_entry": avg_p_strong,
                 "avg_spread": avg_spread,
                 "reward": r,
+                "profit_deadline_misses": agg.profit_deadline_misses,
+                "profit_window_miss_penalty_applied": miss_pen,
                 "objective": "maximize_pnl_usdc_primary",
                 "action": action,
                 "action_name": DeltaQAgent::action_label(action),
@@ -500,6 +621,23 @@ impl PaperLab {
             "rl · intervalo · Q-learn (rentabilidad)"
         );
 
+        if self.cfg.writeback_config {
+            if let Some(ref path) = self.config_path {
+                let params = TunedParams {
+                    delta_up_pct: st.delta_up_pct,
+                    delta_down_pct: st.delta_down_pct,
+                    edge_min: st.edge_min,
+                    prob_scale: st.prob_scale,
+                    min_taker_imbalance: st.min_taker_imbalance,
+                    take_profit_ticks: st.take_profit_ticks,
+                    stop_loss_ticks: st.stop_loss_ticks,
+                };
+                if let Err(e) = config_writeback::writeback_config(path, &params) {
+                    tracing::warn!(target: "sniper", error = %e, "config_writeback falló");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -572,11 +710,14 @@ impl PaperLab {
     }
 
     /// Clonar `MomentumConfig` sustituyendo deltas, `prob_scale` y `min_taker_imbalance` afinados.
+    /// USD overrides se desactivan: el RL trabaja en pct y esos valores deben mandar.
     pub fn effective_momentum(&self, base: &MomentumConfig) -> MomentumConfig {
         let adap = self.adaptive.lock().expect("paper_lab adaptive");
         let mut m = base.clone();
         m.delta_up_pct = adap.delta_up_pct;
         m.delta_down_pct = adap.delta_down_pct;
+        m.delta_up_usd = None;
+        m.delta_down_usd = None;
         m.min_taker_imbalance = adap.min_taker_imbalance;
         m.prob_scale = adap.prob_scale;
         m

@@ -308,6 +308,12 @@ pub struct Position {
     pub close_time_unix: u64,
     #[allow(dead_code)]
     pub created_at_ms: u64,
+    /// Primer fill de entrada (ms); necesario para ventana de TP adaptativa (`profit_window`).
+    pub entry_fill_ms: Option<u64>,
+    /// Plazo absoluto (ms) para haber alcanzado el nivel de TP; solo paper + `profit_window`.
+    pub tp_profit_deadline_ms: Option<u64>,
+    /// Evita contar dos veces la violación de plazo por trade.
+    pub profit_deadline_violation_logged: bool,
     pub kind: Signal,
     #[allow(dead_code)]
     pub entry_diag: TradeEntryDiag,

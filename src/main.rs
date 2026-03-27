@@ -1,4 +1,5 @@
 mod config;
+mod config_writeback;
 mod cex;
 mod execution;
 mod paper_lab;
@@ -656,7 +657,12 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .expect("should_run_adaptive implies adaptive_paper")
             .clone();
-        let lab = PaperLab::new(ap)?;
+        let wb_path = if ap.writeback_config {
+            Some(std::path::PathBuf::from(&cfg_path))
+        } else {
+            None
+        };
+        let lab = PaperLab::new(ap, wb_path)?;
         lab.bootstrap_adaptive_from_config(&cfg.momentum, &cfg.trading);
         if let Some(m) = boot_active_m {
             lab.rotate_interval(None, m.interval_start_unix, &m.slug);

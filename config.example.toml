@@ -21,6 +21,24 @@ balance_usdc = 10000
 # delta_tune_step = "0.0002"
 # delta_min_pct = "0.0005"
 # delta_max_pct = "0.01"
+# Tras cada paso RL, reescribir config.toml con los parámetros optimizados (backup automático en .bak.toml).
+# writeback_config = true
+#
+# Ventana de tiempo hasta TP (paper + adaptive): aprende por bucket de p_strong cuánto tardas en ver TP en bid;
+# señal más fuerte → más ms permitidos; más débil → menos. Si pasado el plazo bid ≥ entrada pero < entry+TP,
+# cuenta `profit_deadline_misses` y resta `rl_penalty_per_miss` al reward del RL (si está activo).
+# Persistencia: `report_dir/tp_timing_stats.json`.
+# [adaptive_paper.profit_window]
+# enabled = true
+# min_ms = 10000
+# max_ms = 180000
+# weak_time_factor = 0.62
+# strong_time_factor = 1.42
+# ema_alpha = 0.22
+# default_expect_ms = 45000
+# rl_penalty_per_miss = 0.32
+# persist_path = "tp_timing_stats.json"
+#
 # Q-learning **cada intervalo 5m** en paper (sustituye tuning heurístico por ventana). Requiere adaptive + mode paper.
 #
 # Esquema persistido: **Q-table v3** → 729 estados (3⁶) × 13 acciones. Buckets: actividad, TP rate, PnL intervalo,

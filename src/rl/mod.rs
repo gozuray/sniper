@@ -200,6 +200,8 @@ impl DeltaQAgent {
         settles: u32,
         trades_opened: u32,
         pnl_divisor: f64,
+        profit_deadline_misses: u32,
+        deadline_miss_penalty_each: f64,
     ) -> f64 {
         let closed = tp_hits.saturating_add(sl_hits).saturating_add(settles);
         let p = pnl.to_f64().unwrap_or(0.0);
@@ -211,7 +213,13 @@ impl DeltaQAgent {
             0.0
         };
         let idle = if trades_opened == 0 { -0.07 } else { 0.0 };
-        2.4 * pnl_r + 0.52 * (2.0 * tp_r - 1.0) - 0.52 * sl_hits as f64 - 0.15 * settles as f64 + idle
+        let base = 2.4 * pnl_r
+            + 0.52 * (2.0 * tp_r - 1.0)
+            - 0.52 * sl_hits as f64
+            - 0.15 * settles as f64
+            + idle;
+        let miss = profit_deadline_misses as f64 * deadline_miss_penalty_each.max(0.0);
+        base - miss
     }
 
     fn q_get(&self, s: usize, a: usize) -> f64 {

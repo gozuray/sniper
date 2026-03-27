@@ -257,6 +257,86 @@ pub struct AdaptivePaperConfig {
     /// Q-learning (solo paper + adaptive): ajusta `delta_*` aprendiendo de PnL / TP / SL por ventana.
     #[serde(default)]
     pub rl: Option<RlTuneConfig>,
+    /// Ventana de tiempo hasta TP esperada (EMA por bucket `p_strong`), penalización si no se cumple.
+    #[serde(default)]
+    pub profit_window: ProfitWindowConfig,
+    /// Si true, re-escribe `config.toml` con los parámetros RL tras cada paso (backup automático `.bak.toml`).
+    #[serde(default = "default_writeback_config")]
+    pub writeback_config: bool,
+}
+
+fn default_writeback_config() -> bool {
+    false
+}
+
+/// Meta de tiempo hasta alcanzar take-profit; aprende con cada TP cerrado (paper + adaptive).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProfitWindowConfig {
+    /// Requiere `adaptive_paper.enabled` y `mode = paper`.
+    pub enabled: bool,
+    pub min_ms: u64,
+    pub max_ms: u64,
+    /// Factor sobre la EMA cuando `p_strong` está en el suelo del umbral (<1 = exige TP más rápido).
+    pub weak_time_factor: f64,
+    /// Factor cuando `p_strong` es alto (>1 = más margen temporal).
+    pub strong_time_factor: f64,
+    /// Peso del nuevo sample en la EMA (0,1].
+    pub ema_alpha: f64,
+    /// Si aún no hay muestras en el bucket, usar esta espera base (ms).
+    pub default_expect_ms: u64,
+    /// Se resta de la recompensa RL por cada trade que viola la ventana (sin llegar a TP a tiempo).
+    pub rl_penalty_per_miss: f64,
+    /// Archivo JSON bajo `report_dir` (mismo esquema de rutas que `rl_qtable.json`).
+    pub persist_path: String,
+}
+
+impl Default for ProfitWindowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_ms: default_pw_min_ms(),
+            max_ms: default_pw_max_ms(),
+            weak_time_factor: default_pw_weak_factor(),
+            strong_time_factor: default_pw_strong_factor(),
+            ema_alpha: default_pw_ema_alpha(),
+            default_expect_ms: default_pw_default_expect_ms(),
+            rl_penalty_per_miss: default_pw_rl_penalty(),
+            persist_path: default_pw_persist_path(),
+        }
+    }
+}
+
+fn default_pw_min_ms() -> u64 {
+    10_000
+}
+
+fn default_pw_max_ms() -> u64 {
+    180_000
+}
+
+fn default_pw_weak_factor() -> f64 {
+    0.62
+}
+
+fn default_pw_strong_factor() -> f64 {
+    1.42
+}
+
+fn default_pw_ema_alpha() -> f64 {
+    0.22
+}
+
+fn default_pw_default_expect_ms() -> u64 {
+    45_000
+}
+
+fn default_pw_rl_penalty() -> f64 {
+    0.32
+}
+
+fn default_pw_persist_path() -> String {
+    "tp_timing_stats.json".to_string()
 }
 
 /// Hiperparámetros del agente tabular (Q-learning) para tuning de momentum en paper.
@@ -652,6 +732,27 @@ impl Config {
                         "adaptive_paper.rl.pnl_reward_divisor must be > 0.01"
                     );
                 }
+            }
+
+            let pw = &ap.profit_window;
+            if pw.enabled {
+                anyhow::ensure!(
+                    ap.enabled,
+                    "adaptive_paper.profit_window.enabled requires adaptive_paper.enabled = true"
+                );
+                anyhow::ensure!(self.mode == Mode::Paper, "adaptive_paper.profit_window requires mode = \"paper\"");
+                anyhow::ensure!(pw.min_ms >= 1_000 && pw.min_ms <= pw.max_ms, "profit_window.min_ms must be in [1000, max_ms]");
+                anyhow::ensure!(pw.max_ms <= 600_000, "profit_window.max_ms must be <= 600000");
+                anyhow::ensure!(
+                    pw.weak_time_factor > 0.0 && pw.strong_time_factor > 0.0,
+                    "profit_window weak_time_factor / strong_time_factor must be > 0"
+                );
+                anyhow::ensure!(
+                    pw.ema_alpha > 0.0 && pw.ema_alpha <= 1.0,
+                    "profit_window.ema_alpha must be in (0, 1]"
+                );
+                anyhow::ensure!(!pw.persist_path.trim().is_empty(), "profit_window.persist_path must be set");
+                anyhow::ensure!(pw.rl_penalty_per_miss >= 0.0, "profit_window.rl_penalty_per_miss must be >= 0");
             }
         }
 

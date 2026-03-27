@@ -16,6 +16,8 @@ Bot de trading de **momentum en tiempo casi real** sobre los mercados **Bitcoin 
 8. **Ejecución y gestión** — El **OrderManager** recibe señales por canal, coloca límites con TIF configurable (**FAK** por defecto en entradas agresivas, **GTC**/post-only si lo configuras), reconcilia **fills** vía WebSocket de usuario (live) o simula fills en paper, aplica **TP/SL/trailing**, **cooldowns** y **settle** al cierre del intervalo usando precios spot de apertura/cierre de la franja.
 9. **Riesgo** — Tamaño por trade (`risk_per_trade_frac`), **kill switch** por drawdown diario simulado, límite de posiciones por mercado.
 10. **Paper lab (solo `mode = paper` + `[adaptive_paper]`)** — Informes por intervalo, `analysis.jsonl` (lag CEX vs libro, impulso reciente, `pct_vs_anchor`), tuning heurístico de deltas o **RL** tabular con persistencia de Q-table.
+11. **Ventana adaptativa de TP (`profit_window`)** — Se aprende por bucket de `p_strong` el tiempo esperado hasta TP (EMA). Señal fuerte = más tiempo permitido; señal débil = menos tiempo. Si vence el plazo sin TP y el bid sigue entre entrada y TP, se registra `profit_deadline_miss`.
+12. **Writeback de parámetros RL (opcional)** — Con `adaptive_paper.writeback_config = true`, el bot persiste en `config.toml` los parámetros sintonizados (`delta_*_pct`, `edge_min`, `prob_scale`, `min_taker_imbalance`, TP/SL) con backup automático `config.bak.toml`.
 
 ---
 
@@ -62,6 +64,7 @@ Claves habituales (el detalle está comentado en `config.example.toml`):
 | `[risk]` | Fracción por trade, drawdown diario, kill switch. |
 | `[adaptive_paper]` | Informes, `impulse_window_ms`, `impulse_min_pct`, análisis JSONL, tuning. |
 | `[adaptive_paper.rl]` | Hiperparámetros Q-learning y paths de persistencia. |
+| `[adaptive_paper.profit_window]` | Ventana adaptativa de TP por fuerza de señal (`p_strong`), EMA persistida y penalización RL por misses. |
 
 **Nota:** en `assets` puedes listar otros símbolos; el bot **solo opera Polymarket BTC 5m** y avisará si ignora el resto.
 
@@ -108,6 +111,42 @@ Endpoints CLOB/Gamma pueden sobreescribirse en `[endpoints]` si tu despliegue lo
 - **TRACE** `mom · ✗ …` — motivo de rechazo (delta, imbalance, prob, edge, spread, intervalo).
 - **INFO** `BTC 5m · arranque|ventana_nueva` — bloque con venues y `precio_ref`; **WARN** si REF vs spot WS discrepa &gt; ~100 USD (ancla sospechosa).
 - **Paper** — Directorio `paper_reports/` (según config; suele estar en `.gitignore`) con JSON por intervalo y `analysis.jsonl`.
+- **Profit window** — **WARN** `profit_window · venció plazo sin TP ...` cuando un trade momentum no llega al TP dentro de su ventana adaptativa.
+- **Writeback** — **INFO** `config_writeback · config.toml actualizado con parámetros RL` cuando el RL persiste nuevos parámetros en config.
+
+---
+
+## Reportes que deja una corrida (ej. 24h)
+
+Con `mode = "paper"` y `adaptive_paper.enabled = true`, al finalizar tendrás:
+
+- `paper_reports/interval_*.json` — resumen por intervalo (trades, TP, SL, settle, PnL, `profit_deadline_misses`).
+- `paper_reports/analysis.jsonl` — muestreo periódico de entorno/mercado para diagnóstico.
+- `paper_reports/trades.jsonl` — registro por trade con entrada/salida/resultados.
+
+Si además `adaptive_paper.rl.enabled = true`:
+
+- `paper_reports/rl_qtable.json` — estado persistido de la Q-table.
+- `paper_reports/rl_interval.jsonl` y `paper_reports/rl_interval.csv` — reward, estado, acción y parámetros aplicados por intervalo.
+
+Si además `adaptive_paper.profit_window.enabled = true`:
+
+- `paper_reports/tp_timing_stats.json` — EMA de tiempo-hasta-TP por bucket de `p_strong`.
+
+Si además `adaptive_paper.writeback_config = true`:
+
+- `config.toml` — actualizado con últimos parámetros RL.
+- `config.bak.toml` — backup del config original (se crea en la primera escritura).
+
+---
+
+## Cambios recientes (momentum branch)
+
+- Se incorporó `profit_window` para aprender timing óptimo de TP según fuerza de señal y penalizar misses en el reward RL.
+- El reward de RL ahora descuenta `profit_deadline_misses * rl_penalty_per_miss`.
+- Se añadió writeback opcional de parámetros RL a `config.toml` con backup automático.
+- Se corrigió la interacción USD vs PCT en momentum efectivo para que los deltas ajustados por RL se apliquen realmente.
+- Se redujo I/O de writeback: solo se escribe config cuando hay cambios efectivos en parámetros.
 
 ---
 

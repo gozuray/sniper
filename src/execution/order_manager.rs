@@ -427,11 +427,13 @@ impl OrderManager {
                     }
                     Some(fill) = mgr.trade_rx.recv() => {
                         mgr.on_fill(fill).await;
+                        mgr.check_profit_deadline_violations().await;
                     }
                     Some(signal) = mgr.signal_rx.recv() => {
                         mgr.submit_signal(signal, &shutdown).await;
                         mgr.check_stop_losses(&shutdown).await;
                         mgr.check_take_profits(&shutdown).await;
+                        mgr.check_profit_deadline_violations().await;
                     }
                     Some(cancel) = mgr.cancel_rx.recv() => {
                         mgr.on_cancel(cancel).await;
@@ -447,6 +449,7 @@ impl OrderManager {
                         mgr.reconcile_orphan_exit_orders().await;
                         mgr.check_stop_losses(&shutdown).await;
                         mgr.check_take_profits(&shutdown).await;
+                        mgr.check_profit_deadline_violations().await;
                     }
                 }
             }
@@ -606,6 +609,7 @@ impl OrderManager {
                 continue;
             }
             if let Some(&(pos_id, leg_idx)) = self.order_to_leg.get(&oid) {
+                let mut schedule_deadline = false;
                 if let Some(pos) = self.positions.get_mut(&pos_id) {
                     if pos.settled {
                         continue;
@@ -615,6 +619,7 @@ impl OrderManager {
                         if add.is_zero() {
                             continue;
                         }
+                        let first_entry_fill = leg.filled_size.is_zero();
                         if leg.filled_size.is_zero() {
                             leg.filled_size = add;
                             leg.filled_price = fill.price;
@@ -624,6 +629,13 @@ impl OrderManager {
                             if !leg.filled_size.is_zero() {
                                 leg.filled_price = total_cost / leg.filled_size;
                             }
+                        }
+                        if first_entry_fill
+                            && !leg.filled_size.is_zero()
+                            && matches!(pos.kind, Signal::Momentum { .. })
+                        {
+                            pos.entry_fill_ms = Some(now_ms());
+                            schedule_deadline = true;
                         }
                         // Realized slippage vs intended price (bps).
                         if !leg.intended_price.is_zero() {
@@ -639,6 +651,16 @@ impl OrderManager {
                         }
                     }
                 }
+                if schedule_deadline {
+                    let lab = self.paper_lab.clone();
+                    let tp_eff = self.take_profit_ticks_effective();
+                    let th = self.cfg.momentum.strong_prob_threshold;
+                    if let Some(pos) = self.positions.get_mut(&pos_id) {
+                        if let Some(ref lab) = lab {
+                            lab.apply_profit_deadline_to_position(pos, tp_eff, th);
+                        }
+                    }
+                }
             }
         }
     }
@@ -648,6 +670,7 @@ impl OrderManager {
         let mut trade_log: Option<TradeLogRecord> = None;
         let mut pnl_round: Option<String> = None;
         let mut lab_tp: Option<(u64, Decimal)> = None;
+        let mut lab_tp_timing: Option<(f64, Option<u64>)> = None;
 
         {
             let Some(pos) = self.positions.get_mut(&pos_id) else {
@@ -720,6 +743,7 @@ impl OrderManager {
             pnl_round = Some(pos.pnl_usdc.round_dp(4).to_string());
             if matches!(pos.kind, Signal::Momentum { .. }) {
                 lab_tp = Some((pos.interval_start_unix, pos.pnl_usdc));
+                lab_tp_timing = Some((pos.entry_diag.p_strong, pos.entry_fill_ms));
             }
             trade_log = Some(trade_log_record_from_pos(
                 pos,
@@ -738,6 +762,9 @@ impl OrderManager {
         if let Some((iv, pnl)) = lab_tp {
             if let Some(lab) = self.paper_lab.as_ref() {
                 lab.record_take_profit(iv, pnl);
+                if let Some((ps, ef)) = lab_tp_timing {
+                    lab.on_closed_take_profit_timing(ps, ef, now_ms());
+                }
             }
         }
     }
@@ -1076,11 +1103,13 @@ impl OrderManager {
             if self.mode == Mode::Paper {
                 let sell_px = bb;
                 let pnl = (sell_px - entry_px) * size;
-                let (trade_log, interval_for_lab) = {
+                let (trade_log, interval_for_lab, tp_ps, tp_ef) = {
                     let Some(pos) = self.positions.get_mut(&pos_id) else {
                         continue;
                     };
                     let interval_for_lab = pos.interval_start_unix;
+                    let tp_ps = pos.entry_diag.p_strong;
+                    let tp_ef = pos.entry_fill_ms;
                     pos.pnl_usdc = pnl;
                     pos.win = pnl > Decimal::ZERO;
                     pos.settled = true;
@@ -1112,6 +1141,8 @@ impl OrderManager {
                     (
                         trade_log_record_from_pos(pos, "tp", Some(sell_px), now_ms()),
                         interval_for_lab,
+                        tp_ps,
+                        tp_ef,
                     )
                 };
                 self.write_trade_log_record(&trade_log);
@@ -1130,6 +1161,7 @@ impl OrderManager {
                 ));
                 if let Some(lab) = self.paper_lab.as_ref() {
                     lab.record_take_profit(interval_for_lab, pnl);
+                    lab.on_closed_take_profit_timing(tp_ps, tp_ef, now_ms());
                 }
                 continue;
             }
@@ -1164,6 +1196,83 @@ impl OrderManager {
                     tracing::warn!(error = %e, position_id = pos_id, "take-profit sell failed; retry later");
                 }
             }
+        }
+    }
+
+    /// Paper + `profit_window`: si pasó el plazo, el bid sigue por debajo de TP pero no por debajo de entrada → fallo de timing.
+    async fn check_profit_deadline_violations(&mut self) {
+        let Some(lab) = self.paper_lab.as_ref() else {
+            return;
+        };
+        if !lab.profit_window_enabled() || self.mode != Mode::Paper {
+            return;
+        }
+        let Some(tp) = self.take_profit_ticks_effective() else {
+            return;
+        };
+        if tp.is_zero() {
+            return;
+        }
+
+        let now = now_ms();
+        let book = self.orderbook.read().await;
+        if !self.book_is_fresh(&book) {
+            return;
+        }
+
+        let mut hits: Vec<(u64, u64)> = Vec::new();
+        for (&pos_id, p) in &self.positions {
+            if p.profit_deadline_violation_logged {
+                continue;
+            }
+            if !matches!(p.kind, Signal::Momentum { .. }) {
+                continue;
+            }
+            if p.settled || p.closed_via_take_profit || p.closed_via_stop_loss {
+                continue;
+            }
+            if p.legs.len() != 1 {
+                continue;
+            }
+            let leg = &p.legs[0];
+            if leg.filled_size.is_zero() {
+                continue;
+            }
+            let Some(deadline) = p.tp_profit_deadline_ms else {
+                continue;
+            };
+            if now < deadline {
+                continue;
+            }
+            let Some((bb, _)) = book.best_bid(leg.token_id) else {
+                continue;
+            };
+            let entry_px = leg.filled_price;
+            if bb >= entry_px + tp {
+                continue;
+            }
+            if bb < entry_px {
+                continue;
+            }
+            hits.push((pos_id, p.interval_start_unix));
+        }
+        drop(book);
+
+        for (pos_id, iv) in hits {
+            let Some(pos) = self.positions.get_mut(&pos_id) else {
+                continue;
+            };
+            if pos.profit_deadline_violation_logged {
+                continue;
+            }
+            pos.profit_deadline_violation_logged = true;
+            tracing::warn!(
+                target: "sniper",
+                position_id = pos_id,
+                interval_start_unix = iv,
+                "profit_window · venció plazo sin TP (bid ≥ entrada y < entry+tp)"
+            );
+            lab.record_profit_deadline_miss(iv);
         }
     }
 
@@ -1365,6 +1474,9 @@ impl OrderManager {
             interval_start_unix,
             close_time_unix,
             created_at_ms: now_ms(),
+            entry_fill_ms: None,
+            tp_profit_deadline_ms: None,
+            profit_deadline_violation_logged: false,
             kind: signal,
             entry_diag,
             legs,
@@ -1417,6 +1529,14 @@ impl OrderManager {
             // FAK 0-fill cleanup: don't insert ghost positions.
             if !has_fill {
                 return;
+            }
+            pos.entry_fill_ms = Some(now_ms());
+            if matches!(pos.kind, Signal::Momentum { .. }) {
+                if let Some(ref lab) = self.paper_lab {
+                    let tp_eff = self.take_profit_ticks_effective();
+                    let th = self.cfg.momentum.strong_prob_threshold;
+                    lab.apply_profit_deadline_to_position(&mut pos, tp_eff, th);
+                }
             }
             if let Some(lab) = self.paper_lab.as_ref() {
                 if matches!(pos.kind, Signal::Momentum { .. }) {
