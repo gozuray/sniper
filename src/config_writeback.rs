@@ -41,13 +41,14 @@ impl TunedParams {
 }
 
 pub fn writeback_config(config_path: &Path, params: &TunedParams) -> Result<()> {
-    if let Ok(guard) = LAST_WRITTEN.lock() {
-        if let Some(ref prev) = *guard {
-            if params.same_as(prev) {
-                return Ok(());
-            }
+    let mut guard = LAST_WRITTEN.lock().map_err(|_| anyhow::anyhow!("writeback mutex poisoned"))?;
+
+    if let Some(ref prev) = *guard {
+        if params.same_as(prev) {
+            return Ok(());
         }
     }
+
     ensure_backup(config_path)?;
 
     let raw = fs::read_to_string(config_path)
@@ -66,6 +67,9 @@ pub fn writeback_config(config_path: &Path, params: &TunedParams) -> Result<()> 
     atomic_replace(&tmp, config_path)
         .with_context(|| format!("writeback: replace {}", config_path.display()))?;
 
+    *guard = Some(params.clone());
+    drop(guard);
+
     tracing::info!(
         target: "sniper",
         delta_up = %params.delta_up_pct,
@@ -77,10 +81,6 @@ pub fn writeback_config(config_path: &Path, params: &TunedParams) -> Result<()> 
         sl_ticks = ?params.stop_loss_ticks,
         "config_writeback · config.toml actualizado con parámetros RL"
     );
-
-    if let Ok(mut guard) = LAST_WRITTEN.lock() {
-        *guard = Some(params.clone());
-    }
 
     Ok(())
 }

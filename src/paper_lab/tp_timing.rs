@@ -76,7 +76,12 @@ impl TpTimingStore {
             0.5
         };
         let factor = weak_time_factor + t * (strong_time_factor - weak_time_factor);
-        let ms = (base * factor).round().max(1.0) as u64;
+        let raw = base * factor;
+        let ms = if raw.is_finite() && raw > 0.0 {
+            raw.round() as u64
+        } else {
+            default_ms
+        };
         ms.clamp(min_ms, max_ms)
     }
 

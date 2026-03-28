@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 pub const NUM_ACTIONS: usize = 13;
 /// 3⁶ = 729
 pub const NUM_STATES: usize = 729;
+const QTABLE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct RlTuningState {
@@ -71,14 +72,24 @@ impl DeltaQAgent {
 
         if let Ok(data) = fs::read_to_string(&agent.persist_path) {
             if let Ok(p) = serde_json::from_str::<QTablePersist>(&data) {
-                if p.q.len() == agent.q.len() {
+                if p.version == QTABLE_VERSION && p.q.len() == agent.q.len() {
                     agent.q = p.q;
                     let emax = agent.cfg.epsilon;
                     agent.epsilon = p.epsilon.clamp(agent.cfg.epsilon_min, emax);
                     tracing::info!(
                         target: "sniper",
+                        version = p.version,
                         path = %agent.persist_path.display(),
                         "rl · Q-table cargada"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "sniper",
+                        file_version = p.version,
+                        expected_version = QTABLE_VERSION,
+                        file_len = p.q.len(),
+                        expected_len = agent.q.len(),
+                        "rl · Q-table descartada (versión/tamaño incompatible); fresh start"
                     );
                 }
             }
@@ -384,7 +395,7 @@ impl DeltaQAgent {
             fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
         }
         let p = QTablePersist {
-            version: 4,
+            version: QTABLE_VERSION,
             q: self.q.clone(),
             epsilon: self.epsilon,
         };

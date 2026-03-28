@@ -248,10 +248,27 @@ impl PaperLab {
         };
     }
 
+    /// Flush whatever is in the current interval (for shutdown).
+    pub fn flush_current_interval(&self) {
+        let interval_start = self.current.lock().expect("paper_lab current").interval_start_unix;
+        if interval_start == 0 {
+            return;
+        }
+        if let Err(e) = self.flush_interval_report(interval_start) {
+            tracing::warn!(target: "sniper", error = %e, "paper_lab · shutdown flush falló");
+        }
+    }
+
     fn flush_interval_report(&self, interval_start: u64) -> Result<()> {
         let agg = {
             let g = self.current.lock().expect("paper_lab current");
             if g.interval_start_unix != interval_start {
+                tracing::trace!(
+                    target: "sniper",
+                    expected = interval_start,
+                    actual = g.interval_start_unix,
+                    "paper_lab · flush_interval_report skipped (interval mismatch)"
+                );
                 return Ok(());
             }
             g.clone()

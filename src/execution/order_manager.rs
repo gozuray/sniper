@@ -442,6 +442,7 @@ impl OrderManager {
                         mgr.reset_day_if_needed();
                         mgr.settle_positions().await;
                         mgr.log_metrics();
+                        mgr.gc_closed_positions();
                     }
                     _ = sleep(Duration::from_millis(50)) => {
                         mgr.reset_day_if_needed();
@@ -508,6 +509,17 @@ impl OrderManager {
                 kill = kill,
                 "pulse"
             );
+        }
+    }
+
+    fn gc_closed_positions(&mut self) {
+        let before = self.positions.len();
+        self.positions.retain(|_id, pos| {
+            !(pos.settled || pos.closed_via_take_profit || pos.closed_via_stop_loss)
+        });
+        let removed = before - self.positions.len();
+        if removed > 0 {
+            tracing::debug!(target: "sniper", removed, remaining = self.positions.len(), "gc · positions");
         }
     }
 
@@ -601,10 +613,13 @@ impl OrderManager {
         }
 
         for oid in order_ids {
-            if let Some((pos_id, reason)) = self.exit_order_to_position.remove(&oid) {
-                match reason {
+            if let Some(&(pos_id, reason)) = self.exit_order_to_position.get(&oid) {
+                let fully_closed = match reason {
                     ExitReason::TakeProfit => self.on_take_profit_fill(pos_id, &fill),
                     ExitReason::StopLoss => self.on_stop_loss_fill(pos_id, &fill),
+                };
+                if fully_closed {
+                    self.exit_order_to_position.remove(&oid);
                 }
                 continue;
             }
@@ -665,8 +680,9 @@ impl OrderManager {
         }
     }
 
+    /// Returns `true` if the position was fully closed by this fill.
     #[allow(unused_assignments)]
-    fn on_take_profit_fill(&mut self, pos_id: u64, fill: &TradeFillEvent) {
+    fn on_take_profit_fill(&mut self, pos_id: u64, fill: &TradeFillEvent) -> bool {
         let mut trade_log: Option<TradeLogRecord> = None;
         let mut pnl_round: Option<String> = None;
         let mut lab_tp: Option<(u64, Decimal)> = None;
@@ -674,18 +690,18 @@ impl OrderManager {
 
         {
             let Some(pos) = self.positions.get_mut(&pos_id) else {
-                return;
+                return true;
             };
             if pos.settled {
-                return;
+                return true;
             }
             let Some(leg) = pos.legs.first_mut() else {
-                return;
+                return true;
             };
             let inv = leg.filled_size;
             let sold = fill.size.min(inv);
             if sold.is_zero() {
-                return;
+                return true;
             }
             let cost_part = leg.filled_price * sold;
             let proceeds_part = fill.price * sold;
@@ -694,7 +710,6 @@ impl OrderManager {
             pos.pnl_usdc += d_pnl;
             self.pnl_day += d_pnl;
             leg.filled_size = inv - sold;
-            pos.take_profit_order_id = None;
 
             if self.cfg.risk.kill_switch_enabled {
                 let loss_limit = -(self.starting_balance * self.cfg.risk.daily_drawdown_frac);
@@ -713,8 +728,10 @@ impl OrderManager {
                     leg.filled_size.round_dp(4),
                     d_pnl.round_dp(4),
                 );
-                return;
+                return false;
             }
+
+            pos.take_profit_order_id = None;
 
             pos.win = pos.pnl_usdc > Decimal::ZERO;
             pos.settled = true;
@@ -767,28 +784,30 @@ impl OrderManager {
                 }
             }
         }
+        true
     }
 
+    /// Returns `true` if the position was fully closed by this fill.
     #[allow(unused_assignments)]
-    fn on_stop_loss_fill(&mut self, pos_id: u64, fill: &TradeFillEvent) {
+    fn on_stop_loss_fill(&mut self, pos_id: u64, fill: &TradeFillEvent) -> bool {
         let mut trade_log: Option<TradeLogRecord> = None;
         let mut pnl_round: Option<String> = None;
         let mut lab_sl: Option<(u64, Decimal)> = None;
 
         {
             let Some(pos) = self.positions.get_mut(&pos_id) else {
-                return;
+                return true;
             };
             if pos.settled {
-                return;
+                return true;
             }
             let Some(leg) = pos.legs.first_mut() else {
-                return;
+                return true;
             };
             let inv = leg.filled_size;
             let sold = fill.size.min(inv);
             if sold.is_zero() {
-                return;
+                return true;
             }
             let cost_part = leg.filled_price * sold;
             let proceeds_part = fill.price * sold;
@@ -797,7 +816,6 @@ impl OrderManager {
             pos.pnl_usdc += d_pnl;
             self.pnl_day += d_pnl;
             leg.filled_size = inv - sold;
-            pos.stop_loss_order_id = None;
 
             if self.cfg.risk.kill_switch_enabled {
                 let loss_limit = -(self.starting_balance * self.cfg.risk.daily_drawdown_frac);
@@ -816,9 +834,10 @@ impl OrderManager {
                     leg.filled_size.round_dp(4),
                     d_pnl.round_dp(4),
                 );
-                return;
+                return false;
             }
 
+            pos.stop_loss_order_id = None;
             pos.win = pos.pnl_usdc > Decimal::ZERO;
             pos.settled = true;
             pos.closed_via_stop_loss = true;
@@ -867,6 +886,7 @@ impl OrderManager {
                 lab.record_stop_loss(iv, pnl);
             }
         }
+        true
     }
 
     async fn check_stop_losses(&mut self, shutdown: &CancellationToken) {
@@ -1680,6 +1700,22 @@ impl OrderManager {
         }
 
         for pos_id in settled_ids {
+            // Cancel any pending TP/SL exit orders before settling.
+            if let Some(pos) = self.positions.get_mut(&pos_id) {
+                if let Some(oid) = pos.take_profit_order_id.take() {
+                    self.exit_order_to_position.remove(&oid);
+                    if let Some(live) = &self.live {
+                        let _ = live.cancel_order(&oid).await;
+                    }
+                }
+                if let Some(oid) = pos.stop_loss_order_id.take() {
+                    self.exit_order_to_position.remove(&oid);
+                    if let Some(live) = &self.live {
+                        let _ = live.cancel_order(&oid).await;
+                    }
+                }
+            }
+
             let trade_log = {
                 let Some(pos) = self.positions.get_mut(&pos_id) else {
                     continue;

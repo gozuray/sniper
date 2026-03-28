@@ -1067,6 +1067,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Stop order manager task (it observes `shutdown`).
     let _ = order_manager_handle.await;
+
+    if let Some(ref lab) = paper_lab {
+        lab.flush_current_interval();
+    }
+
     for h in feed_handles {
         let _ = h.abort();
     }
