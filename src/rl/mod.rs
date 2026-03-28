@@ -1,6 +1,6 @@
 //! Agente RL tabular (Q-learning) para tuning **cada intervalo** en paper.
 //!
-//! Estado: 3⁶ = 729 (actividad × TP rate × PnL × spread × p_strong × racha SL).
+//! Estado: 3⁶ = 729 (time_remaining × TP rate × PnL × spread × p_strong × racha SL).
 //! Acciones: deltas, edge, `min_taker_imbalance`, `prob_scale`, TP/SL ticks, hold.
 //! Recompensa: PnL del intervalo (tanh) + TP/SL/settle.
 
@@ -84,16 +84,22 @@ impl DeltaQAgent {
             }
         }
 
-        // Warm-start: en estados de baja actividad (act=0), favorecer loosen_delta
+        // Warm-start: when time remaining is low (tr_b=0), favor tighten_delta (less trades);
+        // when time remaining is ample (tr_b=2), favor loosen_delta (more trades).
         if agent.q.iter().all(|&v| v == 0.0) {
-            for tp_b in 0..3 {
-                for pnl_b in 0..3 {
-                    for sp_b in 0..3 {
-                        for ps_b in 0..3 {
-                            for sl_b in 0..3 {
-                                let s = tp_b * 81 + pnl_b * 27 + sp_b * 9 + ps_b * 3 + sl_b;
-                                // Action 1 = loosen_delta
-                                agent.q[s * NUM_ACTIONS + 1] = 0.1;
+            for tr_b in 0..3usize {
+                for tp_b in 0..3 {
+                    for pnl_b in 0..3 {
+                        for sp_b in 0..3 {
+                            for ps_b in 0..3 {
+                                for sl_b in 0..3 {
+                                    let s = tr_b * 243 + tp_b * 81 + pnl_b * 27 + sp_b * 9 + ps_b * 3 + sl_b;
+                                    if tr_b == 0 {
+                                        agent.q[s * NUM_ACTIONS + 0] = 0.1;
+                                    } else {
+                                        agent.q[s * NUM_ACTIONS + 1] = 0.1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -116,7 +122,7 @@ impl DeltaQAgent {
         }
     }
 
-    /// s ∈ [0,728] → (act, tp, pnl, spread, p_strong, sl_streak)
+    /// s ∈ [0,728] → (time_rem, tp, pnl, spread, p_strong, sl_streak)
     #[inline]
     pub fn decode_state(s: usize) -> (u8, u8, u8, u8, u8, u8) {
         let s0 = s.min(NUM_STATES.saturating_sub(1));
@@ -130,18 +136,32 @@ impl DeltaQAgent {
         s /= 3;
         let tp_b = (s % 3) as u8;
         s /= 3;
-        let act = (s.min(2)) as u8;
-        (act, tp_b, pnlb, sp_b, ps_b, sl_b)
+        let tr_b = (s.min(2)) as u8;
+        (tr_b, tp_b, pnlb, sp_b, ps_b, sl_b)
     }
 
+    /// Bucket calibrado para rango real observado (p_strong ~0.55–0.65 en la mayoría de trades).
     #[inline]
     pub fn p_strong_bucket(avg_p_strong: f64, trades_opened: u32) -> usize {
         if trades_opened == 0 {
             return 1;
         }
-        if avg_p_strong < 0.73 {
+        if avg_p_strong < 0.57 {
             0
-        } else if avg_p_strong < 0.88 {
+        } else if avg_p_strong < 0.63 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Bucket tiempo restante medio (seg) al abrir trades en el intervalo.
+    /// Poco tiempo → peor probabilidad de TP; mucho → más margen.
+    #[inline]
+    pub fn time_remaining_bucket(avg_time_remaining_sec: f64) -> usize {
+        if avg_time_remaining_sec < 90.0 {
+            0
+        } else if avg_time_remaining_sec < 200.0 {
             1
         } else {
             2
@@ -150,22 +170,15 @@ impl DeltaQAgent {
 
     #[inline]
     pub fn state_index(
-        total_trades: u32,
         tp_rate: f64,
         pnl_interval: Decimal,
         avg_spread: f64,
-        low_activity_ceiling: u32,
         avg_p_strong_at_entry: f64,
+        total_trades: u32,
         consecutive_sl_streak: u32,
+        avg_time_remaining_sec: f64,
     ) -> usize {
-        let hi = low_activity_ceiling.saturating_add(3);
-        let act = if total_trades <= low_activity_ceiling {
-            0usize
-        } else if total_trades <= hi {
-            1usize
-        } else {
-            2usize
-        };
+        let tr_b = Self::time_remaining_bucket(avg_time_remaining_sec);
         let tp_b = if tp_rate < 0.34 {
             0usize
         } else if tp_rate < 0.58 {
@@ -174,9 +187,9 @@ impl DeltaQAgent {
             2usize
         };
         let pnlf = pnl_interval.to_f64().unwrap_or(0.0);
-        let pnlb = if pnlf < -0.5 {
+        let pnlb = if pnlf < -3.0 {
             0usize
-        } else if pnlf <= 0.5 {
+        } else if pnlf <= 3.0 {
             1usize
         } else {
             2usize
@@ -190,7 +203,7 @@ impl DeltaQAgent {
         };
         let ps_b = Self::p_strong_bucket(avg_p_strong_at_entry, total_trades);
         let sl_b = Self::sl_streak_bucket(consecutive_sl_streak);
-        act * 243 + tp_b * 81 + pnlb * 27 + sp_b * 9 + ps_b * 3 + sl_b
+        tr_b * 243 + tp_b * 81 + pnlb * 27 + sp_b * 9 + ps_b * 3 + sl_b
     }
 
     pub fn reward_interval_profit_max(
@@ -371,7 +384,7 @@ impl DeltaQAgent {
             fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
         }
         let p = QTablePersist {
-            version: 3,
+            version: 4,
             q: self.q.clone(),
             epsilon: self.epsilon,
         };

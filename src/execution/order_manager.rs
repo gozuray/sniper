@@ -1540,7 +1540,7 @@ impl OrderManager {
             }
             if let Some(lab) = self.paper_lab.as_ref() {
                 if matches!(pos.kind, Signal::Momentum { .. }) {
-                    lab.record_paper_entry(interval_start_unix, pos.entry_diag.p_strong);
+                    lab.record_paper_entry(interval_start_unix, pos.entry_diag.p_strong, pos.entry_diag.time_remaining_sec);
                 }
             }
             self.entered_intervals.insert(interval_key);

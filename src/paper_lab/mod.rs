@@ -33,6 +33,9 @@ struct IntervalAgg {
     /// Suma de `p_strong` al entrar (solo momentum paper).
     p_strong_sum: f64,
     p_strong_n: u32,
+    /// Suma de `time_remaining_sec` al abrir (para bucket RL).
+    time_remaining_sum: f64,
+    time_remaining_n: u32,
     /// Trades que no alcanzaron TP dentro de la ventana adaptativa (`profit_window`).
     profit_deadline_misses: u32,
 }
@@ -232,6 +235,8 @@ impl PaperLab {
             spread_samples: 0,
             p_strong_sum: 0.0,
             p_strong_n: 0,
+            time_remaining_sum: 0.0,
+            time_remaining_n: 0,
             profit_deadline_misses: 0,
         };
     }
@@ -356,17 +361,22 @@ impl PaperLab {
         } else {
             0.0
         };
+        let avg_time_remaining = if agg.time_remaining_n > 0 {
+            agg.time_remaining_sum / f64::from(agg.time_remaining_n)
+        } else {
+            150.0
+        };
 
         let mut ad = self.adaptive.lock().expect("paper_lab adaptive");
         let streak = ad.consecutive_sl_streak;
         let s_next = DeltaQAgent::state_index(
-            agg.trades_opened,
             tp_rate,
             agg.pnl_usdc,
             avg_spread,
-            self.cfg.low_activity_trade_ceiling,
             avg_p_strong,
+            agg.trades_opened,
             streak,
+            avg_time_remaining,
         );
         let miss_pen = if self.cfg.profit_window.enabled {
             agg.profit_deadline_misses as f64 * self.cfg.profit_window.rl_penalty_per_miss
@@ -453,22 +463,23 @@ impl PaperLab {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let (ba, bt, bp, bs, bps, bsl) = DeltaQAgent::decode_state(s_next);
+        let (b_tr, bt, bp, bs, bps, bsl) = DeltaQAgent::decode_state(s_next);
 
         if rlc.log_interval_jsonl {
             let jsonl_path = self.resolve_rl_path(&rlc.interval_log_jsonl_path);
             let core = json!({
-                "schema": "sniper.rl_interval.v3",
+                "schema": "sniper.rl_interval.v4",
                 "wall_time_ms": wall_ms,
                 "interval_start_unix": agg.interval_start_unix,
                 "slug": &agg.slug,
                 "state": s_next,
-                "bucket_activity": ba,
+                "bucket_time_remaining": b_tr,
                 "bucket_tp": bt,
                 "bucket_pnl": bp,
                 "bucket_spread": bs,
                 "bucket_p_strong": bps,
                 "bucket_sl_streak": bsl,
+                "avg_time_remaining_sec": avg_time_remaining,
                 "consecutive_sl_streak": streak,
                 "avg_p_strong_at_entry": avg_p_strong,
                 "avg_spread": avg_spread,
@@ -544,7 +555,7 @@ impl PaperLab {
                 .open(&csv_path)
                 .with_context(|| format!("rl csv {}", csv_path.display()))?;
             if need_header {
-                writeln!(f, "wall_ms,interval_start,slug,state,b_act,b_tp,b_pnl,b_sp,b_ps,b_slst,streak,avg_sp,avg_ps,rwd,act,act_name,eps,q_b,q_a,q_boot,du0,du1,dd0,dd1,e0,e1,imb0,imb1,pb,pa,tp0,tp1,sl0,sl1,cd0,cd1,step,pnl,tr,tp,sl,st,tpr,cl")?;
+                writeln!(f, "wall_ms,interval_start,slug,state,b_tr,b_tp,b_pnl,b_sp,b_ps,b_slst,streak,avg_sp,avg_ps,avg_tr,rwd,act,act_name,eps,q_b,q_a,q_boot,du0,du1,dd0,dd1,e0,e1,imb0,imb1,pb,pa,tp0,tp1,sl0,sl1,cd0,cd1,step,pnl,tr,tp,sl,st,tpr,cl")?;
             }
             let qb = if q_old.is_nan() { "".to_string() } else { format!("{q_old:.6}") };
             let qa = if q_new.is_nan() { "".to_string() } else { format!("{q_new:.6}") };
@@ -557,7 +568,7 @@ impl PaperLab {
                 agg.interval_start_unix.to_string(),
                 agg.slug.replace('"', "'"),
                 s_next.to_string(),
-                ba.to_string(),
+                b_tr.to_string(),
                 bt.to_string(),
                 bp.to_string(),
                 bs.to_string(),
@@ -566,6 +577,7 @@ impl PaperLab {
                 streak.to_string(),
                 format!("{avg_spread:.6}"),
                 format!("{avg_p_strong:.6}"),
+                format!("{avg_time_remaining:.1}"),
                 format!("{r:.8}"),
                 action.to_string(),
                 DeltaQAgent::action_label(action).to_string(),
@@ -782,7 +794,7 @@ impl PaperLab {
         g.spread_samples = g.spread_samples.saturating_add(1);
     }
 
-    pub fn record_paper_entry(&self, interval_start_unix: u64, p_strong: f64) {
+    pub fn record_paper_entry(&self, interval_start_unix: u64, p_strong: f64, time_remaining_sec: u64) {
         let mut g = self.current.lock().expect("paper_lab current");
         if g.interval_start_unix != interval_start_unix {
             return;
@@ -790,6 +802,8 @@ impl PaperLab {
         g.trades_opened = g.trades_opened.saturating_add(1);
         g.p_strong_sum += p_strong;
         g.p_strong_n = g.p_strong_n.saturating_add(1);
+        g.time_remaining_sum += time_remaining_sec as f64;
+        g.time_remaining_n = g.time_remaining_n.saturating_add(1);
     }
 
     pub fn record_take_profit(&self, interval_start_unix: u64, pnl: Decimal) {
