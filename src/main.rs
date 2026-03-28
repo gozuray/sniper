@@ -410,7 +410,6 @@ async fn sync_polymarket_5m_interval_if_needed(
     orderbook_state: &Arc<tokio::sync::RwLock<OrderbookTop>>,
     orderbook_ws_handle: &mut tokio::task::JoinHandle<()>,
     cached_ws_token_count: &mut usize,
-    last_logged_btc_5m_start: &mut Option<u64>,
 ) -> anyhow::Result<()> {
     loop {
         let wall_sec = now_ms() / 1000;
@@ -482,7 +481,9 @@ async fn sync_polymarket_5m_interval_if_needed(
 
         let mut guard = orderbook_state.write().await;
         *guard = OrderbookTop::new(&new_token_ids_vec);
-        *last_logged_btc_5m_start = None;
+        // Do NOT clear `last_logged_btc_5m_start` here: `PaperLab::rotate_interval` needs
+        // `Some(prev_interval)` to flush `interval_*.json` and run the RL step for the closed window.
+        // Clearing forced `rotate_interval(None, …)` every resync and silently skipped all flushes.
     }
 }
 
@@ -751,7 +752,6 @@ async fn main() -> anyhow::Result<()> {
                     &orderbook_state,
                     &mut _orderbook_ws_handle,
                     &mut cached_ws_token_count,
-                    &mut last_logged_btc_5m_start,
                 )
                 .await
                 .context("sync polymarket 5m interval (start of tick)")?;
@@ -883,7 +883,6 @@ async fn main() -> anyhow::Result<()> {
                     &orderbook_state,
                     &mut _orderbook_ws_handle,
                     &mut cached_ws_token_count,
-                    &mut last_logged_btc_5m_start,
                 )
                 .await
                 .context("sync polymarket 5m interval (before signals)")?;

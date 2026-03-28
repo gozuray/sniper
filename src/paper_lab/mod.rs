@@ -219,7 +219,14 @@ impl PaperLab {
     pub fn rotate_interval(&self, prev_interval_start: Option<u64>, new_interval: u64, slug: &str) {
         if let Some(prev) = prev_interval_start {
             if prev != new_interval {
-                let _ = self.flush_interval_report(prev);
+                if let Err(e) = self.flush_interval_report(prev) {
+                    tracing::warn!(
+                        target: "sniper",
+                        error = %e,
+                        interval_start_unix = prev,
+                        "paper_lab · flush_interval_report falló (sin interval_*.json / paso RL)"
+                    );
+                }
             }
         }
         let mut g = self.current.lock().expect("paper_lab current");
